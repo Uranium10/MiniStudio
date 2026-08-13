@@ -1,0 +1,78 @@
+[package]
+name = "minidaw"
+version = "0.2.0"
+description = "A compact native-audio digital audio workstation"
+authors = ["MiniDAW contributors"]
+edition = "2021"
+
+[lib]
+name = "minidaw_lib"
+# MiniDAW is a desktop application. Keeping this as an rlib avoids producing
+# unused mobile library artifacts (and an oversized GNU DLL export table).
+crate-type = ["rlib"]
+
+[[bin]]
+name = "minidaw"
+path = "src/main.rs"
+test = false
+bench = false
+
+[features]
+default = ["desktop"]
+desktop = ["tauri/wry"]
+# Enabling cpal/asio pulls the Steinberg ASIO SDK and makes that build GPLv3.
+asio = ["cpal/asio"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+bytemuck = "1.24"
+crossbeam-queue = "0.3"
+cpal = "0.16"
+hound = "3.5"
+clack-host = "0.1.1"
+clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "state", "tail", "thread-check"] }
+midir = "0.10"
+rubato = "0.16"
+rtrb = "0.3"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+specta = { version = "=2.0.0-rc.25", features = ["derive", "function"] }
+specta-typescript = "=0.0.12"
+symphonia = { version = "0.5", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+tauri = { version = "2.11", default-features = false, features = ["specta", "test"] }
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+thiserror = "2"
+triple_buffer = "8"
+vst3-host = { version = "0.9.0", default-features = false }
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+# Tauri dev uses this profile: optimize MiniDAW's realtime DSP, but leave the
+# large GUI dependency graph cheap to compile.
+[profile.dev-dsp]
+inherits = "dev"
+opt-level = 2
+debug = 1
+# Windows indexers/antivirus have repeatedly left incompatible incremental
+# codegen objects in this external cache, producing LNK2019/LNK1120 at launch.
+incremental = false
+
+[profile.dev-dsp.package."*"]
+opt-level = 0
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+# External plug-in hosting uses the MIT-licensed VST3 SDK bindings through
+# vst3-host and the MIT/Apache Clack wrappers for the CLAP ABI.

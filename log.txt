@@ -1,0 +1,204 @@
+## 2026-08-12 10:24:17 +09:00
+- 작업: MiniDAW 작업 공간의 규칙, 루트 구조, 주요 설정, 현재 소스 및 1단계 구현 문서를 가볍게 점검함.
+- 확인 결과: 현재 프로젝트는 React 19 + Vite 8 기반 JavaScript 기본 템플릿이며, Tauri/TypeScript/Zustand/Tailwind 및 DAW 기능은 아직 구성되지 않음.
+- 변경점: 애플리케이션 소스와 설정은 수정하지 않았으며, AGENT.md 규칙에 따라 이 점검 기록만 이어서 추가함.
+
+## 2026-08-12 11:05:41 +09:00
+- 작업: `docs/daw-phase1-agent-prompt.md`와 Studio One/Ableton Live 레퍼런스를 기준으로 MiniDAW 1단계 앱을 구현함.
+- 기반 변경: React 18 strict TypeScript, Vite 8, Zustand, Tailwind CSS, Vitest, Tauri 2.11 API/CLI 및 fs/dialog 플러그인 구성을 추가하고 JavaScript 데모 템플릿을 제거함.
+- 엔진: `IAudioEngine` 계약과 직렬화 도메인 타입, Web Audio 그래프, 25ms/100ms 룩어헤드 스케줄러, AudioContext 기반 플레이헤드, 트랙/버스/센드/마스터 라우팅, peak/RMS 미터, EQ/Compressor/Delay/Reverb를 구현함.
+- 파형: Web Worker에서 4단계 LOD min/max 피크를 계산하고 트랙 레인당 하나의 Canvas로 뷰포트 컬링 렌더링하도록 구현함.
+- 편집/UI: Studio One형 인스펙터·트랙 헤더·아레인지와 Ableton형 믹서·고정 마스터·가로 디바이스 랙을 구현하고, 7개 도구, 서브 도구 순환, Ctrl/Cmd 임시 전환, 제스처 latch, blur 초기화, 이동/트림/페이드/분할/삭제/그리기/뮤트/오디션 및 Alt 드래그 복제를 연결함.
+- 파일 기능: Tauri 오디오 가져오기/파일 드롭, 프로젝트 JSON 저장·열기, 오디오 재수화, 누락 파일 목록과 재지정, OfflineAudioContext 마스터 렌더 및 직접 16-bit PCM WAV 인코딩을 구현함.
+- 2단계 준비: Rust VST3 스캔/오프라인 이펙트 커맨드 스텁, 플랫폼별 경로 상수, TypeScript 네이티브 래퍼, capability 기반 비활성 플러그인 패널을 추가함. 실제 VST3 라이브러리는 추가하지 않음.
+- 문서/품질: README와 `docs/engine-contract.md`, 엔진/UI import 경계 규칙, 도구·스케줄러·피크·WAV 인코더 단위 테스트를 추가함.
+- 검증: `npm run build` 성공, `npm run lint` 무경고, Vitest 4개 파일 11개 테스트 통과. 현재 PC에 Rust/MSVC 툴체인이 없어 Tauri 네이티브 컴파일은 실행하지 못함.
+
+## 2026-08-12 12:46:12 +09:00
+- 작업: 2단계 Rust 네이티브 오디오 엔진과 IPC 보강 지시를 구현하고, 마스터/버스/트랙 공용 FX 체인 및 마스터 기본 EQ·컴프레서·웨이브셰이퍼를 추가함.
+- 네이티브 엔진: CPAL 스트림, lock-free 명령/미터 전달, 그래프 교체, 디코딩·리샘플링·파형 LOD, PDC, 루프 크로스페이드, 공용 실시간/오프라인 그래프, WAV 익스포트와 취소/진행률을 구현함.
+- IPC: Specta typed command, Channel 기반 디코딩/익스포트 진행률, raw little-endian f32 피크 전송, typed EngineError, revision 기반 배열 미터 및 30Hz/4Hz 적응 폴링을 반영함.
+- UI/문서: 오디오 설정 다이얼로그, 익스포트 진행/취소 UI, Waveshaper 장치 UI, IPC·DSP·아키텍처 문서와 ASIO GPL 고지를 추가함.
+- 검증: GNU 타깃의 `cargo check --all-targets` 성공, 프런트엔드 build/lint 성공, Vitest 2개 파일 6개 테스트 통과. Specta 테스트 실행은 GNU/Tauri 런타임 호환 문제로 중단되었으며 정식 MSVC 검증과 실제 바인딩 재생성은 Visual Studio C++ Build Tools 설치 후 남아 있음.
+- 빌드 준비: 기존 favicon.svg에서 Tauri 데스크톱/모바일 아이콘 세트를 생성하고 데스크톱 전용 Rust 라이브러리를 rlib으로 한정함.
+
+## 2026-08-12 14:08:03 +09:00
+- 환경 확인: Visual Studio Build Tools 2026의 x64/x86 MSVC, Windows SDK, 완전 설치 상태와 재부팅 불필요 상태를 확인함.
+- MSVC 검증: `cargo check --all-targets` 성공, 비-GUI MockRuntime 구성의 Rust 테스트 4개(EQ, smoother, waveshaper latency, Specta binding) 통과, 기본 desktop 기능의 `minidaw` 앱 바이너리 빌드 성공.
+- IPC 보정: Specta가 생성한 실제 tagged result와 nullable float 타입을 RustEngine에서 명시적으로 unwrap/정규화하도록 수정하고 `bindings.ts`를 Rust 정의에서 재생성함.
+- 빌드 구성: Tauri GUI 런타임은 기본 `desktop` 기능으로, Rust 단위 테스트와 바인딩 생성은 `--no-default-features` MockRuntime으로 분리해 Windows Common Controls 테스트 실행 충돌을 제거함.
+- 최종 프런트 검증: 실제 생성 바인딩을 포함해 `npm run build`, `npm run lint`, Vitest 2개 파일 6개 테스트가 모두 통과함.
+
+## 2026-08-12 14:45:34 +09:00
+- 수정: 일반 셸에서 Tauri CLI가 `cargo metadata`를 실행하지 못하던 PATH 문제를 해결하기 위해 `run.bat`이 `%USERPROFILE%\.cargo\bin`과 Visual Studio C++ 개발자 환경을 자동으로 설정하도록 변경함.
+- 진단: `run.bat --check` 모드를 추가해 앱 실행 없이 Cargo 탐색과 프로젝트 metadata 조회를 확인할 수 있게 함.
+- 검증: 동일 배치 환경에서 Cargo 1.97.1 탐색과 `cargo metadata --manifest-path src-tauri\Cargo.toml` 실행이 성공함.
+
+## 2026-08-12 15:03:55 +09:00
+- 진단: `run.bat` 실행 시 Vite는 1420에서 정상 시작했으나 Rust가 `src-tauri/target`의 증분 오브젝트를 교체할 때 다른 프로세스의 파일 잠금(os error 32)으로 빌드가 실패했고, 그 결과 Tauri가 Vite를 종료해 WebView에 `ERR_CONNECTION_REFUSED`가 표시됨.
+- 수정: Rust 빌드 캐시를 Desktop 작업공간 밖의 `C:\tmp\minidaw-msvc-target`으로 지정해 인덱서/백신의 중간 산출물 잠금 영향을 피하도록 `run.bat`을 변경함.
+- 검증: 수정된 실행 경로에서 Vite `http://localhost:1420` HTTP 200 응답, Cargo 빌드 유지, `C:\tmp\minidaw-msvc-target\debug\minidaw.exe` 프로세스 실행을 확인함.
+
+## 2026-08-12 16:24:20 +09:00
+- 성능 최적화: 재생헤드를 영속 프로젝트 그래프에서 분리해 30Hz 폴링이 전체 UI를 다시 렌더하지 않도록 변경하고, 파형 `Float32Array`와 오디오 자산을 Undo 스냅샷 사이에서 구조 공유하도록 개선함.
+- 상태/UI: 연속 파라미터 편집을 750ms 단위의 단일 Undo로 병합하고, 트랙·센드·클립·이펙트·버스·마스터 업데이트가 해당 브랜치만 교체하도록 변경함. 타임라인/믹서 컴포넌트 메모이제이션, 뷰포트 한정 Canvas 렌더, DPR 1.5 제한, 공유 30Hz 미터 스케줄러를 적용함.
+- 엔진/IPC: 구조 변경에만 전체 그래프를 동기화하고 실시간 파라미터는 animation-frame 단위로 마지막 IPC만 전송하도록 병합함. 버스/마스터 게인 실시간 명령을 Rust 그래프에 추가하고, Undo/Redo도 값 diff를 통해 네이티브 엔진에 반영되도록 함.
+- 빌드/실행: Cargo `dev-dsp` 프로필과 외부 타깃 캐시를 `run.bat`에 연결하고 npm/Tauri/Cargo 옵션 구분자를 교정함. 첫 프로필 빌드 6분 23초와 Tauri dev 전용 빌드 2분 5초 후, warm Cargo 재빌드 20.79초 및 실제 창+HTTP 200 준비 13.94초를 측정함.
+- 검증: `npm run build`, `npm run lint`, Vitest 3개 파일 9개 테스트, Rust 포맷, Rust 단위 테스트 4개, `dev-dsp` 앱 빌드, 실제 Tauri 창 및 `localhost:1420` HTTP 200 확인을 모두 통과함. 검증용 프로세스는 종료함.
+
+## 2026-08-12 17:54:30 +09:00
+- MIDI/재생: 프로젝트 포맷 v2와 기존 오디오 프로젝트 마이그레이션, 인스트루먼트 트랙·MIDI 클립·960 PPQ 노트 모델, 샘플 정확도 `TempoMap` 스케줄러, 실시간 입력 큐, `Instrument` 계약, 고정 32보이스 할당기와 PolyBLEP `builtin:testtone`을 추가함. 기본 데모에 실제 소리가 나는 MIDI 패턴을 넣고 엔진 초기화/재생 실패 전파 및 정지 중 라이브 MIDI 처리를 교정함.
+- 입력/편집: 컴퓨터 키보드 연주·blur AllNotesOff·MIDI 녹음과 Merge/New clip 옵션, 다중 외부 MIDI 포트 연결 UI를 추가함. Canvas 레이어 기반 피아노롤, 그리기/선택/이동/리사이즈/분할/삭제/뮤트/미리듣기, 벨로시티, 퀀타이즈 강도·스윙·노트 끝, 스케일 스냅, 독립 줌과 최대화를 구현함. 아레인지의 MIDI 미니 프리뷰·이동·복제·트림·분할·삭제 및 오디오 클립 편집 안내도 연결함.
+- 믹서/UI: 이펙트 추가 시 내장 DSP 카탈로그에서 선택하도록 바꾸고, 마스터/버스/트랙 FX 체인을 공용 처리함. 노브 드래그를 window pointer capture로 유지하고 수치 UI의 더블클릭 직접 입력·범위 클립을 추가함. 센드 라우팅 제거/변경과 라우트별 레벨 슬라이더를 추가함.
+- 성능/문서: 피아노롤 뷰포트 이진 탐색, Canvas DPR 제한, 드래그 오버레이, 다중 노트 편집 단일 배치 커밋으로 기존 구조 공유·IPC 병합 최적화를 유지함. `docs/midi-architecture.md`, `docs/instrument-contract.md`, 성능 문서를 추가·갱신함.
+- 검증: 프로덕션 프런트 빌드와 oxlint 무경고, Vitest 4개 파일 10개 테스트 통과. 격리 Cargo 캐시에서 Rust 테스트 7개가 통과했으며 예약 MIDI의 실제 비영 샘플 출력과 32/1024 블록 렌더의 비트 단위 일치를 확인함.
+
+## 2026-08-13 08:55:06 +09:00
+- 재생 실패 원인: Windows 기본 출력 `스피커(Realtek(R) Audio)`는 48kHz/2ch로 정상 탐지됐지만 CPAL이 선택한 출력 샘플 포맷이 U8이었고, 엔진이 F32/I16/U16만 허용해 `unsupported output sample format: U8`로 스트림 초기화를 거부하고 있었음. 오디오 콜백이 없으므로 네이티브 시계 기반 플레이헤드도 함께 정지한 상태였음.
+- 수정: CPAL 출력 설정에서 사용 가능한 포맷 중 고품질 포맷을 우선 선택하고 F32/F64, I8/I16/I24/I32/I64, U8/U16/U32/U64 변환 출력을 모두 지원함. Tauri IPC의 구조화된 EngineError를 UI에서 `[object Object]`가 아닌 종류와 상세 내용으로 표시하도록 통합함.
+- 검증: 실제 Realtek 기본 출력 스트림 열기 테스트와 `NativeEngine.init → play → 120ms → poll` 실시간 테스트가 통과했으며 stream.running, playing, 플레이헤드 증가를 확인함. Rust 일반 테스트 7개, Vitest 10개, 프런트 빌드·린트·Rust 포맷 및 `dev-dsp` Tauri 바이너리 빌드가 모두 통과함.
+
+## 2026-08-13 09:17:05 +09:00
+- 대량 메시지 진단: 실행 로그를 stdout/stderr로 재현해 16개 Rust 경고가 여러 줄로 펼쳐진 부분과 실제 실패인 `LNK2019/LNK1120` 미해결 외부 기호 9개를 분리함. 앱 프로세스가 종료되고 Tauri/Vite만 남던 직접 원인은 외부 `dev-dsp` 증분 캐시에 서로 호환되지 않는 코드젠 산출물이 섞인 링크 실패였음.
+- 빌드 안정화: `C:\tmp\minidaw-msvc-target`에서 MiniDAW `dev-dsp` 패키지 캐시만 `cargo clean`으로 정리하고, 이 프로필의 incremental 컴파일을 비활성화해 깨진 중간 오브젝트 재사용을 막음. 중복 실행으로 남은 MiniDAW 개발 프로세스와 1420 포트 점유도 정리함.
+- 경고 정리: 사용되지 않는 내부 상수/필드/명령을 제거하고 테스트 전용 오디오 placeholder를 cfg(test)로 한정했으며, 의도된 미래 MIDI/오류 확장 지점과 구식 SSE CSR intrinsic에만 국소 allow를 적용함. 전역 경고 억제는 사용하지 않음.
+- 검증: 실제 Tauri dev와 동일한 `dev-dsp + desktop` 구성의 비증분 빌드가 링크까지 성공했고 `minidaw.exe` 프로세스 실행·유지를 확인함. 경고 정리 후 동일 구성 `cargo check` 무경고 및 최종 바이너리 링크 성공을 확인함.
+
+## 2026-08-13 09:30:22 +09:00
+- 작업: 소스를 수정하지 않고 현재 MiniDAW 전체(React UI 2,858줄 / Rust 엔진 4,546줄)를 점검해 미구현·플레이스홀더 기능과 사용감 저해 요소를 목록화함.
+- 확인한 플레이스홀더: TransportBar CPU 미터와 4/4 박자 표시, TopChrome의 ONLINE 배지·메뉴바 6개 버튼·그리드/퀀타이즈 버튼, LowerPanel의 컴프레서 게인 리덕션 수치와 EQ 근사 곡선, 버스 M/S·마스터 DIM/M 버튼, 버스 정적 미터, 인스트루먼트 전원 버튼, 트랙 헤더 ⋯ 메뉴, 루프 스트립이 모두 표시 전용이거나 무동작임을 확인함.
+- 확인한 미구현: 메트로놈/카운트인(countInBars가 어디서도 소비되지 않음), 오디오 입력 녹음(Rust에 입력 스트림 없음), 오토메이션(CcLane 타입만 존재), 버스 레벨 미터, 클립 게인 UI, reverb/delay/compressor/waveshaper/instrument의 다수 파라미터 미노출, 네이티브 engine_eq_response 커맨드 미사용.
+- 확인한 사용감 결함: showToast가 자동 해제되지 않아 토스트가 영구 잔류(clearToast는 단축키 경로에서만 호출), 재생 중 플레이헤드 오토스크롤 없음, 룰러가 줌과 무관한 5초 고정 눈금이며 마디/박 표시 없음, 스냅이 1/16 고정이고 툴바·타임라인·피아노롤 그리드가 서로 분리, 마우스휠 줌/가로 스크롤 없음, 클립 복사·붙여넣기와 트랙 간 이동 불가, 피아노롤 마퀴 선택과 벨로시티 드래그 없음, Redo 버튼 없음.
+- 변경점: 애플리케이션 소스와 설정은 수정하지 않았으며 이 점검 기록만 이어서 추가함. 후속 실행은 P0(신뢰성) → P1(편집 사용감) → P2(기능 보강) → P3(구조 확장) 순서로 제안함.
+
+## 2026-08-13 10:34:28 +09:00
+- 노브 드래그 수정(요청 사항): 원인은 노브를 감싼 `device-card`와 `track-header`가 통째로 `draggable`이라 포인터를 움직이는 즉시 네이티브 HTML5 드래그가 시작되고 브라우저가 `pointercancel`을 발생시켜 제스처가 끊긴 것이었음. `draggable`을 카드 헤더의 그립과 트랙 헤더 그립으로만 한정하고, Knob을 pointerdown `preventDefault` + 요소 자체 pointer capture + `lostpointercapture` 복구 구조로 재작성함. Shift 미세 조절 중 재앵커링, 방향키·PageUp/Down·Home 키보드 조작, `role="slider"` ARIA, 드래그 중 전역 `ns-resize` 커서를 추가함.
+- P0 가짜 UI 제거: 하드코딩된 CPU 미터를 엔진이 실제 측정하는 레이턴시·xrun·PDC 판독으로 교체하고, 상단 `ONLINE` 배지를 `StreamStatus` 실시간 폴링(ONLINE/IDLE/ERROR)에 연결함. 컴프레서의 고정 `-3.2 dB` 게인 리덕션 표시와 버스 스트립의 움직이는 가짜 미터를 제거했고, 버스 미터는 네이티브 지원이 없음을 명시한 비활성 미터로 바꿈. 무동작이던 버스 M/FX, 마스터 DIM/M, 인스트루먼트 전원 버튼을 모두 실제 동작에 연결함.
+- 믹스 모델: `Bus.muted`, `MasterStrip.muted/dim`, `Transport.timeSignature`를 도메인 타입에 추가하고 구 프로젝트 마이그레이션을 `setProject`와 `migrateProject` 양쪽에 넣음. 뮤트·딤은 `effectiveBusGainDb`/`effectiveMasterGainDb`로 실효 게인을 계산해 전달하며, `toNativeSnapshot`이 네이티브 필드만 명시적으로 추려 UI 전용 상태가 Rust 역직렬화기로 새지 않게 함. Rust 코드와 바인딩은 변경하지 않음.
+- 메뉴/명령: 무동작이던 메뉴바 6개를 실제 드롭다운으로 구현하고 트랙 헤더 `⋯` 메뉴(랙 열기·복제·순서 이동·뮤트/솔로·삭제)를 추가함. 공통 `MenuPanel`(바깥 클릭·Escape·blur 닫힘, 뷰포트 클램프)과 엔진 의존 명령을 `store/commands.ts`로 분리해 툴바·메뉴·단축키의 중복 파일 I/O 로직을 제거함. F1 단축키 도움말 다이얼로그를 registry 기반으로 추가함.
+- 사용감(P1): 토스트가 영구 잔류하던 문제를 스토어 타이머(3.6초) + 클릭 해제로 고침. 재생 중 플레이헤드 오토스크롤, 줌 적응형 마디/박 룰러, Ctrl+휠 커서 기준 줌·Shift+휠 가로 스크롤·Alt+휠 트랙 높이, 드래그 가능한 루프 구간(본체 이동·양끝 리사이즈·빈 레인 드로잉), 클립 복사/잘라내기/붙여넣기(트랙 오프셋과 간격 보존), Redo 버튼, 선택 영역 루프(Shift+L), 클립 뮤트(M)를 추가함.
+- 그리드 통합: 툴바의 무동작 `1/16` 버튼과 하드코딩된 타임라인 스냅, 피아노롤 전용 `gridTicks`로 3중 분열돼 있던 그리드를 스토어의 단일 `gridTicks`로 통합하고 툴바 셀렉터·아레인지 스냅·캔버스 격자·피아노롤이 모두 이를 공유하게 함.
+- 피아노롤: 마퀴(고무줄) 다중 선택, 클립을 열 때 노트 음역 중앙(빈 클립은 C4)으로 초기 스크롤, 벨로시티 레인 드래그 페인팅을 추가하고 전조를 단일 배치 커밋으로 바꿈.
+- 디바이스 파라미터: 기본값에만 있고 UI에 없던 값들을 전부 노출함. EQ midFreq/midQ, 컴프레서 knee/makeup, 딜레이 damping/pingPong, 리버브 decay/damping/width/diffusion, 웨이브셰이퍼 curve/oversample/dcBlock, 인스트루먼트 polyphony/velocityCurve. EQ 곡선은 이미 존재하던 `engine_eq_response` 커맨드를 `IAudioEngine`에 노출해 네이티브 실측 응답을 로그 주파수 축으로 그리도록 바꿈(Rust 변경 없음).
+- 검증: `npm run build`, `npm run lint` 무경고, Vitest 6개 파일 25개 테스트 통과(룰러 눈금 7개·클립보드/루프/실효 게인 8개 신규). Vite 1420 HTTP 200과 변경 모듈 10개 전부 200 응답을 확인하고, 기존 `dev-dsp` 바이너리로 실제 Tauri 창을 띄워 패닉·콘솔 오류 없이 responding 상태 유지를 확인한 뒤 검증 프로세스를 종료함.
+- 남은 항목: 메트로놈·카운트인, 오디오 입력 녹음, 오토메이션 레인, 리턴 버스 레벨 미터, CPU 부하 계측은 모두 Rust 엔진 변경이 필요해 이번 범위에서 제외했고 README에 명시함. 트랙 간 클립 이동은 레인 캔버스 통합이 선행돼야 해 함께 보류함.
+
+## 2026-08-13 10:57:02 +09:00
+- 시작 오류 진단: 프런트 프로덕션 빌드는 정상 통과했으며, 직접 재현된 오류는 Claude 검증 과정에서 별도로 실행한 `npx vite --port 1420 --strictPort`의 bash/cmd/node 자식 프로세스가 종료되지 않고 남아 `run.bat`의 Vite가 `Port 1420 is already in use`로 실패한 것이었음. 애플리케이션 소스 오류는 아니었음.
+- 조치: 해당 Claude Vite 프로세스 트리만 종료해 1420 리슨 포트를 해제함. 이후 현재 코드로 `run.bat`을 다시 실행해 `C:\tmp\minidaw-msvc-target\dev-dsp\minidaw.exe`가 정상 기동되는 것을 확인함.
+- 정리: 검증용 MiniDAW/Tauri/Vite 프로세스를 종료했으며 1420 포트에는 TIME_WAIT 연결만 남고 LISTEN 점유는 없음. 애플리케이션 소스와 설정은 수정하지 않음.
+
+## 2026-08-13 11:09:50 +09:00
+- 드롭다운 전면 표시: 상단 메뉴, 트랙/디바이스 컨텍스트 메뉴, 인스펙터와 디바이스 랙의 이펙트 선택기를 `document.body` 포털 기반 공통 `FloatingPanel`로 통합함. 워크스페이스와 스크롤 패널의 `overflow` 및 stacking context에 잘리지 않고 z-index 1000의 최상위 UI 레이어에 표시됨.
+- 팝업 배치/조작: 트리거 또는 포인터 좌표를 기준으로 위치를 계산하고, 화면 경계 클램프·하단 공간 부족 시 위쪽 플립·리사이즈/중첩 스크롤 재배치·바깥 클릭/Escape/창 blur 닫힘을 공통 처리함.
+- 검증: `npm.cmd run lint`, `npm.cmd run build` 성공. Vitest 6개 파일 25개 테스트 통과.
+
+## 2026-08-13 12:16:46 +09:00
+- 1초 후 무음 원인/수정: MIDI 스케줄러는 4초 연속 렌더와 실제 장치 2.2초 지속음 테스트에서 정상으로 확인됨. 데모와 같은 리버브·딜레이·마스터 FX 체인을 재현하자 리버브 FDN이 감쇠 경로와 Hadamard 행렬 출력을 중복 피드백해 루프 이득이 1을 넘고 샘플이 NaN으로 발산하는 직접 원인을 확인함. 감쇠된 신호 하나만 정규 직교 행렬을 거쳐 decay gain으로 되먹임하도록 수정해 4초 전체가 finite/가청 에너지를 유지하게 함.
+- 스트림 복구: CPAL 출력 오류 콜백을 엔진 상태에 전달하고 다음 poll에서 출력 스트림을 자동 재시작하도록 추가함. 복구 시 마지막 오디오 시계 위치와 재생 상태를 복원하며 xrun 누계도 유지함.
+- 트랙 간 클립 이동: 아레인지의 클립을 세로로 다른 호환 트랙에 드롭할 수 있게 함. MIDI는 instrument 트랙끼리, 오디오는 audio 트랙끼리 이동하며 유효/무효 대상 레인을 청색/적색으로 표시함. 스토어의 원자적 이동 명령이 클립 ID·노트·피아노롤 편집 연결과 선택 트랙을 유지함.
+- 검증: 프런트 린트와 프로덕션 빌드 성공, Vitest 6개 파일 27개 테스트 통과. Rust 일반 테스트 9개 통과(3개 장치 테스트 ignored), 데모형 전체 FX 연속 렌더 회귀 테스트 통과, 실제 기본 오디오 장치 2.2초 지속음 테스트 통과, `dev-dsp + desktop` Cargo check 성공.
+
+## 2026-08-13 13:47:21 +09:00
+- MIDI 반복 재생: 데모 MIDI 클립이 48초 구간 전체에서 4마디 패턴을 반복하도록 `loopEnabled: true`로 생성되던 원인을 수정해 기본 자동 루프를 끔. MIDI 자동 루프 방지 회귀 테스트를 추가함.
+- 피아노롤 입력/미리듣기: 피아노롤이 항상 `z/s/x/.../q/2/w/...` 키를 가로채 연주하던 훅을 제거함. 노트를 생성할 때와 기존 노트를 드래그하기 시작할 때, 시간 또는 피치 스냅 지점이 바뀔 때 고유 live note-id로 짧게 오디션하여 배치·이동 결과를 귀로 확인할 수 있게 함.
+- 줌/가상 피아노: `W`는 가로 축소, `E`는 가로 확대이며 피아노롤 편집 중에는 피아노롤, 그 외에는 아레인지 줌을 조정함. CapsLock으로 표시/해제되는 전역 가상 피아노를 추가하고 열린 동안에만 `Q 2 W 3 E R 5 T 6 Y 7 U` 입력을 한 옥타브의 12반음으로 독점 처리함. 화면 건반, 눌림 표시, 옥타브·벨로시티 조절, 선택 인스트루먼트 표시, MIDI 녹음 연동, 닫기/blur/프로젝트 교체 시 all-notes-off 처리를 포함함.
+- 트랙/믹서 표시: 각 인스트루먼트 트랙 헤더에 악기 아이콘을 추가해 해당 트랙의 instrument/VST 디바이스 랙을 바로 열게 함. 기존 고정 볼륨 막대를 엔진 Peak/RMS 기반 실시간 재생·입력 신호 바로 교체하고 armed MIDI 입력은 `IN`으로 표시함. 트랙·버스·마스터 믹서 페이더는 현재 dB 값을 채움 색과 커스텀 핸들 위치로 표시함.
+- 검증: `npm.cmd run lint` 무경고, 프로덕션 빌드 성공, Vitest 6개 파일 29개 테스트 통과.
+
+## 2026-08-13 14:12:47 +09:00
+- 피아노롤 선택/메뉴: 캔버스 마퀴 선택을 포인터 캡처 기반 단일 제스처로 정리해 빈 영역 드래그로 여러 노트를 안정적으로 선택하게 함. 노트와 빈 피아노롤 영역에 미리듣기·옥타브 이동·뮤트·삭제·노트 추가·전체 선택·퀀타이즈 전용 우클릭 메뉴를 추가함.
+- 트랜스포트/루프: 아레인지에서 `B`와 기존 `Enter`가 플레이헤드를 0초로 이동하도록 연결함. 루프 생성·양끝 리사이즈·이동은 활성 퀀타이즈 그리드에 스냅하며, 선택 클립으로 루프를 만드는 명령은 정확한 클립 경계를 유지함.
+- 트랙/이펙터 이동 및 동기화: HTML5 드래그 payload에 전용 MIME 타입과 move 효과, 유효성 검사를 추가해 트랙 헤더와 디바이스 체인의 그립 드래그 순서 변경을 실제 스토어 재정렬에 연결함. 하단 트랙 이펙터 삭제는 트랙 전용 삭제 경로를 사용해 좌측 인스펙터와 즉시 동기화하며 인스펙터 이펙터 우클릭 삭제/바이패스도 추가함.
+- 독립 패널: 피아노롤을 믹서/디바이스 하단 탭에서 분리해 독립 리사이즈 패널로 만들고 `F2`로 토글함. 하단 인터페이스는 `F3`, 좌측 인스펙터는 `F4`로 독립 토글하며 아레인지가 남은 공간을 자동으로 채우도록 그리드 레이아웃을 변경함.
+- 전용 우클릭/새 프로젝트: 앱 안의 Windows 기본 컨텍스트 메뉴를 막고 트랙 헤더, 클립/빈 레인, 피아노롤, 디바이스, 인스펙터에 작업별 메뉴를 연결함. 상단 파일 메뉴와 `Ctrl+N`에 확인 후 빈 세션으로 초기화하는 `새 프로젝트`를 추가함.
+- 검증: `npm.cmd run lint` 무경고, 프로덕션 빌드 성공, Vitest 6개 파일 29개 테스트 통과.
+
+## 2026-08-13 14:21:23 +09:00
+- 피아노롤 키 이동: 선택 노트의 `↑/↓` 반음 이동을 유지하고 옥타브 modifier를 요청대로 `Ctrl+↑/↓`로 변경함. 피아노롤이 닫혀 있을 때는 화살표가 숨은 MIDI 선택을 변경하지 않도록 컨텍스트를 제한함.
+- Alt 복사 이동: `Alt+↑/↓`, `Alt+Ctrl+↑/↓`가 원본 대신 새 ID의 반음/옥타브 복사본을 만들도록 추가함. 피아노롤의 Alt-드래그도 시간·피치 이동량만큼 선택 묶음을 복사하며, 기존 다중 선택 안의 노트를 잡았을 때 선택이 한 노트로 풀리지 않도록 수정함.
+- 스마트 `D` 복제: 선택 노트의 시작–끝 범위를 기준으로 최대 반 마디는 다음 반 마디, 최대 한 마디는 다음 마디, 이후는 2·4마디 단위로 올림해 복제함. 복사본만 다시 선택해 연속 복제가 가능하고, 복사 위치가 MIDI 클립 끝을 넘으면 클립 재생 길이와 loop ticks를 함께 확장함.
+- 안내/검증: 피아노롤 키보드 툴바와 단축키 도움말을 갱신함. 스마트 범위 계산, 새 ID 보존, 원본 유지, 반 마디 배치 회귀 테스트 3개를 추가했으며 프로덕션 빌드 성공, 린트 무경고, Vitest 6개 파일 32개 테스트 통과.
+
+## 2026-08-13 14:29:23 +09:00
+- Alt 키 동작 조정: `Alt+↑/↓` 및 `Alt+Ctrl+↑/↓`의 키보드 복사 분기를 제거해 화살표는 Alt 여부와 무관하게 선택 원본을 반음/옥타브 이동함. 피아노롤의 `Alt+마우스 드래그` 복사는 유지하고 UI 안내에서도 둘을 구분함.
+- 편집기 포커스 분리: 전역 편집 포커스를 arrangement/pianoRoll로 나누고 각 화면의 포인터 조작 및 클립/노트 선택이 해당 포커스를 갱신하도록 함. 포커스된 화면 상단에 청록색 경계를 표시하며 Delete, Ctrl+A, W/E, 화살표, D가 열린 패널이 아니라 마지막 편집 포커스를 기준으로 동작함.
+- 아레인지 스마트 D 복제: 트랙 화면에서 선택한 오디오/MIDI 클립들의 전체 시작–끝 범위를 tick으로 환산해 최대 반 마디는 다음 반 마디, 최대 한 마디는 다음 마디, 이후는 2·4마디 블록으로 복제함. 여러 트랙의 상대 배치와 MIDI 내부 노트/CC를 보존하고 새 복사본만 선택함.
+- 검증: 아레인지 음악 블록 복제와 편집 포커스 전환 회귀 테스트 2개를 추가함. 프로덕션 빌드 성공, 린트 무경고, Vitest 6개 파일 34개 테스트 통과.
+
+## 2026-08-13 15:30:03 +09:00
+- Drive Shaper DSP: 기존 Soft/Hard/Tube/Fold 혼합 매핑을 Soft Clip(`tanh`), Hard Clip(clamp), Sine Shaper(레일에서 기울기 0인 clamp+sin) 3모드로 정리함. 기본 4× 오버샘플링, DC 차단, 파라미터 스무딩과 auto-level 경로를 유지하고 8× 내부 처리 매핑 오류도 보완함.
+- Shaper UI: 첨부된 kHs Shaper 구성을 참고해 어두운 사각 전달함수 그래프, 입출력 기준선, 모드 탭, Drive/Mix 노브 중심의 장치 UI로 교체함. 그래프는 모드·Drive·Mix·바이패스를 즉시 시각화하며 직접 포인트 편집은 제공하지 않음. Output/OS/DC는 단순한 주 UI에서 제거하고 품질 처리는 내부 고정 경로로 유지함.
+- Tape/Tube 판단: 공개 DAFx 모델을 검토한 결과 실제 Tape/Tube 에뮬레이션은 히스테리시스·바이어스·회로 상태를 포함하는 동적 모델이어서 이번 정적 Shaper에 이름만 붙인 근사 모드는 추가하지 않음.
+- 이펙트 추가 hit area: 디바이스 랙의 점선 `이펙트 추가` 타일 안쪽 버튼을 가로·세로 100%로 확장해 사각형 전체에서 선택기가 열리도록 수정함.
+- 검증: 프런트 프로덕션 빌드 성공, 린트 무경고, Vitest 6개 파일 34개 테스트 통과. Rust 전체 테스트 11개 통과·실장치 테스트 3개 ignored, 새 Shaper 유한성·bounded·홀대칭·Sine 레일 회귀 테스트 통과.
+
+## 2026-08-13 15:49:00 +09:00
+- Multiband Compressor DSP: 4차 Linkwitz–Riley 크로스오버와 위상 보정 저역 분기를 사용한 3밴드 압축기를 추가함. Low/Mid/High별 Threshold·Ratio·Attack·Release·Makeup, 공통 Knee, Output, Mix를 지원하며 실시간 처리 중 추가 할당 없이 미리 확보한 밴드 버퍼를 재사용함.
+- 밴드/UI 범위: 요청한 기준에 맞춰 기본 분할을 150 Hz와 2.5 kHz로 설정하고 Low split은 20–150 Hz로 제한함. 참조 이미지처럼 3개 밴드 상태를 한눈에 보는 표시부, 밴드 선택, 분할/출력 노브 및 선택 밴드 컨트롤을 디바이스 랙에 추가하고 이펙트 선택 목록·인스펙터에도 등록함.
+- EQ 개선: 장치 이름을 모든 목록에서 `EQ`로 통일하고 Low/Mid/High의 주파수 노브를 모두 노출함. 응답 그래프에 세 밴드 포인트를 추가해 포인터 캡처 드래그로 각 밴드의 주파수와 게인을 함께 편집할 수 있게 함.
+- 검증: 프런트 프로덕션 빌드 성공, Vitest 6개 파일 34개 테스트 통과. Rust 전체 테스트 13개 통과·실장치 테스트 3개 ignored, 멀티밴드 유한 출력 및 Low split 범위 회귀 테스트 통과, rustfmt 확인 완료.
+
+## 2026-08-13 16:23:43 +09:00
+- Transport stuck-note 수정: Pause가 타임라인 플래그만 끄던 경로를 수정해 재생 중 일시정지 시 모든 악기 트랙에 sample-offset 0의 All Notes Off를 전달함. 현재 위치와 이펙트 테일은 유지하면서 보이스는 악기 Release 설정에 따라 종료되며, Stop/Seek의 기존 graph reset 경로도 유지함.
+- 멀티밴드 L/R 미터: 각 밴드의 압축 후 좌·우 피크를 오디오 스레드에서 블록 단위로 계산하고 12 dB/s 감쇠를 적용함. 고정 크기 meter frame과 기존 30 fps 상태 폴링을 통해 effect ID별 Low/Mid/High stereo level을 UI에 전달해 실시간 경로의 동적 할당 및 별도 IPC 타이머를 피함.
+- Threshold 막대 조작: 기존 단일 장식 막대를 L/R 2줄 레벨 미터로 교체하고 세로 마커를 -60–0 dB Threshold 컨트롤러로 연결함. 마커 드래그는 포인터 캡처를 사용해 막대 밖에서도 계속되며 해당 밴드 선택, 화면 수치, Threshold 노브와 양방향으로 동기화됨.
+- 검증: 프런트 Vitest 6개 파일 34개 테스트 통과, lint 무경고, 프로덕션 빌드 성공. Rust 전체 테스트 14개 통과·실장치 테스트 3개 ignored, transport All Notes Off release 및 멀티밴드 meter 유한/활성 출력 회귀 테스트 통과, IPC 바인딩 재생성 및 rustfmt 확인 완료.
+
+## 2026-08-13 17:08:26 +09:00
+- 이펙트 체인 통합: 하단 `디바이스`/`플러그인` 탭을 하나의 `이펙트` 탭으로 합치고 built-in DSP와 `vst3:*` EffectInstance가 동일 배열, 순서 변경, 바이패스, 삭제 경로를 사용하도록 정리함. 보기 메뉴·Tab 전환·인스펙터 명칭도 이펙트 체인으로 통일하고 VST3 카드 더블클릭을 향후 native editor 별도 창 진입점으로 예약함.
+- Utility DSP/UI: Input Stereo/Left/Right/Swap, L/R 위상 반전, Width 0–200%, Mono, Bass Mono와 40–500 Hz 분할, Output Gain, Balance, Mute, DC Block을 구현함. Bass Mono는 LR4 저역 분리 뒤 저역만 mono 합산하고 고역 stereo를 유지함.
+- 4band-EQ: 기존 별칭 기반 3밴드 UI/6밴드 내부 불일치를 실제 4밴드 공통 `bandN.*` 모델로 교체함. 포인트 선택 시 Enable/Q/Gain/Freq/Shape를 표시하며 disabled 밴드는 회색 처리함. 1번은 Low Shelf/Low Cut/Bell, 4번은 High Shelf/High Cut/Bell, 중간은 Bell/Notch를 지원함.
+- 8band-EQ: 같은 parametric 코어로 독립 Enable/Q/Gain/Freq/Shape를 갖는 8밴드 DSP와 넓은 편집 UI를 추가함. Stereo mode 표시, Adapt Q, 0–200% Scale, Output Gain을 실제 DSP 계수/출력에 연결함.
+- EQ 드래그 응답: 파라미터 변경 즉시 이전 native 실측 곡선을 무효화하고 로컬 분석 곡선을 그린 뒤 70 ms debounce 후 새 실측 응답으로 교체하도록 바꿔 포인트 드래그가 화면에 즉시 반영됨.
+- 사이드체인: Compressor에 외부 detector 입력을 추가하고 트랙 post-FX 신호를 고정 크기 이중 탭 버퍼로 한 블록 지연 전달함. Sidechain 팝업에서 Enable과 소스 트랙을 선택하며 자기 참조와 기존 의존성 역추적에 의한 순환 참조를 store에서 거부함. Seek/reset 시 탭도 초기화함.
+- 검증: 프런트 Vitest 6개 파일 34개 테스트 통과, lint 무경고, 프로덕션 빌드 성공. Rust 전체 테스트 17개 통과·실장치 테스트 3개 ignored, EQ8 유한 응답·Utility mono·외부 사이드체인 detector 테스트 통과, IPC 바인딩 재생성 및 rustfmt 확인 완료.
+## 2026-08-13 17:34:05 +09:00
+- Piano roll independent layer: removed the editor from the main CSS Grid rows and made it a fixed overlay above the arrangement, inspector, mixer, and effect rack. Layer order is workspace < piano roll < transport < virtual piano/modal < floating plug-in/menu panels. F2, resize, and maximize behavior remain intact.
+- 3-band Distortion DSP: reused the LR4 crossover and phase-alignment path, with independent Off/Tube/Tape/Saturation/Exciter model, Gain, Drive, and Mix controls for Low/Mid/High. Added asymmetric tube saturation with DC blocking, stateful tape hysteresis approximation, symmetric saturation, harmonic-residual exciter, and 4x oversampling per nonlinear band.
+- Distortion UI/analyzer: added a native 256-point FFT updated near 30 fps and exported as 48 logarithmic meter bins without audio-thread allocation. Two vertical crossover handles clamp against each other and disable the Low/High band at the outer edge; three horizontal band lines edit Gain vertically. Registered the device in the rack and inspector catalogs.
+- Verification: production build, lint, 34 Vitest tests, Rust desktop library check, rustfmt, and 19 Rust tests passed (3 hardware tests ignored). Specta IPC bindings regenerated; new tests cover all distortion models, finite FFT output, and crossover edge behavior.
+
+## 2026-08-13 18:18:26 +09:00
+- Track/effect reordering: replaced HTML5 drag-and-drop with a shared pointer-capture gesture that continues tracking at window level, resolves the nearest item after leaving its parent, auto-scrolls the rack/timeline, and commits the correct before/after insertion index. Collapsed effects now retain a dedicated drag grip.
+- Disperser DSP: added up to 64 cascaded double-precision second-order all-pass stages with smoothed Frequency and Pinch parameters, Amount-to-order mapping, state reset, tail estimation, bypass support, project defaults, and effect-factory registration.
+- Disperser UI: added an interactive logarithmic Frequency display with group-delay visualization and note readout, Amount/Frequency/Pinch knobs, rack and inspector catalog entries, device styling, and direct numeric editing through the existing knob controls.
+- Verification: production frontend build and lint passed; 36 Vitest tests passed, including pointer insertion-index coverage. All 14 Rust DSP tests passed, including unity-magnitude and extreme-setting finite-output checks for Disperser; rustfmt passed.
+
+## 2026-08-13 18:49:29 +09:00
+- Arrangement signal meters: moved activity into a 7 px vertical strip attached to the right edge of every track header. Audio tracks show smoothed peak/RMS level; instrument tracks show a binary MIDI gate with a 420 ms visual decay after note-off, while timeline-only activity falls back to the native active-voice state.
+- Shared spectral analysis: extended the allocation-free 256-point/30 fps analyzer path to 4band-EQ, 8band-EQ, and Disperser. Their canvases now render 48 logarithmic post-effect spectrum bins behind the EQ response or all-pass group-delay curve.
+- Floating virtual piano: its header now supports pointer-captured free movement, preserves its last position across CapsLock toggles, and clamps the window inside the viewport after dragging or resizing.
+- EQ interaction and UI: removed delayed native-response swapping during edits, added immediate pointer-local canvas rendering, live spectrum refresh, compact device layouts, refined enabled/disabled band pills and power control, functional cut-filter slope choices (12/24/36/48 dB/oct), and retained working Shape, Q, Gain, Frequency, Adaptive Q, Scale, and Output controls.
+- Verification: frontend production build and lint passed; all 36 Vitest tests passed. Full Rust suite passed 22 tests with 3 real-hardware tests ignored; new DSP coverage verifies finite non-empty EQ and Disperser spectra. rustfmt and generated binding export passed.
+
+## 2026-08-13 19:18:06 +09:00
+- EQ sizing/defaults: replaced the flexible EQ body with a fixed 112 px compact grid so raising the lower panel no longer stretches the response graph. The 8-band global controls now share the parameter row, and higher-specificity knob rules keep all controls visible at the 180 px minimum panel height. New 4band-EQ and 8band-EQ instances both start with band 1 enabled as Low Cut; saved user settings remain unchanged.
+- Native DSP hot-path pass: changed EQ and Disperser to cache-local stage-major traversal; hoisted compressor envelope coefficients and gain-reduction metering out of sample loops; folded multiband meters into recombination; precomputed reverb feedback gains and recursive LFO increments; removed division-based delay-line wrapping; precomputed FFT windows/bin maps; and reduced duplicate oversampling, compensation, smoothing, and DC work in Shaper, Distortion, Delay, Reverb, Utility, and analyzer paths.
+- Regression coverage/documentation: added tests proving both EQ defaults, cubic-delay equivalence, and sparse FIR equivalence, and documented the realtime optimizations in `docs/performance.md`. Production frontend build and lint passed, all 36 Vitest tests passed, the final Rust suite passed 25 tests with 3 real-hardware tests ignored, and the focused DSP suite passed all 18 tests.
+
+## 2026-08-13 19:57:21 +09:00
+- External plug-in model/UI: extended effects and instruments with persistent VST3/CLAP format, UID, vendor, name, and binary path references. The shared effect picker now scans and inserts installed VST3/CLAP effects into track, return, and master chains; instrument tracks can replace Test Tone from a matching external-instrument picker. Cards and inspector rows retain the real plug-in name and format.
+- Crash-isolated discovery: added standard Windows/macOS/Linux VST3 and CLAP paths and a same-executable `--minidaw-plugin-probe` mode. Native binaries are inspected in their own processes with a 15-second per-binary timeout and up to four parallel workers; bad scans are skipped, results are sorted/deduplicated and session-cached, and Tauri IPC bindings now expose format/editor metadata.
+- Realtime hosting: added VST3 stereo effect processing, sample-offset MIDI instrument events, parameter-ID entry points, latency/tail reporting, reset/bypass, and preallocated buffers through `vst3-host`. Added CLAP stereo effect and MIDI instrument processing through `clack-host`, with reusable audio/event storage; the non-Send CLAP main instance stays on a dedicated owner thread while only its Send audio processor enters the realtime graph, then returns to the owner for deactivate/destruction. External instances participate in the existing graph, routing, chain order, and project sync.
+- Scope/documentation: documented standard folders, current stereo-bus support, and the remaining native editor, parameter enumeration/automation, opaque state, multi-bus/sidechain, CLAP PDC, and realtime process-isolation work in `docs/plugin-hosting.md`.
+- Verification: regenerated Specta bindings; production frontend build and lint passed; all 36 Vitest tests passed; all 25 non-hardware Rust tests passed with 3 hardware tests ignored; rustfmt and desktop cargo check passed; the full desktop binary linked and its probe mode exited without opening the GUI.
+
+## 2026-08-13 20:24:38 +09:00
+- VST3 multi-bus hosting: scan metadata now records audio input/output bus counts and sidechain capability. Every declared audio bus is activated before processing when possible; the main input receives the insert-chain stereo signal, auxiliary inputs receive the selected external-sidechain signal, and bus-aware preallocated buffers replace the former single stereo adapter.
+- CLAP multi-port hosting: enabled the host audio-ports extension, enumerated declared port/channel layouts on the plug-in owner thread, preserved all ports during realtime processing, sent the chain to the main input and sidechain audio to every non-main input, and retained the main declared output for MiniDAW's stereo chain.
+- Graph and UI routing: generalized sidechain sources from tracks only to tracks and return buses, and enabled sidechain selection on track, return, and master insert chains. Post-gain track/return taps use deterministic one-block buffering; self references and transitive track/return/master cycles are rejected before graph rebuild. External device cards show discovered input/output bus counts and expose the picker only for sidechain-capable plug-ins.
+- Compatibility and scope: plug-in bus metadata is optional in saved project references and defaults safely when loading older sessions. Additional output buses are activated and processed, while independent stem routing remains a later mixer feature; `docs/plugin-hosting.md` records the exact routing contract.
+- Verification: Specta bindings regenerated. Production frontend build and lint passed; all 38 Vitest tests passed, including return-to-master persistence and track-return cycle rejection. Rust desktop library tests passed 26 tests with 3 real-hardware tests ignored, including live track/return tap resolution and signal propagation; rustfmt passed.
+
+## 2026-08-13 20:59:50 +09:00
+- Compact mixer redesign: rebuilt track strips as 104 px console channels with restrained gradients, high-contrast selection banks, compact name/M-S-arm/send/pan sections, long center faders, slim meters, numeric readouts, and a MAIN/group output selector. Return and master strips now use the same visual grammar with distinct copper and cyan/gold accents, while preserving horizontal scrolling and minimum-panel-height usability.
+- Shared multi-track selection: added ordered `selectedTrackIds` state shared by arrangement and mixer. Shift-click selects the inclusive range while the most recently clicked track remains the inspector/device-rack focus. Mixer fader gestures snapshot every selected channel and apply the same relative dB delta with per-channel clipping; numeric edits and reset use the same group path.
+- True group bus creation: right-click menus in arrangement headers, lanes, and mixer strips expose `선택 트랙으로 버스 채널 생성` for multi-selection. The action creates and focuses a new return/group strip, sets each selected track's main `outputBusId`, and the Rust graph routes those post-fader signals exclusively through that bus instead of also summing them directly to master. Output routing can be changed later from each mixer strip.
+- Automation lanes: added a disclosure control to arrangement track headers, default Volume-lane creation, independent compact lanes below the track, double-click point creation, pointer-captured point dragging with timeline snap, right-click deletion, and lane removal. The categorized searchable `+` picker covers Mixer, Instrument, each built-in DSP, VST3 parameters, and CLAP parameter modules; deleting an effect cleans its dependent lanes.
+- External plug-in automation: scanner metadata now persists VST3 automatable parameter IDs/names/normalized ranges and CLAP parameter IDs/names/modules/plain ranges. CLAP parameter changes enter the realtime event buffer, VST3 uses its existing parameter queue, and Read mode linearly interpolates lanes at control rate through native smoothers. Exact scope and the future sample-accurate Write/Touch/Latch work are documented in `docs/automation.md`.
+- Verification: Specta bindings regenerated; production frontend build and lint passed. All 42 Vitest tests passed, including Shift range selection, grouped relative volumes, group-bus creation/focus, and clipped/sorted automation points. Rust passed 27 tests with 3 real-hardware tests ignored, including exclusive track-to-group routing; rustfmt passed.
+
+## 2026-08-13 21:16:20 +09:00
+- Repository hygiene: initialized the MiniDAW Git repository on `main`, configured the requested MiniStudio remote, excluded local Claude settings and the Rust/Tauri `src-tauri/target` build cache, and removed the existing 2.1 GB generated target directory before the initial source-only checkpoint.
+- Next browser scope recorded from the handoff: the future drag-and-drop browser uses Instrument / Effects / Media tabs and toggles with F5.

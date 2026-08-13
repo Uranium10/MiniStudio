@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }],
+    "typescript/no-explicit-any": "error"
+  },
+  "overrides": [
+    {
+      "files": ["src/engine/rust/bindings.ts"],
+      "rules": {
+        "typescript/no-explicit-any": "off"
+      }
+    },
+    {
+      "files": ["src/engine/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": ["error", { "paths": [{ "name": "react", "message": "The audio engine must remain framework-independent." }, { "name": "react-dom", "message": "The audio engine must remain framework-independent." }] }]
+      }
+    },
+    {
+      "files": ["src/components/**/*.tsx", "src/store/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": ["error", { "patterns": [{ "group": ["**/engine/webaudio/**"], "message": "UI and stores may only use the public engine contract." }] }]
+      }
+    }
+  ]
+}
