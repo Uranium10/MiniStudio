@@ -1,6 +1,6 @@
 // Canvas-based arrangement view with Studio One-style track lanes and tool gestures.
 import { ChevronDown, GripVertical, Headphones, Layers3, MoreHorizontal, Piano, Plus, Radio } from 'lucide-react'
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { describeEngineError, gridLabel, secondsPerBar, secondsPerBeat, type AutomationLane, type Clip, type MidiClip, type TimeSignature, type Track } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { seekTo } from '../store/commands'
@@ -10,6 +10,7 @@ import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { SignalBar } from './controls'
 import { buildRulerTicks } from './rulerMath'
 import { beginPointerReorder } from './pointerReorder'
+import { BROWSER_DRAG_TYPE, readBrowserDrag } from './browserPayload'
 
 const HEADER_WIDTH = 188
 /** Keep the playhead this far from the viewport edge before scrolling ahead. */
@@ -26,6 +27,7 @@ type Gesture = {
 }
 
 export function Timeline() {
+  const engine = useEngine()
   const tracks = useProjectStore((state) => state.project.tracks)
   const pixelsPerSecond = useProjectStore((state) => state.pixelsPerSecond)
   const trackHeight = useProjectStore((state) => state.trackHeight)
@@ -35,6 +37,8 @@ export function Timeline() {
   const addInstrumentTrack = useProjectStore((state) => state.addInstrumentTrack)
   const focused = useProjectStore((state) => state.editFocus === 'arrangement')
   const setEditFocus = useProjectStore((state) => state.setEditFocus)
+  const selectTrack = useProjectStore((state) => state.selectTrack)
+  const [browserDragOver, setBrowserDragOver] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const maxEnd = Math.max(60, ...tracks.flatMap((track) => [...track.clips, ...track.midiClips].map((clip) => clip.startSec + clip.durationSec + 4)))
   const timelineWidth = Math.ceil(maxEnd * pixelsPerSecond)
@@ -42,17 +46,48 @@ export function Timeline() {
   useFollowPlayhead(scrollRef)
   useTimelineWheel(scrollRef)
 
+  const onBrowserDrop = (event: ReactDragEvent<HTMLElement>) => {
+    const payload = readBrowserDrag(event.dataTransfer)
+    setBrowserDragOver(false)
+    if (!payload) return
+    event.preventDefault()
+    const store = useProjectStore.getState()
+    if (payload.kind === 'instrument') {
+      store.addInstrumentTrack(payload.plugin)
+      store.showToast(`${payload.plugin?.name ?? 'DefaultSynth'} 트랙을 추가했습니다.`)
+      return
+    }
+    if (payload.kind === 'media') {
+      void engine.loadAudioFile(payload.path).then((asset) => store.addAssetAsTrack(asset)).catch((error) => store.showToast(`${payload.name}을 불러오지 못했습니다: ${String(error)}`))
+      return
+    }
+    const element = event.target instanceof Element ? event.target : null
+    const targetId = element?.closest<HTMLElement>('[data-track-id]')?.dataset.trackId ?? store.selectedTrackId
+    if (!targetId) { store.showToast('이펙트를 놓을 트랙을 먼저 선택하세요.'); return }
+    store.selectTrack(targetId)
+    store.addEffect(targetId, payload.type, payload.plugin)
+    store.setRackTarget({ kind: 'track', id: targetId })
+  }
+
   return (
-    <section className={`arrangement ${focused ? 'edit-focused' : ''}`} aria-label="Arrangement timeline" onPointerDownCapture={() => setEditFocus('arrangement')}>
+    <section
+      className={`arrangement ${focused ? 'edit-focused' : ''} ${browserDragOver ? 'browser-drop-active' : ''}`}
+      aria-label="Arrangement timeline"
+      onPointerDownCapture={(event) => { setEditFocus('arrangement'); if (event.target instanceof Element && !event.target.closest('.track-stack')) selectTrack(null) }}
+      onDragEnter={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) setBrowserDragOver(true) }}
+      onDragOver={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }}
+      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setBrowserDragOver(false) }}
+      onDrop={onBrowserDrop}
+    >
       <div className="arrangement-topline"><span>ARRANGEMENT</span><div><span className="legend-grid" />그리드 {gridLabel(gridTicks)}{snapEnabled ? '' : ' (스냅 꺼짐)'} <span className="legend-loop" />루프 영역 · Ctrl+휠 줌</div></div>
       <div className="timeline-scroll" ref={scrollRef}>
         <div className="timeline-content" style={{ width: HEADER_WIDTH + timelineWidth }}>
           <div className="ruler-row">
-            <div className="track-list-heading"><span>트랙</span><button onClick={addTrack} title="오디오 트랙 추가"><Plus size={14} /></button><button onClick={addInstrumentTrack} title="인스트루먼트 트랙 추가"><Piano size={13} /></button></div>
+            <div className="track-list-heading"><span>트랙</span><button onClick={addTrack} title="오디오 트랙 추가"><Plus size={14} /></button><button onClick={() => addInstrumentTrack()} title="인스트루먼트 트랙 추가"><Piano size={13} /></button></div>
             <Ruler width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />
           </div>
           <LoopStrip width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />
-          {tracks.map((track, index) => <div className="track-stack" key={track.id}>
+          {tracks.map((track, index) => <div className="track-stack" data-track-id={track.id} key={track.id}>
             <div className="track-row" style={{ height: trackHeight }}>
               <TrackHeader track={track} index={index} />
               <TrackLane track={track} width={timelineWidth} height={trackHeight} scrollRef={scrollRef} />

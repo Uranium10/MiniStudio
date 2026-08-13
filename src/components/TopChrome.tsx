@@ -135,6 +135,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
         separator,
         item('하단 인터페이스 접기 / 펴기', store.toggleLowerPanel, { keys: 'F3', checked: !store.lowerPanelCollapsed }),
         item('좌측 인스펙터 접기 / 펴기', store.toggleInspector, { keys: 'F4', checked: store.inspectorVisible }),
+        item('미디어 브라우저 접기 / 펴기', store.toggleBrowser, { keys: 'F5', checked: store.browserVisible }),
         item('에디터 최대화', store.toggleEditorMaximized, { checked: store.editorMaximized }),
         item('플레이헤드 따라가기', store.toggleFollowPlayhead, { keys: 'Shift+F', checked: store.followPlayhead }),
         separator,

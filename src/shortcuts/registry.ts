@@ -5,7 +5,7 @@ export type ShortcutId =
   | 'edit.copy' | 'edit.cut' | 'edit.paste' | 'edit.mute'
   | 'file.new' | 'file.save' | 'file.open' | 'file.export'
   | 'view.zoomIn' | 'view.zoomOut' | 'view.trackIn' | 'view.trackOut' | 'view.fit' | 'view.panel' | 'view.tab'
-  | 'view.follow' | 'view.shortcuts' | 'view.pianoRoll' | 'view.bottomPanel' | 'view.inspector'
+  | 'view.follow' | 'view.shortcuts' | 'view.pianoRoll' | 'view.bottomPanel' | 'view.inspector' | 'view.browser'
   | 'tool.pick' | 'tool.temporary' | 'midi.transpose' | 'midi.duplicate' | 'midi.octave' | 'timeline.wheelZoom' | 'timeline.wheelScroll'
 
 export type ShortcutDefinition = { id: ShortcutId; label: string; keys: string }
@@ -59,6 +59,7 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
       { id: 'view.pianoRoll', label: '피아노롤 열기 / 닫기', keys: 'F2' },
       { id: 'view.bottomPanel', label: '하단 인터페이스 열기 / 닫기', keys: 'F3' },
       { id: 'view.inspector', label: '인스펙터 열기 / 닫기', keys: 'F4' },
+      { id: 'view.browser', label: '미디어 브라우저 열기 / 닫기', keys: 'F5' },
       { id: 'timeline.wheelZoom', label: '커서 기준 가로 줌', keys: 'Ctrl+휠' },
       { id: 'timeline.wheelScroll', label: '가로 스크롤', keys: 'Shift+휠' },
     ],

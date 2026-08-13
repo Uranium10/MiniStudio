@@ -24,6 +24,7 @@ type ProjectStore = {
   pianoRollOpen: boolean
   pianoRollHeight: number
   inspectorVisible: boolean
+  browserVisible: boolean
   recordingEnabled: boolean
   countInBars: 0 | 1 | 2
   overdubMode: 'merge' | 'new'
@@ -63,7 +64,7 @@ type ProjectStore = {
   selectClip(id: string, additive?: boolean): void
   clearClipSelection(): void
   addTrack(): void
-  addInstrumentTrack(): void
+  addInstrumentTrack(plugin?: ExternalPluginRef): string
   removeSelectedTrack(): void
   removeTrack(trackId: string): void
   duplicateTrack(trackId: string): void
@@ -114,6 +115,7 @@ type ProjectStore = {
   togglePianoRoll(): void
   setPianoRollHeight(value: number): void
   toggleInspector(): void
+  toggleBrowser(): void
   setRecordingEnabled(enabled: boolean): void
   updateEffect(trackId: string, effectId: string, params: Record<string, number>): void
   toggleEffectBypass(trackId: string, effectId: string): void
@@ -245,6 +247,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     pianoRollOpen: false,
     pianoRollHeight: 300,
     inspectorVisible: true,
+    browserVisible: false,
     recordingEnabled: false,
     countInBars: 0,
     overdubMode: 'merge',
@@ -254,7 +257,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     snapEnabled: true,
     gridTicks: 240,
     followPlayhead: true,
-    lowerPanelHeight: 276,
+    lowerPanelHeight: 350,
     lowerPanelCollapsed: false,
     lowerTab: 'mixer',
     toast: null,
@@ -298,12 +301,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     setPlaying: (value) => set((state) => ({ project: { ...state.project, transport: { ...state.project.transport, isPlaying: value } } })),
     selectTrack: (id, range = false) => set((state) => {
       if (!id) return { selectedTrackId: null, selectedTrackIds: [] }
-      if (!range || !state.selectedTrackId) return { selectedTrackId: id, selectedTrackIds: [id], rackTarget: { kind: 'track' as const, id } }
+      if (!range || !state.selectedTrackId) return { selectedTrackId: id, selectedTrackIds: [id] }
       const anchor = state.project.tracks.findIndex((track) => track.id === state.selectedTrackId)
       const target = state.project.tracks.findIndex((track) => track.id === id)
-      if (anchor < 0 || target < 0) return { selectedTrackId: id, selectedTrackIds: [id], rackTarget: { kind: 'track' as const, id } }
+      if (anchor < 0 || target < 0) return { selectedTrackId: id, selectedTrackIds: [id] }
       const [from, to] = anchor < target ? [anchor, target] : [target, anchor]
-      return { selectedTrackId: id, selectedTrackIds: state.project.tracks.slice(from, to + 1).map((track) => track.id), rackTarget: { kind: 'track' as const, id } }
+      return { selectedTrackId: id, selectedTrackIds: state.project.tracks.slice(from, to + 1).map((track) => track.id) }
     }),
     setEditFocus: (focus) => set({ editFocus: focus }),
     selectClip: (id, additive = false) => set((state) => ({ selectedClipIds: additive ? [...new Set([...state.selectedClipIds, id])] : [id], editFocus: 'arrangement' })),
@@ -313,11 +316,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       project.tracks.push({ id, kind: 'audio', name: `Audio ${project.tracks.length + 1}`, color: '#5ba8ff', clips: [], midiClips: [], instrument: null, volumeDb: 0, pan: 0, muted: false, solo: false, armed: false, effects: [], sends: project.buses.map((bus) => ({ id: crypto.randomUUID(), targetBusId: bus.id, gainDb: -60, preFader: false })), outputBusId: null, automationOpen: false, automationLanes: [] })
       queueMicrotask(() => set({ selectedTrackId: id, selectedTrackIds: [id] }))
     }),
-    addInstrumentTrack: () => mutateProject((project) => {
+    addInstrumentTrack: (plugin) => {
       const id = `instrument-${crypto.randomUUID()}`
-      project.tracks.push({ id, kind: 'instrument', name: `Instrument ${project.tracks.filter((track) => track.kind === 'instrument').length + 1}`, color: '#66d3ff', clips: [], midiClips: [], instrument: { id: crypto.randomUUID(), type: 'builtin:testtone', bypassed: false, params: { waveform: 0, attack: 0.01, decay: 0.15, sustain: 0.7, release: 0.3, gainDb: -12, polyphony: 16, velocityCurve: 1 } }, volumeDb: 0, pan: 0, muted: false, solo: false, armed: true, effects: [], sends: [], outputBusId: null, automationOpen: false, automationLanes: [] })
-      queueMicrotask(() => set({ selectedTrackId: id, selectedTrackIds: [id], rackTarget: { kind: 'track', id } }))
-    }),
+      mutateProject((project) => {
+        const instrumentNumber = project.tracks.filter((track) => track.kind === 'instrument').length + 1
+        project.tracks.push({ id, kind: 'instrument', name: plugin?.name ?? `Instrument ${instrumentNumber}`, color: '#66d3ff', clips: [], midiClips: [], instrument: plugin ? { id: crypto.randomUUID(), type: `${plugin.format}:${plugin.uid}`, bypassed: false, params: {}, plugin } : { id: crypto.randomUUID(), type: 'builtin:testtone', bypassed: false, params: { waveform: 0, attack: 0.01, decay: 0.15, sustain: 0.7, release: 0.3, gainDb: -12, polyphony: 16, velocityCurve: 1 } }, volumeDb: 0, pan: 0, muted: false, solo: false, armed: true, effects: [], sends: [], outputBusId: null, automationOpen: false, automationLanes: [] })
+      })
+      set({ selectedTrackId: id, selectedTrackIds: [id] })
+      return id
+    },
     removeSelectedTrack: () => {
       const id = get().selectedTrackId
       if (id) get().removeTrack(id)
@@ -812,6 +819,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     togglePianoRoll: () => set((state) => ({ pianoRollOpen: !state.pianoRollOpen, editorMaximized: state.pianoRollOpen ? false : state.editorMaximized })),
     setPianoRollHeight: (value) => set({ pianoRollHeight: Math.max(180, Math.min(720, value)), pianoRollOpen: true }),
     toggleInspector: () => set((state) => ({ inspectorVisible: !state.inspectorVisible })),
+    toggleBrowser: () => set((state) => ({ browserVisible: !state.browserVisible })),
     setRecordingEnabled: (enabled) => set({ recordingEnabled: enabled }),
     updateEffect: (trackId, effectId, params) => {
       const current = get().project
@@ -955,7 +963,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     toggleSnap: () => set((state) => ({ snapEnabled: !state.snapEnabled })),
     setGridTicks: (ticks) => set({ gridTicks: Math.max(1, Math.round(ticks)) }),
     toggleFollowPlayhead: () => set((state) => ({ followPlayhead: !state.followPlayhead })),
-    setLowerPanelHeight: (value) => set({ lowerPanelHeight: Math.max(180, Math.min(720, value)), lowerPanelCollapsed: false }),
+    setLowerPanelHeight: (value) => set({ lowerPanelHeight: Math.max(315, Math.min(720, value)), lowerPanelCollapsed: false }),
     toggleLowerPanel: () => set((state) => ({ lowerPanelCollapsed: !state.lowerPanelCollapsed })),
     setLowerTab: (tab) => set({ lowerTab: tab, lowerPanelCollapsed: false }),
     setShortcutsOpen: (open) => set({ shortcutsOpen: open }),

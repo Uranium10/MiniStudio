@@ -32,6 +32,10 @@ project rebuild path.
 `opt-level = 2`, while dependency crates stay at `opt-level = 0` to keep the
 large Tauri dependency graph cheaper to rebuild. The target cache lives in
 `C:\tmp\minidaw-msvc-target` to avoid Desktop indexer and antivirus file locks.
+The regular `dev` and `test` profiles disable Cargo incremental compilation and
+dependency debug symbols. This trades a little warm-check latency for a much
+smaller and more stable cache; the realtime `dev-dsp` profile was already
+non-incremental. The external target directory remains fully disposable.
 
 The first build of a new profile is intentionally expensive. On the reference
 Windows machine used on 2026-08-12:

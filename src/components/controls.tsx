@@ -7,11 +7,12 @@ import { useEngine } from '../hooks/useEngine'
 // window. preventDefault on pointerdown stops any ancestor from starting a native
 // HTML5 drag, which would otherwise fire pointercancel and kill the gesture.
 type KnobDrag = { pointerId: number; anchorY: number; anchorValue: number; fine: boolean; moved: boolean }
+type KnobScale = 'linear' | 'log'
 
-export function Knob({ value, min, max, step, label, format = (current) => current.toFixed(1), defaultValue, onChange }: { value: number; min: number; max: number; step: number; label: string; format?: (value: number) => string; defaultValue: number; onChange(value: number): void }) {
+export function Knob({ value, min, max, step, scale = 'linear', label, format = (current) => current.toFixed(1), defaultValue, onChange }: { value: number; min: number; max: number; step: number; scale?: KnobScale; label: string; format?: (value: number) => string; defaultValue: number; onChange(value: number): void }) {
   const dragRef = useRef<KnobDrag | null>(null)
   const elementRef = useRef<HTMLButtonElement>(null)
-  const normalized = (value - min) / (max - min)
+  const normalized = controlNormalized(value, min, max, scale)
   const angle = -135 + normalized * 270
 
   const endDrag = () => {
@@ -47,16 +48,17 @@ export function Knob({ value, min, max, step, label, format = (current) => curre
       drag.anchorValue = value
     }
     drag.moved = true
-    const travel = (drag.anchorY - event.clientY) / 90 * (max - min) * (drag.fine ? 0.15 : 1)
-    onChange(clampStep(drag.anchorValue + travel, min, max, step))
+    const travel = (drag.anchorY - event.clientY) / 90 * (drag.fine ? 0.15 : 1)
+    const next = controlValue(controlNormalized(drag.anchorValue, min, max, scale) + travel, min, max, scale)
+    onChange(clampStep(next, min, max, step))
   }
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
     const coarse = event.shiftKey ? 0.1 : 1
-    const page = (max - min) / 20
+    const pageValue = (direction: number) => controlValue(controlNormalized(value, min, max, scale) + direction / 20, min, max, scale) - value
     const delta = event.key === 'ArrowUp' || event.key === 'ArrowRight' ? step * coarse
       : event.key === 'ArrowDown' || event.key === 'ArrowLeft' ? -step * coarse
-        : event.key === 'PageUp' ? page : event.key === 'PageDown' ? -page : 0
+        : event.key === 'PageUp' ? pageValue(1) : event.key === 'PageDown' ? pageValue(-1) : 0
     if (delta) { event.preventDefault(); onChange(clampStep(value + delta, min, max, step)); return }
     if (event.key === 'Home' || event.key === 'Backspace') { event.preventDefault(); onChange(defaultValue) }
   }
@@ -104,6 +106,18 @@ export function EditableNumber({ value, min, max, step, onChange, format = Strin
 function clampStep(value: number, min: number, max: number, step: number): number {
   const clipped = Math.max(min, Math.min(max, value))
   return Number((Math.round((clipped - min) / step) * step + min).toFixed(8))
+}
+
+function controlNormalized(value: number, min: number, max: number, scale: KnobScale): number {
+  const clipped = Math.max(min, Math.min(max, value))
+  if (scale === 'log' && min > 0 && max > min) return Math.log(clipped / min) / Math.log(max / min)
+  return (clipped - min) / Math.max(Number.EPSILON, max - min)
+}
+
+function controlValue(normalized: number, min: number, max: number, scale: KnobScale): number {
+  const ratio = Math.max(0, Math.min(1, normalized))
+  if (scale === 'log' && min > 0 && max > min) return min * (max / min) ** ratio
+  return min + (max - min) * ratio
 }
 
 export function LevelMeter({ trackId }: { trackId?: string }) {

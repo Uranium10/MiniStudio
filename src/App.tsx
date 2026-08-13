@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { Inspector } from './components/Inspector'
 import { AudioSettingsDialog } from './components/AudioSettingsDialog'
+import { BrowserPanel } from './components/BrowserPanel'
 import { LowerPanel } from './components/LowerPanel'
 import { MissingAssetsDialog } from './components/MissingAssetsDialog'
 import { PianoRollPanel } from './components/PianoRollPanel'
@@ -25,6 +26,7 @@ export default function App() {
   const pianoRollOpen = useProjectStore((state) => state.pianoRollOpen)
   const pianoRollHeight = useProjectStore((state) => state.pianoRollHeight)
   const inspectorVisible = useProjectStore((state) => state.inspectorVisible)
+  const browserVisible = useProjectStore((state) => state.browserVisible)
   const toast = useProjectStore((state) => state.toast)
   useShortcuts()
 
@@ -86,7 +88,8 @@ export default function App() {
     >
       <MenuBar />
       <ToolBar />
-      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'}`}>
+      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'} ${browserVisible ? 'browser-visible' : ''}`}>
+        {browserVisible && <BrowserPanel />}
         {inspectorVisible && <Inspector />}
         <Timeline />
       </main>

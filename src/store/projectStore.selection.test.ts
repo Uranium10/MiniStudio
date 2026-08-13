@@ -14,7 +14,16 @@ describe('multi-track selection and routing', () => {
     const state = useProjectStore.getState()
     expect(state.selectedTrackIds).toEqual(tracks.slice(0, 3).map((track) => track.id))
     expect(state.selectedTrackId).toBe(tracks[2]!.id)
-    expect(state.rackTarget).toEqual({ kind: 'track', id: tracks[2]!.id })
+    expect(state.rackTarget).toEqual({ kind: 'track', id: tracks[0]!.id })
+  })
+
+  it('keeps track focus separate from the explicitly opened FX rack', () => {
+    const tracks = useProjectStore.getState().project.tracks
+    useProjectStore.getState().selectTrack(tracks[1]!.id)
+    expect(useProjectStore.getState().selectedTrackIds).toEqual([tracks[1]!.id])
+    expect(useProjectStore.getState().rackTarget).toEqual({ kind: 'track', id: tracks[0]!.id })
+    useProjectStore.getState().setRackTarget({ kind: 'track', id: tracks[1]!.id })
+    expect(useProjectStore.getState().lowerTab).toBe('effects')
   })
 
   it('updates a selected volume bank in one project edit', () => {

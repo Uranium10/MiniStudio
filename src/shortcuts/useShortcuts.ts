@@ -24,6 +24,7 @@ export function useShortcuts(): void {
       if (event.key === 'F2') { event.preventDefault(); store.togglePianoRoll(); return }
       if (event.key === 'F3') { event.preventDefault(); store.toggleLowerPanel(); return }
       if (event.key === 'F4') { event.preventDefault(); store.toggleInspector(); return }
+      if (event.key === 'F5') { event.preventDefault(); store.toggleBrowser(); return }
       if (isEditable(event.target)) return
       if (store.virtualPianoOpen) return
       if (store.shortcutsOpen && event.key === 'Escape') { event.preventDefault(); store.setShortcutsOpen(false); return }

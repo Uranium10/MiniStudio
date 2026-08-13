@@ -4,10 +4,12 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Bus, EffectInstance, EffectType, ExternalPluginRef, PluginDescriptor, Track } from '../engine'
 import { effectiveMasterGainDb, MUTE_GAIN_DB } from '../engine'
 import { useEngine } from '../hooks/useEngine'
+import { scanPluginsOnce } from '../plugins/scan'
 import { useProjectStore, type LowerTab, type RackTarget } from '../store/projectStore'
 import { EditableNumber, Knob, LevelMeter, subscribeMeterFrame } from './controls'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { beginPointerReorder } from './pointerReorder'
+import { displayFrequencyAtX, FREQUENCY_TICKS, frequencyToX, parameterFrequencyAtX, spectrumFrequencyAtIndex } from './frequencyScale'
 
 export function LowerPanel() {
   const collapsed = useProjectStore((state) => state.lowerPanelCollapsed)
@@ -44,9 +46,10 @@ export function LowerPanel() {
 function Mixer() {
   const tracks = useProjectStore((state) => state.project.tracks)
   const buses = useProjectStore((state) => state.project.buses)
+  const clearTrackSelection = useProjectStore((state) => state.selectTrack)
   return (
     <div className="mixer-shell">
-      <div className="mixer-scroll">
+      <div className="mixer-scroll" onClick={(event) => { if (event.target === event.currentTarget) clearTrackSelection(null) }}>
         {tracks.map((track, index) => <TrackStrip key={track.id} track={track} index={index} />)}
         {buses.map((bus) => <BusStrip key={bus.id} bus={bus} />)}
       </div>
@@ -70,6 +73,8 @@ function TrackStripView({ track, index }: { track: Track; index: number }) {
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const faderStart = useRef<{ source: number; values: Map<string, number> } | null>(null)
   const engine = useEngine()
+  const focusSingle = () => selectTrack(track.id)
+  const openFx = () => { focusSingle(); useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id }) }
   const beginFader = (event: React.PointerEvent<HTMLInputElement>) => {
     event.stopPropagation()
     const state = useProjectStore.getState()
@@ -88,17 +93,17 @@ function TrackStripView({ track, index }: { track: Track; index: number }) {
   }
   const contextItems: MenuItem[] = menu ? [
     { kind: 'label', label: selectedTrackIds.length > 1 ? `${selectedTrackIds.length}개 트랙 선택됨` : track.name },
-    { kind: 'item', label: '이펙트 체인 열기', run: () => useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id }) },
+    { kind: 'item', label: '이펙트 체인 열기', run: openFx },
     { kind: 'item', label: '선택 트랙으로 버스 채널 생성', icon: <Layers3 size={13} />, disabled: selectedTrackIds.length < 2, run: () => { createBus() } },
   ] : []
   return (
     <article className={`channel-strip ${selected ? 'selected' : ''}`} onClick={(event) => selectTrack(track.id, event.shiftKey)} onContextMenu={(event) => { event.preventDefault(); if (!selected) selectTrack(track.id); setMenu({ x: event.clientX, y: event.clientY }) }}>
       <div className="channel-color" style={{ background: track.color }} />
-      <div className="channel-title"><span>{String(index + 1).padStart(2, '0')}</span><input value={track.name} onChange={(event) => updateTrack(track.id, { name: event.target.value })} /></div>
+      <div className="channel-title"><span>{String(index + 1).padStart(2, '0')}</span><input value={track.name} onChange={(event) => updateTrack(track.id, { name: event.target.value })} /><button className="channel-fx-button" title="이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); openFx() }}>FX</button></div>
       <div className="channel-buttons">
-        <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
-        <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
-        <button className={track.armed ? 'active arm' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { armed: !track.armed }) }}>●</button>
+        <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); focusSingle(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
+        <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); focusSingle(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
+        <button className={track.armed ? 'active arm' : ''} onClick={(event) => { event.stopPropagation(); focusSingle(); updateTrack(track.id, { armed: !track.armed }) }}>●</button>
       </div>
       <div className="send-routes">
         {track.sends.map((send) => <div className="send-route" key={send.id}><span><select aria-label="센드 라우팅" value={send.targetBusId} onChange={(event) => { if (!event.target.value) removeSend(track.id, send.id); else updateSendRoute(track.id, send.id, event.target.value) }}><option value="">센드 제거</option>{buses.map((bus) => <option key={bus.id} value={bus.id}>{bus.name}</option>)}</select><button title="센드 제거" onClick={() => removeSend(track.id, send.id)}><X size={9} /></button></span><input title="센드 레벨" type="range" min="-60" max="6" step="0.1" value={send.gainDb} onChange={(event) => { const value = Number(event.target.value); updateSend(track.id, send.id, value); engine.setSendLevel(send.id, value) }} /><EditableNumber value={send.gainDb} min={-60} max={6} step={0.1} onChange={(value) => { updateSend(track.id, send.id, value); engine.setSendLevel(send.id, value) }} format={(value) => value <= -59.9 ? '-∞' : `${value.toFixed(1)} dB`} /></div>)}
@@ -111,7 +116,7 @@ function TrackStripView({ track, index }: { track: Track; index: number }) {
         <LevelMeter trackId={track.id} />
       </div>
       <div className="db-readout-shell" onClick={(event) => event.stopPropagation()}><EditableNumber className="db-readout" value={track.volumeDb} min={-60} max={12} step={0.1} onChange={(value) => applyGroupVolume(value, false)} format={(value) => `${value <= -59.9 ? '-∞' : value.toFixed(1)} dB`} /></div>
-      <select className="channel-output" title={track.outputBusId ? '그룹 버스로 출력' : '마스터로 출력'} value={track.outputBusId ?? ''} onClick={(event) => event.stopPropagation()} onChange={(event) => updateTrack(track.id, { outputBusId: event.target.value || null })}><option value="">MAIN</option>{buses.map((bus) => <option key={bus.id} value={bus.id}>{bus.name}</option>)}</select>
+      <select className="channel-output" title={track.outputBusId ? '그룹 버스로 출력' : '마스터로 출력'} value={track.outputBusId ?? ''} onClick={(event) => { event.stopPropagation(); focusSingle() }} onChange={(event) => updateTrack(track.id, { outputBusId: event.target.value || null })}><option value="">MAIN</option>{buses.map((bus) => <option key={bus.id} value={bus.id}>{bus.name}</option>)}</select>
       {menu && <MenuPanel items={contextItems} anchor={menu} onClose={() => setMenu(null)} className="context-menu" />}
     </article>
   )
@@ -128,8 +133,8 @@ function BusStripView({ bus }: { bus: Bus }) {
   // The graph only knows a strip gain, so mute is applied as an effective gain.
   const applyGain = (value: number, muted = bus.muted) => { update(bus.id, value); engine.setBusVolume(bus.id, muted ? MUTE_GAIN_DB : value) }
   return (
-    <article className={`channel-strip bus-strip ${selected ? 'selected' : ''}`} onClick={() => selectRack({ kind: 'bus', id: bus.id })}>
-      <div className="channel-color bus-color" /><div className="channel-title"><span>↪</span><strong>{bus.name}</strong></div>
+    <article className={`channel-strip bus-strip ${selected ? 'selected' : ''}`} onClick={() => useProjectStore.getState().selectTrack(null)}>
+      <div className="channel-color bus-color" /><div className="channel-title"><span>↪</span><strong>{bus.name}</strong><button className="channel-fx-button" title="이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); useProjectStore.getState().selectTrack(null); selectRack({ kind: 'bus', id: bus.id }) }}>FX</button></div>
       <div className="bus-effects">{bus.effects.length ? bus.effects.map((effect) => <span key={effect.id}>{deviceName(effect.type, effect.plugin)}</span>) : <span className="empty">No effects</span>}</div>
       {/* The engine snapshot carries per-track and master levels only, so a return
           bus shows an inert meter rather than borrowing another strip's level. */}
@@ -137,7 +142,6 @@ function BusStripView({ bus }: { bus: Bus }) {
       <EditableNumber className="db-readout" value={bus.volumeDb} min={-60} max={12} step={0.1} onChange={(value) => applyGain(value)} format={(value) => `${value.toFixed(1)} dB`} />
       <div className="channel-buttons">
         <button className={bus.muted ? 'active mute' : ''} title="리턴 버스 뮤트" onClick={(event) => { event.stopPropagation(); toggleMute(bus.id); engine.setBusVolume(bus.id, bus.muted ? bus.volumeDb : MUTE_GAIN_DB) }}>M</button>
-        <button title="이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); selectRack({ kind: 'bus', id: bus.id }) }}>FX</button>
       </div>
     </article>
   )
@@ -154,8 +158,8 @@ function MasterStrip() {
   const engine = useEngine()
   const applyGain = (value: number) => { update(value); engine.setMasterVolume(effectiveMasterGainDb({ ...master, volumeDb: value })) }
   return (
-    <article className="channel-strip master-strip" onClick={() => selectRack({ kind: 'master', id: 'master' })}>
-      <div className="channel-color master-color" /><div className="channel-title"><span>∑</span><strong>MASTER</strong></div>
+    <article className="channel-strip master-strip" onClick={() => useProjectStore.getState().selectTrack(null)}>
+      <div className="channel-color master-color" /><div className="channel-title"><span>∑</span><strong>MASTER</strong><button className="channel-fx-button" title="마스터 이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); useProjectStore.getState().selectTrack(null); selectRack({ kind: 'master', id: 'master' }) }}>FX</button></div>
       <div className="master-label">MAIN OUT<br /><small>1 / 2 · FX {master.effects.length}{master.dim ? ' · DIM -20 dB' : ''}</small></div>
       <div className="fader-zone"><input className="vertical-fader" style={faderStyle(master.volumeDb)} aria-valuetext={`${master.volumeDb.toFixed(1)} dB`} type="range" min="-60" max="12" step="0.1" value={master.volumeDb} onDoubleClick={() => applyGain(0)} onChange={(event) => applyGain(Number(event.target.value))} /><LevelMeter /></div>
       <EditableNumber className="db-readout" value={master.volumeDb} min={-60} max={12} step={0.1} onChange={applyGain} format={(gain) => `${gain.toFixed(1)} dB`} />
@@ -168,6 +172,7 @@ function MasterStrip() {
 }
 
 function DeviceRack() {
+  const clearTrackSelection = useProjectStore((state) => state.selectTrack)
   const target = useProjectStore((state) => state.rackTarget)
   const tracks = useProjectStore((state) => state.project.tracks)
   const buses = useProjectStore((state) => state.project.buses)
@@ -189,7 +194,7 @@ function DeviceRack() {
     { kind: 'item', label: '삭제', icon: <Trash2 size={13} />, danger: true, run: () => target.kind === 'track' ? useProjectStore.getState().removeEffect(target.id, menu.effect.id) : removeEffect(target, menu.effect.id) },
   ] : []
   return (
-    <div className="device-rack" onClick={() => setMenu(null)}>
+    <div className="device-rack" onPointerDownCapture={() => clearTrackSelection(null)} onClick={() => setMenu(null)}>
       <div className={`rack-track ${target.kind === 'master' ? 'master-rack-target' : ''}`}><span style={{ background: color }} /><strong>{name}</strong><small>{target.kind === 'master' ? 'Master insert chain' : target.kind === 'bus' ? 'Return bus effects' : 'Audio effects'}</small></div>
       <div className="device-chain">
         {targetTrack?.kind === 'instrument' && targetTrack.instrument && <InstrumentCard track={targetTrack} />}
@@ -281,8 +286,8 @@ function DistortionPanel({ effectId, params, bypassed, setParam }: { effectId: s
       <label>MODEL<select value={Math.round(params[`${selected}Mode`] ?? 0)} onChange={(event) => setParam(`${selected}Mode`, Number(event.target.value))}>{DISTORTION_MODES.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}</select></label>
       <Knob value={params[`${selected}GainDb`] ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`${selected}GainDb`, value)} />
       <Knob value={params[`${selected}DriveDb`] ?? 6} min={0} max={36} step={.1} defaultValue={6} label="DRIVE" format={dbFormat} onChange={(value) => setParam(`${selected}DriveDb`, value)} />
-      <Knob value={params.splitLow ?? 180} min={20} max={Math.max(21, (params.splitHigh ?? 4500) / 1.05)} step={1} defaultValue={180} label="LOW FREQ" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
-      <Knob value={params.splitHigh ?? 4500} min={Math.min(19_999, (params.splitLow ?? 180) * 1.05)} max={20_000} step={10} defaultValue={4500} label="HIGH FREQ" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
+      <Knob value={params.splitLow ?? 180} min={20} max={Math.max(21, (params.splitHigh ?? 4500) / 1.05)} step={1} scale="log" defaultValue={180} label="LOW FREQ" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
+      <Knob value={params.splitHigh ?? 4500} min={Math.min(19_999, (params.splitLow ?? 180) * 1.05)} max={20_000} step={10} scale="log" defaultValue={4500} label="HIGH FREQ" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
       <Knob value={params[`${selected}Mix`] ?? .75} min={0} max={1} step={.01} defaultValue={.75} label="MIX" format={percentFormat} onChange={(value) => setParam(`${selected}Mix`, value)} />
     </div>
     <div className="distortion-tabs">{DISTORTION_BANDS.map((band) => <button key={band.id} className={selected === band.id ? 'active' : ''} style={{ '--band-color': band.color } as React.CSSProperties} onClick={() => setSelected(band.id)}><b>{band.id.toUpperCase()}</b><span>{DISTORTION_MODES[Math.round(params[`${band.id}Mode`] ?? 0)]}</span></button>)}</div>
@@ -301,20 +306,20 @@ function DistortionDisplay({ effectId, params, bypassed, selected, onSelect, onP
     const { width, height } = canvas; const xFor = (frequency: number) => frequencyToX(frequency, width); const yFor = (db: number) => height / 2 - Math.max(-24, Math.min(24, db)) / 24 * height * .4
     const lowX = xFor(low); const highX = xFor(high)
     const background = context.createLinearGradient(0, 0, 0, height); background.addColorStop(0, '#16222a'); background.addColorStop(1, '#0b1116'); context.fillStyle = background; context.fillRect(0, 0, width, height)
+    drawFrequencyGrid(context, width, height, '#283640')
     context.strokeStyle = '#283640'; context.lineWidth = 1
-    for (const frequency of [50, 100, 500, 1000, 5000, 10000]) { const x = xFor(frequency); context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke() }
     for (const db of [-12, 0, 12]) { const y = yFor(db); context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke() }
     const spectrum = engine.getDistortionSpectrum(effectId); context.beginPath()
-    for (let index = 0; index < spectrum.length; index += 1) { const x = index / Math.max(1, spectrum.length - 1) * width; const db = 20 * Math.log10(Math.max(1e-5, spectrum[index] ?? 0)); const y = height - Math.max(0, Math.min(1, (db + 72) / 72)) * height * .88; if (index === 0) context.moveTo(x, y); else context.lineTo(x, y) }
+    for (let index = 0; index < spectrum.length; index += 1) { const x = xFor(spectrumFrequencyAtIndex(index, spectrum.length)); const db = 20 * Math.log10(Math.max(1e-5, spectrum[index] ?? 0)); const y = height - Math.max(0, Math.min(1, (db + 72) / 72)) * height * .88; if (index === 0) context.moveTo(x, y); else context.lineTo(x, y) }
     context.lineTo(width, height); context.lineTo(0, height); context.closePath(); const fill = context.createLinearGradient(0, 0, 0, height); fill.addColorStop(0, bypassed ? '#7a87902a' : '#5ad3f75b'); fill.addColorStop(1, '#18313b08'); context.fillStyle = fill; context.fill()
     const ranges: Array<{ band: DistortionBandName; from: number; to: number; color: string }> = [{ band: 'low', from: 0, to: lowX, color: '#f0ca62' }, { band: 'mid', from: lowX, to: highX, color: '#62d4f4' }, { band: 'high', from: highX, to: width, color: '#ed916e' }]
     for (const range of ranges) { const y = yFor(gain(range.band)); context.beginPath(); context.moveTo(range.from, y); context.lineTo(range.to, y); context.strokeStyle = bypassed ? '#68747c' : range.color; context.lineWidth = selected === range.band ? 3 : 2; context.stroke(); context.fillStyle = selected === range.band ? `${range.color}18` : `${range.color}0b`; context.fillRect(range.from, 0, range.to - range.from, height); context.fillStyle = range.color; context.font = 'bold 8px sans-serif'; context.textAlign = 'center'; context.fillText(range.band.toUpperCase(), (range.from + range.to) / 2, 12) }
     for (const [frequency, color] of [[low, '#f0ca62'], [high, '#ed916e']] as Array<[number, string]>) { const x = xFor(frequency); context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.strokeStyle = color; context.lineWidth = 2; context.stroke(); context.fillStyle = color; context.fillRect(x - 3, height / 2 - 10, 6, 20) }
-    context.fillStyle = '#8b9aa4'; context.font = '7px monospace'; context.textAlign = 'left'; context.fillText(low <= 20.5 ? 'LOW OFF' : hzFormat(low), 5, height - 5); context.textAlign = 'right'; context.fillText(high >= 19_950 ? 'HIGH OFF' : hzFormat(high), width - 5, height - 5)
+    context.fillStyle = '#8b9aa4'; context.font = '7px monospace'; context.textAlign = 'left'; context.fillText(low <= 20.5 ? 'LOW OFF' : hzFormat(low), 5, height - 15); context.textAlign = 'right'; context.fillText(high >= 19_950 ? 'HIGH OFF' : hzFormat(high), width - 5, height - 15)
   }, [bypassed, effectId, engine, gain, high, low, selected])
   useEffect(() => { draw(); return subscribeMeterFrame(draw) }, [draw])
   const point = (event: React.PointerEvent<HTMLCanvasElement>) => { const bounds = event.currentTarget.getBoundingClientRect(); return { x: (event.clientX - bounds.left) * event.currentTarget.width / bounds.width, y: (event.clientY - bounds.top) * event.currentTarget.height / bounds.height } }
-  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const target = dragging.current; if (!target) return; const p = point(event); const { width, height } = event.currentTarget; if (target === 'splitLow' || target === 'splitHigh') { let frequency = 20 * 1000 ** (Math.max(0, Math.min(width, p.x)) / width); if (target === 'splitLow') { if (p.x < 5) frequency = 20; frequency = Math.min(frequency, high / 1.05) } else { if (p.x > width - 5) frequency = 20_000; frequency = Math.max(frequency, low * 1.05) } onParam(target, Math.round(frequency)); return } const value = (height / 2 - p.y) / (height * .4) * 24; onParam(`${target}GainDb`, Math.round(Math.max(-24, Math.min(24, value)) * 10) / 10) }
+  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const target = dragging.current; if (!target) return; const p = point(event); const { width, height } = event.currentTarget; if (target === 'splitLow' || target === 'splitHigh') { let frequency = parameterFrequencyAtX(p.x, width); if (target === 'splitLow') { if (p.x < 5) frequency = 20; frequency = Math.min(frequency, high / 1.05) } else { if (p.x > width - 5) frequency = 20_000; frequency = Math.max(frequency, low * 1.05) } onParam(target, Math.round(frequency)); return } const value = (height / 2 - p.y) / (height * .4) * 24; onParam(`${target}GainDb`, Math.round(Math.max(-24, Math.min(24, value)) * 10) / 10) }
   const down = (event: React.PointerEvent<HTMLCanvasElement>) => { const p = point(event); const width = event.currentTarget.width; const lowX = frequencyToX(low, width); const highX = frequencyToX(high, width); if (Math.abs(p.x - lowX) <= 9) dragging.current = 'splitLow'; else if (Math.abs(p.x - highX) <= 9) dragging.current = 'splitHigh'; else { const band: DistortionBandName = p.x < lowX ? 'low' : p.x < highX ? 'mid' : 'high'; onSelect(band); dragging.current = band } event.currentTarget.setPointerCapture(event.pointerId); update(event) }
   const up = (event: React.PointerEvent<HTMLCanvasElement>) => { dragging.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
   return <canvas ref={canvasRef} className="distortion-display" width="500" height="112" onPointerDown={down} onPointerMove={update} onPointerUp={up} onPointerCancel={up} title="Drag crossovers horizontally and band gain lines vertically" />
@@ -338,8 +343,8 @@ function MultibandCompressorPanel({ effectId, params, setParam }: { effectId: st
   return <div className="multiband-panel">
     <div className="multiband-top">
       <div className="multiband-splits">
-        <Knob value={params.splitLow ?? 150} min={20} max={150} step={1} defaultValue={150} label="LOW SPLIT" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
-        <Knob value={params.splitHigh ?? 2500} min={300} max={16_000} step={10} defaultValue={2500} label="HIGH SPLIT" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
+        <Knob value={params.splitLow ?? 150} min={20} max={150} step={1} scale="log" defaultValue={150} label="LOW SPLIT" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
+        <Knob value={params.splitHigh ?? 2500} min={300} max={16_000} step={10} scale="log" defaultValue={2500} label="HIGH SPLIT" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
       </div>
       <div className="multiband-display" aria-label="Multiband compressor bands">
         {bands.map((band) => {
@@ -480,7 +485,7 @@ function EqPanel({ effectId, params, bypassed, bandCount, setParam }: { effectId
       <button className={band.enabled ? 'eq-enable active' : 'eq-enable'} aria-pressed={band.enabled} onClick={() => setParam(`band${band.index}.enabled`, band.enabled ? 0 : 1)}><CirclePower size={14} /><span>{band.enabled ? 'ON' : 'OFF'}</span></button>
       <Knob value={band.q} min={.2} max={12} step={.01} defaultValue={.71} label="Q" format={(value) => value.toFixed(2)} onChange={(value) => setParam(`band${band.index}.q`, value)} />
       <Knob value={band.gain} min={-18} max={18} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`band${band.index}.gain`, value)} />
-      <Knob value={band.frequency} min={20} max={20000} step={1} defaultValue={defaults[band.index]!} label="FREQ" format={hzFormat} onChange={(value) => setParam(`band${band.index}.freq`, value)} />
+      <Knob value={band.frequency} min={20} max={20000} step={1} scale="log" defaultValue={defaults[band.index]!} label="FREQ" format={hzFormat} onChange={(value) => setParam(`band${band.index}.freq`, value)} />
       <div className="eq-filter-selects"><label>SHAPE<select value={band.shape} onChange={(event) => { const shape = Number(event.target.value); setParam(`band${band.index}.type`, shape); if (shape === 3 || shape === 4) setParam(`band${band.index}.slope`, band.slope) }}>{shapes.map((shape) => <option key={shape.value} value={shape.value}>{shape.name}</option>)}</select></label>{(band.shape === 3 || band.shape === 4) && <label>SLOPE<select value={band.slope} onChange={(event) => setParam(`band${band.index}.slope`, Number(event.target.value))}>{[12, 24, 36, 48].map((slope) => <option key={slope} value={slope}>{slope} dB/oct</option>)}</select></label>}</div>
     </div>
     {bandCount === 8 && <div className="eq8-global"><strong>STEREO · 8 BAND</strong><button className={(params.adaptiveQ ?? 1) >= .5 ? 'active' : ''} onClick={() => setParam('adaptiveQ', (params.adaptiveQ ?? 1) >= .5 ? 0 : 1)}>ADAPT Q</button><Knob value={(params.scale ?? 1) * 100} min={0} max={200} step={1} defaultValue={100} label="SCALE" format={(value) => `${Math.round(value)}%`} onChange={(value) => setParam('scale', value / 100)} /><Knob value={params.outputDb ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="OUTPUT" format={dbFormat} onChange={(value) => setParam('outputDb', value)} /></div>}
@@ -495,15 +500,15 @@ function InteractiveEqDisplay({ effectId, bands, selected, bypassed, scale, adap
   const draw = useCallback(() => {
     const canvas = ref.current; const context = canvas?.getContext('2d'); if (!canvas || !context) return
     const { width, height } = canvas; const toY = (db: number) => height / 2 - Math.max(-EQ_RANGE_DB, Math.min(EQ_RANGE_DB, db)) / EQ_RANGE_DB * height * .46
-    context.clearRect(0, 0, width, height); context.strokeStyle = '#2b3743'; context.lineWidth = 1
-    for (const hz of [100, 1000, 10000]) { const x = frequencyToX(hz, width); context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke() }
+    context.clearRect(0, 0, width, height); drawFrequencyGrid(context, width, height, '#2b3743')
+    context.strokeStyle = '#2b3743'; context.lineWidth = 1
     for (let y = 0; y <= height; y += height / 4) { context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke() }
     drawEffectSpectrum(context, engine.getEffectSpectrum(effectId), width, height, bypassed ? '#69737a' : '#638c9a')
     const preview = dragPreview.current
     const visibleBands = preview ? bands.map((band) => band.index === preview.index ? { ...band, frequency: preview.frequency, gain: preview.gain } : band) : bands
     context.beginPath(); context.strokeStyle = bypassed ? '#56636d' : '#62d6fa'; context.lineWidth = 2
     for (let x = 0; x < width; x += 1) {
-      const hz = 20 * 1000 ** (x / width)
+      const hz = displayFrequencyAtX(x, width)
       const value = visibleBands.reduce((sum, band) => sum + previewEqBand(band, hz, scale, adaptiveQ), 0)
       if (x === 0) context.moveTo(x, toY(value)); else context.lineTo(x, toY(value))
     }
@@ -512,7 +517,7 @@ function InteractiveEqDisplay({ effectId, bands, selected, bypassed, scale, adap
   }, [adaptiveQ, bands, bypassed, effectId, engine, scale, selected])
   useEffect(() => { draw(); return subscribeMeterFrame(draw) }, [draw])
   const point = (event: React.PointerEvent<HTMLCanvasElement>) => { const bounds = event.currentTarget.getBoundingClientRect(); return { x: (event.clientX - bounds.left) * event.currentTarget.width / bounds.width, y: (event.clientY - bounds.top) * event.currentTarget.height / bounds.height } }
-  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const index = dragging.current; if (index === null) return; const p = point(event); const frequency = Math.round(Math.max(20, Math.min(20000, 20 * 1000 ** (Math.max(0, Math.min(event.currentTarget.width, p.x)) / event.currentTarget.width)))); const gain = Math.round(Math.max(-18, Math.min(18, (event.currentTarget.height / 2 - p.y) / (event.currentTarget.height * .46) * EQ_RANGE_DB)) * 10) / 10; dragPreview.current = { index, frequency, gain }; draw(); onParam(`band${index}.freq`, frequency); onParam(`band${index}.gain`, gain) }
+  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const index = dragging.current; if (index === null) return; const p = point(event); const frequency = Math.round(parameterFrequencyAtX(p.x, event.currentTarget.width)); const gain = Math.round(Math.max(-18, Math.min(18, (event.currentTarget.height / 2 - p.y) / (event.currentTarget.height * .46) * EQ_RANGE_DB)) * 10) / 10; dragPreview.current = { index, frequency, gain }; draw(); onParam(`band${index}.freq`, frequency); onParam(`band${index}.gain`, gain) }
   const down = (event: React.PointerEvent<HTMLCanvasElement>) => { const p = point(event); const closest = bands.map((band) => ({ index: band.index, distance: Math.hypot(frequencyToX(band.frequency, event.currentTarget.width) - p.x, event.currentTarget.height / 2 - band.gain / EQ_RANGE_DB * event.currentTarget.height * .46 - p.y) })).sort((a, b) => a.distance - b.distance)[0]; if (!closest || closest.distance > 16) return; dragging.current = closest.index; onSelect(closest.index); event.currentTarget.setPointerCapture(event.pointerId); update(event) }
   const up = (event: React.PointerEvent<HTMLCanvasElement>) => { dragging.current = null; dragPreview.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
   return <canvas className="eq-display interactive" ref={ref} width="450" height="48" onPointerDown={down} onPointerMove={update} onPointerUp={up} onPointerCancel={up} />
@@ -520,11 +525,33 @@ function InteractiveEqDisplay({ effectId, bands, selected, bypassed, scale, adap
 
 function previewEqBand(band: EqBandView, hz: number, scale = 1, adaptiveQ = false): number { if (!band.enabled) return 0; const gain = band.gain * scale; const q = adaptiveQ ? band.q * (1 + Math.abs(gain) / 36) : band.q; const distance = Math.log2(hz / band.frequency); const slope = band.slope / 12; if (band.shape === 1) return gain / (1 + Math.exp(distance * 4)); if (band.shape === 2) return gain / (1 + Math.exp(-distance * 4)); if (band.shape === 3) return distance < 0 ? -18 * Math.min(1, -distance * q * slope) : 0; if (band.shape === 4) return distance > 0 ? -18 * Math.min(1, distance * q * slope) : 0; if (band.shape === 5) return -18 * Math.exp(-(distance ** 2) * q); return gain * Math.exp(-(distance ** 2) * q * .8) }
 
+function drawFrequencyGrid(context: CanvasRenderingContext2D, width: number, height: number, color: string): void {
+  context.save()
+  context.lineWidth = 1
+  for (const tick of FREQUENCY_TICKS) {
+    const x = frequencyToX(tick.hz, width)
+    context.globalAlpha = tick.major ? .72 : .24
+    context.strokeStyle = color
+    context.beginPath(); context.moveTo(Math.round(x) + .5, 0); context.lineTo(Math.round(x) + .5, height); context.stroke()
+  }
+  context.globalAlpha = 1
+  context.fillStyle = '#6c7b85'
+  context.font = '6px monospace'
+  context.textBaseline = 'bottom'
+  for (const tick of FREQUENCY_TICKS) {
+    if (!tick.label) continue
+    const x = frequencyToX(tick.hz, width)
+    context.textAlign = x < 12 ? 'left' : x > width - 12 ? 'right' : 'center'
+    context.fillText(tick.label, Math.max(2, Math.min(width - 2, x)), height - 2)
+  }
+  context.restore()
+}
+
 function drawEffectSpectrum(context: CanvasRenderingContext2D, spectrum: readonly number[], width: number, height: number, color: string): void {
   if (!spectrum.some((value) => value > 1e-5)) return
   context.beginPath(); context.moveTo(0, height)
   for (let index = 0; index < spectrum.length; index += 1) {
-    const x = index / Math.max(1, spectrum.length - 1) * width
+    const x = frequencyToX(spectrumFrequencyAtIndex(index, spectrum.length), width)
     const db = 20 * Math.log10(Math.max(1e-5, spectrum[index] ?? 0))
     const y = height - Math.max(0, Math.min(1, (db + 72) / 72)) * height * .9
     context.lineTo(x, y)
@@ -573,9 +600,9 @@ function EqDisplay({ effectId, params, bypassed, onParam }: { effectId: string; 
     if (!canvas || !context) return
     const { width, height } = canvas
     context.clearRect(0, 0, width, height)
+    drawFrequencyGrid(context, width, height, '#2b3743')
     context.strokeStyle = '#2b3743'
     context.lineWidth = 1
-    for (const hz of [100, 1000, 10_000]) { const x = frequencyToX(hz, width); context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke() }
     for (let y = 0; y <= height; y += height / 4) { context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke() }
     context.strokeStyle = '#3a4956'
     context.beginPath(); context.moveTo(0, height / 2); context.lineTo(width, height / 2); context.stroke()
@@ -592,7 +619,7 @@ function EqDisplay({ effectId, params, bypassed, onParam }: { effectId: string; 
       }
     } else {
       for (let x = 0; x < width; x += 1) {
-        const hz = 20 * 1000 ** (x / width)
+        const hz = displayFrequencyAtX(x, width)
         const lowDistance = Math.log2(hz / (params.lowFreq ?? 90))
         const midDistance = Math.log2(hz / (params.midFreq ?? 1200))
         const highDistance = Math.log2(hz / (params.highFreq ?? 8000))
@@ -622,7 +649,7 @@ function EqDisplay({ effectId, params, bypassed, onParam }: { effectId: string; 
     if (!band) return
     const canvas = event.currentTarget
     const point = pointFromEvent(event)
-    const rawFrequency = 20 * 1000 ** (Math.max(0, Math.min(canvas.width, point.x)) / canvas.width)
+    const rawFrequency = parameterFrequencyAtX(point.x, canvas.width)
     const [minimum, maximum] = band === 'low' ? [20, 2_000] : band === 'mid' ? [40, 16_000] : [500, 20_000]
     const frequency = Math.max(minimum, Math.min(maximum, rawFrequency))
     const gain = Math.max(-EQ_RANGE_DB, Math.min(EQ_RANGE_DB, (canvas.height / 2 - point.y) / (canvas.height * .46) * EQ_RANGE_DB))
@@ -646,11 +673,6 @@ function EqDisplay({ effectId, params, bypassed, onParam }: { effectId: string; 
   return <canvas className="eq-display interactive" ref={ref} width="210" height="62" title="EQ 포인트를 드래그해 주파수와 게인을 조절" onPointerDown={beginNodeDrag} onPointerMove={updateNode} onPointerUp={endNodeDrag} onPointerCancel={endNodeDrag} />
 }
 
-/** Log frequency axis spanning the engine's 20 Hz – 20 kHz response sweep. */
-function frequencyToX(hz: number, width: number): number {
-  return Math.log(Math.max(20, hz) / 20) / Math.log(1000) * width
-}
-
 function DisperserPanel({ effectId, params, bypassed, setParam }: { effectId: string; params: Record<string, number>; bypassed: boolean; setParam(param: string, value: number): void }) {
   const frequency = Math.max(20, Math.min(20_000, params.frequency ?? 3_050))
   const amount = Math.max(0, Math.min(1, params.amount ?? .25))
@@ -658,7 +680,7 @@ function DisperserPanel({ effectId, params, bypassed, setParam }: { effectId: st
   return <div className="disperser-panel">
     <DisperserDisplay effectId={effectId} frequency={frequency} amount={amount} pinch={pinch} bypassed={bypassed} onFrequency={(value) => setParam('frequency', value)} />
     <div className="parameter-row disperser-controls">
-      <Knob value={frequency} min={20} max={20_000} step={1} defaultValue={3_050} label="FREQUENCY" format={hzFormat} onChange={(value) => setParam('frequency', value)} />
+      <Knob value={frequency} min={20} max={20_000} step={1} scale="log" defaultValue={3_050} label="FREQUENCY" format={hzFormat} onChange={(value) => setParam('frequency', value)} />
       <Knob value={amount} min={0} max={1} step={1 / 64} defaultValue={.25} label="AMOUNT" format={(value) => `${Math.round(value * 64)} STG`} onChange={(value) => setParam('amount', value)} />
       <Knob value={pinch} min={0} max={1} step={.01} defaultValue={.45} label="PINCH" format={percentFormat} onChange={(value) => setParam('pinch', value)} />
     </div>
@@ -683,12 +705,9 @@ function DisperserDisplay({ effectId, frequency, amount, pinch, bypassed, onFreq
     background.addColorStop(1, '#0f1418')
     context.fillStyle = background
     context.fillRect(0, 0, width, height)
+    drawFrequencyGrid(context, width, graphBottom, '#3e353a')
     context.strokeStyle = '#3e353a'
     context.lineWidth = 1
-    for (const hz of [50, 100, 500, 1_000, 5_000, 10_000]) {
-      const x = frequencyToX(hz, width)
-      context.beginPath(); context.moveTo(x, 0); context.lineTo(x, graphBottom); context.stroke()
-    }
     for (let row = 1; row < 4; row += 1) {
       const y = row * graphBottom / 4
       context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke()
@@ -699,7 +718,7 @@ function DisperserDisplay({ effectId, frequency, amount, pinch, bypassed, onFreq
     const q = .12 * 100 ** pinch
     const samples = Array.from({ length: 181 }, (_, index) => {
       const x = index / 180 * width
-      const hz = 20 * 1000 ** (x / width)
+      const hz = displayFrequencyAtX(x, width)
       return { x, delay: disperserGroupDelay(hz, frequency, q, stages) }
     })
     const maxDelay = Math.max(1, ...samples.map((sample) => sample.delay))
@@ -741,8 +760,8 @@ function DisperserDisplay({ effectId, frequency, amount, pinch, bypassed, onFreq
 
   const updateFrequency = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect()
-    const ratio = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width))
-    onFrequency(Math.round(20 * 1000 ** ratio))
+    const x = (event.clientX - bounds.left) / bounds.width * event.currentTarget.width
+    onFrequency(Math.round(parameterFrequencyAtX(x, event.currentTarget.width)))
   }
   const beginFrequencyDrag = (event: React.PointerEvent<HTMLCanvasElement>) => {
     if (event.button !== 0) return
@@ -862,8 +881,6 @@ function shaperPreview(curve: number, input: number): number {
   return Math.tanh(input)
 }
 
-let pluginScanCache: Promise<PluginDescriptor[]> | null = null
-const scanPluginsOnce = (engine: ReturnType<typeof useEngine>) => pluginScanCache ??= engine.scanPlugins().catch((error) => { pluginScanCache = null; throw error })
 const pluginRef = (plugin: PluginDescriptor): ExternalPluginRef => ({ format: plugin.format, uid: plugin.uid, name: plugin.name, vendor: plugin.vendor, path: plugin.path, audioInputBuses: plugin.audioInputBuses, audioOutputBuses: plugin.audioOutputBuses, supportsSidechain: plugin.supportsSidechain, paramCount: plugin.paramCount, parameters: plugin.parameters })
 
 function AddDevice({ onAdd }: { onAdd(type: EffectType, plugin?: ExternalPluginRef): void }) {
