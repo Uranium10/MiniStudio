@@ -381,11 +381,12 @@ impl DspEffect for Vst3Effect {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, _channels: usize) {
         self.buffers.sample_rate = sample_rate as f64;
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
-        self.process_with_sidechain(buffer, None, frames)
+    fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        self.process_with_sidechain(events, buffer, None, frames)
     }
     fn process_with_sidechain(
         &mut self,
+        _events: &[NoteEvent],
         buffer: &mut AudioBuffer,
         sidechain: Option<&AudioBuffer>,
         frames: usize,
@@ -913,11 +914,12 @@ impl ClapEffect {
 }
 impl DspEffect for ClapEffect {
     fn prepare(&mut self, _sample_rate: f32, _max_block: usize, _channels: usize) {}
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
-        self.process_with_sidechain(buffer, None, frames)
+    fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        self.process_with_sidechain(events, buffer, None, frames)
     }
     fn process_with_sidechain(
         &mut self,
+        _events: &[NoteEvent],
         buffer: &mut AudioBuffer,
         sidechain: Option<&AudioBuffer>,
         frames: usize,

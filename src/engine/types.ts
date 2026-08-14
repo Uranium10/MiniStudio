@@ -10,6 +10,13 @@ export type EffectType =
   | 'builtin:waveshaper'
   | 'builtin:distortion'
   | 'builtin:disperser'
+  | 'builtin:mastering-limiter'
+  | 'builtin:vocoder'
+  | 'builtin:lfo-tremolo'
+  | 'builtin:clipper'
+  | 'builtin:upward-compressor'
+  | 'builtin:roboter'
+  | 'builtin:resonator'
   | `vst3:${string}`
   | `clap:${string}`
 
@@ -38,6 +45,8 @@ export type AudioAssetInfo = {
   peaks: Float32Array
 }
 
+export type ClipGainPoint = { id: string; timeSec: number; valueDb: number; /** Outgoing segment bend, -1…1. */ curve?: number }
+
 export type Clip = {
   id: string
   assetId: string
@@ -49,6 +58,16 @@ export type Clip = {
   fadeInSec: number
   fadeOutSec: number
   muted?: boolean
+  /** Varispeed playback multiplier. */
+  playbackRate?: number
+  pitchSemitones?: number
+  fineCents?: number
+  reversed?: boolean
+  fadeInCurve?: number
+  fadeOutCurve?: number
+  gainPoints?: ClipGainPoint[]
+  warpMode?: 'none' | 'project' | 'half' | 'double'
+  warpSourceBpm?: number
 }
 
 export type Send = {
@@ -67,7 +86,7 @@ export type EffectInstance = {
   sidechain?: { enabled: boolean; sourceTrackId: string | null }
 }
 
-export type AutomationPoint = { id: string; timeSec: number; value: number }
+export type AutomationPoint = { id: string; timeSec: number; value: number; /** Outgoing segment bend, -1…1. */ curve?: number }
 export type AutomationLane = {
   id: string
   targetKind: 'track' | 'instrument' | 'effect'
@@ -79,12 +98,18 @@ export type AutomationLane = {
   max: number
   defaultValue: number
   points: AutomationPoint[]
+  /** Arrangement-only lane height in CSS pixels. */
+  height?: number
 }
 
 export const MIDI_PPQ = 960
+/** Reserved controller lane id used for the MIDI pitch-bend wheel. */
+export const MIDI_PITCH_BEND_LANE = -1
 export type TrackKind = 'audio' | 'instrument'
 export type MidiNote = { id: string; pitch: number; velocity: number; startTicks: number; lengthTicks: number; releaseVelocity: number; muted: boolean }
-export type CcLane = { cc: number; points: Array<{ ticks: number; value: number }> }
+export type MidiControlPoint = { ticks: number; value: number }
+/** CC 0…127, or MIDI_PITCH_BEND_LANE for the bipolar pitch wheel. */
+export type CcLane = { cc: number; points: MidiControlPoint[] }
 export type MidiClip = {
   id: string
   name: string
@@ -121,6 +146,8 @@ export type Track = {
   outputBusId?: string | null
   automationOpen?: boolean
   automationLanes?: AutomationLane[]
+  /** Arrangement-only per-track height in CSS pixels. */
+  height?: number
 }
 
 export type Bus = {
@@ -249,6 +276,7 @@ export type Level = { peak: number; rms: number }
 export type StereoLevel = { left: number; right: number }
 export type MultibandLevels = { low: StereoLevel; mid: StereoLevel; high: StereoLevel }
 export type DistortionSpectrum = readonly number[]
+export type LimiterMetrics = { inputPeakDb: number; outputPeakDb: number; gainReductionDb: number; truePeakDb: number; momentaryLufs: number; shortTermLufs: number; integratedLufs: number }
 
 export type AudioBackendInfo = { id: string; name: string; available: boolean; asio: boolean }
 export type AudioDeviceInfo = {
@@ -264,6 +292,7 @@ export type MidiInputPortInfo = { id: string; name: string; connected: boolean }
 export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number }
 export type EqFrequencyResponse = { frequencies: number[]; combinedDb: number[]; bandsDb: number[][] }
 export type ExportProgress = { stage: string; renderedFrames: number; totalFrames: number; fraction: number }
+export type ExportSettings = { format: 'wav' | 'mp3'; sampleRate: number; bitDepth: 16 | 24 | 32; mp3BitrateKbps: 128 | 192 | 256 | 320; normalize: boolean }
 
 export class NotSupportedError extends Error {
   constructor(message: string) {

@@ -2,7 +2,10 @@
 use super::{
     asset::AudioAsset,
     command::{ChainKind, EffectRef},
-    dsp::{create_effect, AudioBuffer, DspEffect, Smoother, DISTORTION_SPECTRUM_BINS},
+    dsp::{
+        create_effect, AudioBuffer, DspEffect, Smoother, DISTORTION_SPECTRUM_BINS,
+        LIMITER_METER_VALUES,
+    },
     instrument::{create_instrument, Instrument, NoteEvent, NoteEventKind, TempoMap},
     types::{db_to_gain, sec_to_samples, GraphSnapshot, Level},
     MAX_BLOCK_SIZE, MAX_CHANNELS, MAX_EFFECT_METERS, MAX_TRACKS,
@@ -12,8 +15,18 @@ use std::{collections::HashMap, sync::Arc};
 fn effect_has_spectrum(kind: &str) -> bool {
     matches!(
         kind,
-        "builtin:eq" | "builtin:eq8" | "builtin:distortion" | "builtin:disperser"
+        "builtin:eq"
+            | "builtin:eq8"
+            | "builtin:distortion"
+            | "builtin:disperser"
+            | "builtin:clipper"
+            | "builtin:roboter"
+            | "builtin:resonator"
     )
+}
+
+fn effect_has_limiter_metrics(kind: &str) -> bool {
+    kind == "builtin:mastering-limiter"
 }
 
 fn resolve_sidechain_source(spec: &GraphSnapshot, source: &str) -> Option<SidechainSource> {
@@ -50,6 +63,7 @@ pub struct Bindings {
     pub track_ids: Vec<String>,
     pub multiband_meter_ids: Vec<String>,
     pub distortion_meter_ids: Vec<String>,
+    pub limiter_meter_ids: Vec<String>,
 }
 struct ClipEvent {
     asset: Arc<AudioAsset>,
@@ -59,6 +73,17 @@ struct ClipEvent {
     gain: f32,
     fade_in: u64,
     fade_out: u64,
+    source_step: f64,
+    reversed: bool,
+    fade_in_curve: f32,
+    fade_out_curve: f32,
+    gain_segments: Vec<ClipGainSegment>,
+}
+#[derive(Clone, Copy)]
+struct ClipGainSegment {
+    end: u64,
+    gain: f32,
+    control: f32,
 }
 #[derive(Clone, Copy)]
 struct ScheduledNoteEvent {
@@ -162,6 +187,7 @@ impl AudioGraph {
         let mut track_ids = Vec::new();
         let mut multiband_meter_ids = Vec::new();
         let mut distortion_meter_ids = Vec::new();
+        let mut limiter_meter_ids = Vec::new();
         let mut latencies = Vec::new();
         let mut tracks = Vec::new();
         let tempo = TempoMap::new(spec.transport.bpm, sample_rate);
@@ -191,6 +217,11 @@ impl AudioGraph {
                     {
                         distortion_meter_ids.push(es.id.clone())
                     }
+                    if effect_has_limiter_metrics(&es.kind)
+                        && limiter_meter_ids.len() < MAX_EFFECT_METERS
+                    {
+                        limiter_meter_ids.push(es.id.clone())
+                    }
                     effects.insert(
                         es.id.clone(),
                         EffectRef {
@@ -219,6 +250,54 @@ impl AudioGraph {
                         gain: db_to_gain(c.gain_db),
                         fade_in: sec_to_samples(c.fade_in_sec, sample_rate),
                         fade_out: sec_to_samples(c.fade_out_sec, sample_rate),
+                        source_step: c.playback_rate.clamp(0.05, 8.0)
+                            * 2.0_f64.powf(
+                                (c.pitch_semitones.clamp(-48.0, 48.0)
+                                    + c.fine_cents.clamp(-100.0, 100.0) / 100.0)
+                                    / 12.0,
+                            ),
+                        reversed: c.reversed,
+                        fade_in_curve: c.fade_in_curve.clamp(-1.0, 1.0),
+                        fade_out_curve: c.fade_out_curve.clamp(-1.0, 1.0),
+                        gain_segments: {
+                            let mut points: Vec<_> = c
+                                .gain_points
+                                .iter()
+                                .map(|point| {
+                                    (
+                                        sec_to_samples(
+                                            point.time_sec.max(0.0).min(c.duration_sec),
+                                            sample_rate,
+                                        ),
+                                        point.value_db.clamp(-60.0, 12.0),
+                                        point.curve.clamp(-1.0, 1.0),
+                                    )
+                                })
+                                .collect();
+                            points.sort_by_key(|point| point.0);
+                            let mut previous = (0_u64, c.gain_db.clamp(-60.0, 12.0), 0.0_f32);
+                            let mut segments = Vec::with_capacity(points.len() + 1);
+                            for point in points {
+                                let end_gain = db_to_gain(point.1);
+                                segments.push(ClipGainSegment {
+                                    end: point.0,
+                                    gain: end_gain,
+                                    control: clip_gain_control(previous.1, point.1, previous.2),
+                                });
+                                previous = point;
+                            }
+                            if !segments.is_empty() {
+                                let end = sec_to_samples(c.duration_sec, sample_rate);
+                                let end_db = c.gain_db.clamp(-60.0, 12.0);
+                                let end_gain = db_to_gain(end_db);
+                                segments.push(ClipGainSegment {
+                                    end,
+                                    gain: end_gain,
+                                    control: clip_gain_control(previous.1, end_db, previous.2),
+                                });
+                            }
+                            segments
+                        },
                     })
                 }
             }
@@ -228,6 +307,45 @@ impl AudioGraph {
                 let clip_start = sec_to_samples(clip.start_sec, sample_rate);
                 let clip_length = sec_to_samples(clip.duration_sec, sample_rate);
                 let loop_length = clip.loop_length_ticks.max(1);
+                // Controller points are scheduled before notes so a point placed on
+                // the same tick as a note affects that note deterministically.
+                for lane in &clip.cc_lanes {
+                    for point in &lane.points {
+                        let mut cycle = 0_u64;
+                        loop {
+                            let tick = if clip.loop_enabled {
+                                point.ticks.saturating_sub(clip.loop_start_ticks)
+                                    + cycle * loop_length
+                            } else {
+                                point.ticks
+                            };
+                            let relative = tempo.ticks_to_samples(tick);
+                            if relative >= clip_length {
+                                break;
+                            }
+                            let kind = if lane.cc == -1 {
+                                NoteEventKind::PitchBend {
+                                    value: (f32::from(point.value) / 8192.0).clamp(-1.0, 1.0),
+                                }
+                            } else if (0..=127).contains(&lane.cc) {
+                                NoteEventKind::Controller {
+                                    cc: lane.cc as u8,
+                                    value: (f32::from(point.value) / 127.0).clamp(0.0, 1.0),
+                                }
+                            } else {
+                                break;
+                            };
+                            midi_events.push(ScheduledNoteEvent {
+                                sample: clip_start + relative,
+                                kind,
+                            });
+                            if !clip.loop_enabled {
+                                break;
+                            }
+                            cycle += 1;
+                        }
+                    }
+                }
                 for note in clip.notes.iter().filter(|note| !note.muted) {
                     let mut cycle = 0_u64;
                     loop {
@@ -345,6 +463,11 @@ impl AudioGraph {
                     {
                         distortion_meter_ids.push(es.id.clone())
                     }
+                    if effect_has_limiter_metrics(&es.kind)
+                        && limiter_meter_ids.len() < MAX_EFFECT_METERS
+                    {
+                        limiter_meter_ids.push(es.id.clone())
+                    }
                     effects.insert(
                         es.id.clone(),
                         EffectRef {
@@ -380,6 +503,11 @@ impl AudioGraph {
                 }
                 if effect_has_spectrum(&es.kind) && distortion_meter_ids.len() < MAX_EFFECT_METERS {
                     distortion_meter_ids.push(es.id.clone())
+                }
+                if effect_has_limiter_metrics(&es.kind)
+                    && limiter_meter_ids.len() < MAX_EFFECT_METERS
+                {
+                    limiter_meter_ids.push(es.id.clone())
                 }
                 effects.insert(
                     es.id.clone(),
@@ -420,6 +548,7 @@ impl AudioGraph {
                 track_ids,
                 multiband_meter_ids,
                 distortion_meter_ids,
+                limiter_meter_ids,
             },
         )
     }
@@ -521,7 +650,13 @@ impl AudioGraph {
                     .and_then(|source| {
                         sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
                     });
-                fx.process_with_sidechain(&mut track.buffer, sidechain, frames)
+                // Effect-note routing is intentionally not connected yet. The
+                // event-aware DSP contract is live, but inserts receive an
+                // allocation-free empty slice until a routing source exists.
+                // Querying the capability keeps graph construction ready for
+                // a routed source without implicitly borrowing instrument MIDI.
+                let _awaiting_midi_route = fx.wants_midi();
+                fx.process_with_sidechain(&[], &mut track.buffer, sidechain, frames)
             }
             let silent = track.muted || (has_solo && !track.solo);
             let mut peak = 0.0_f32;
@@ -579,7 +714,7 @@ impl AudioGraph {
                     .and_then(|source| {
                         sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
                     });
-                fx.process_with_sidechain(&mut bus.buffer, sidechain, frames)
+                fx.process_with_sidechain(&[], &mut bus.buffer, sidechain, frames)
             }
             for i in 0..frames {
                 let g = bus.gain.next();
@@ -598,7 +733,7 @@ impl AudioGraph {
                 .copied()
                 .flatten()
                 .and_then(|source| sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps));
-            fx.process_with_sidechain(&mut self.master_buffer, sidechain, frames)
+            fx.process_with_sidechain(&[], &mut self.master_buffer, sidechain, frames)
         }
         let (mut peak, mut sum) = (0.0_f32, 0.0_f32);
         for (i, frame) in out.chunks_exact_mut(2).take(frames).enumerate() {
@@ -732,6 +867,28 @@ impl AudioGraph {
             }
         }
     }
+    pub fn write_limiter_metrics(
+        &self,
+        output: &mut [[f32; LIMITER_METER_VALUES]; MAX_EFFECT_METERS],
+    ) {
+        output.fill([-120.0, -120.0, 0.0, -120.0, -120.0, -120.0, -120.0]);
+        let effects = self
+            .tracks
+            .iter()
+            .flat_map(|track| track.effects.iter())
+            .chain(self.buses.iter().flat_map(|bus| bus.effects.iter()))
+            .chain(self.master_effects.iter());
+        let mut index = 0;
+        for effect in effects {
+            if let Some(metrics) = effect.limiter_metrics() {
+                if index >= MAX_EFFECT_METERS {
+                    break;
+                }
+                output[index] = metrics;
+                index += 1
+            }
+        }
+    }
     pub fn set_instrument_param(&mut self, track: usize, param: &str, value: f32) {
         if let Some(instrument) = self
             .tracks
@@ -808,43 +965,112 @@ fn render_clip(c: &ClipEvent, pos: u64, n: usize, b: &mut AudioBuffer) {
     let to = (pos + n as u64).min(c.end);
     for timeline in from..to {
         let dst = (timeline - pos) as usize;
-        let src = (c.offset + timeline - c.start) as usize;
+        let rel = timeline - c.start;
+        let source_rel = if c.reversed {
+            c.end
+                .saturating_sub(c.start)
+                .saturating_sub(1)
+                .saturating_sub(rel)
+        } else {
+            rel
+        };
+        let src_pos = c.offset as f64 + source_rel as f64 * c.source_step;
+        let src = src_pos.floor() as usize;
         if src >= c.asset.frames {
+            if c.reversed {
+                continue;
+            }
             break;
         }
-        let rel = timeline - c.start;
+        let fraction = (src_pos - src as f64) as f32;
         let remaining = c.end - timeline;
         let fade_in = if c.fade_in > 0 {
-            ((rel as f32 / c.fade_in as f32).min(1.0) * std::f32::consts::FRAC_PI_2).sin()
+            fade_shape((rel as f32 / c.fade_in as f32).min(1.0), c.fade_in_curve)
         } else {
             1.0
         };
         let fade_out = if c.fade_out > 0 {
-            ((remaining as f32 / c.fade_out as f32).min(1.0) * std::f32::consts::FRAC_PI_2).sin()
+            fade_shape(
+                (remaining as f32 / c.fade_out as f32).min(1.0),
+                c.fade_out_curve,
+            )
         } else {
             1.0
         };
+        let envelope_gain = clip_gain(c, rel) * fade_in * fade_out;
         for ch in 0..2 {
             let source = c
                 .asset
                 .channels
                 .get(ch)
                 .or_else(|| c.asset.channels.first())
-                .and_then(|v| v.get(src))
-                .copied()
+                .map(|v| {
+                    let first = v.get(src).copied().unwrap_or(0.0);
+                    let second = v
+                        .get((src + 1).min(c.asset.frames.saturating_sub(1)))
+                        .copied()
+                        .unwrap_or(first);
+                    first + (second - first) * fraction
+                })
                 .unwrap_or(0.0);
-            b.channels[ch][dst] += source * c.gain * fade_in * fade_out
+            b.channels[ch][dst] += source * envelope_gain
         }
     }
+}
+
+fn fade_shape(progress: f32, curve: f32) -> f32 {
+    progress
+        .clamp(0.0, 1.0)
+        .powf(2.0_f32.powf(curve.clamp(-1.0, 1.0) * 2.0))
+}
+
+fn clip_gain(c: &ClipEvent, rel: u64) -> f32 {
+    if c.gain_segments.is_empty() {
+        return c.gain;
+    }
+    let mut previous = (0_u64, c.gain);
+    for segment in &c.gain_segments {
+        if rel <= segment.end {
+            let span = segment.end.saturating_sub(previous.0).max(1) as f32;
+            let mix = rel.saturating_sub(previous.0) as f32 / span;
+            let mix = mix.clamp(0.0, 1.0);
+            let inverse = 1.0 - mix;
+            return (inverse * inverse * previous.1
+                + 2.0 * inverse * mix * segment.control
+                + mix * mix * segment.gain)
+                .max(0.0);
+        }
+        previous = (segment.end, segment.gain);
+    }
+    c.gain
+}
+
+fn clip_gain_control(from_db: f32, to_db: f32, curve: f32) -> f32 {
+    let from = db_to_gain(from_db);
+    let to = db_to_gain(to_db);
+    let midpoint = db_to_gain((from_db + to_db) * 0.5 + curve.clamp(-1.0, 1.0) * 9.0);
+    2.0 * midpoint - 0.5 * (from + to)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::audio::types::{
-        BusSpec, EffectSpec, InstrumentSpec, LoopSpec, MasterSpec, MidiClipSpec, MidiNoteSpec,
-        SendSpec, SidechainSpec, TrackSpec, TransportSpec,
+        BusSpec, EffectSpec, InstrumentSpec, LoopSpec, MasterSpec, MidiCcLaneSpec, MidiCcPointSpec,
+        MidiClipSpec, MidiNoteSpec, SendSpec, SidechainSpec, TrackSpec, TransportSpec,
     };
+
+    #[test]
+    fn clip_gain_curve_control_reaches_the_requested_midpoint() {
+        for curve in [-1.0, 1.0] {
+            let from_db = -12.0;
+            let to_db = -6.0;
+            let control = clip_gain_control(from_db, to_db, curve);
+            let midpoint = 0.25 * db_to_gain(from_db) + 0.5 * control + 0.25 * db_to_gain(to_db);
+            let requested = db_to_gain((from_db + to_db) * 0.5 + curve * 9.0);
+            assert!((midpoint - requested).abs() < 1.0e-5);
+        }
+    }
 
     fn effect(id: &str, kind: &str, params: &[(&str, f32)]) -> EffectSpec {
         EffectSpec {
@@ -884,6 +1110,7 @@ mod tests {
                         release_velocity: 64,
                         muted: false,
                     }],
+                    cc_lanes: Vec::new(),
                     transpose_semitones: 0,
                     velocity_scale: 1.0,
                     muted: false,
@@ -947,6 +1174,36 @@ mod tests {
             .iter()
             .zip(&large)
             .all(|(left, right)| left.to_bits() == right.to_bits()));
+    }
+
+    #[test]
+    fn clip_controller_and_pitch_bend_points_are_scheduled() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].midi_clips[0].cc_lanes = vec![
+            MidiCcLaneSpec {
+                cc: -1,
+                points: vec![MidiCcPointSpec {
+                    ticks: 0,
+                    value: 4_096,
+                }],
+            },
+            MidiCcLaneSpec {
+                cc: 64,
+                points: vec![MidiCcPointSpec {
+                    ticks: 60,
+                    value: 127,
+                }],
+            },
+        ];
+        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        assert!(matches!(
+            graph.tracks[0].midi_events[0].kind,
+            NoteEventKind::PitchBend { value } if (value - 0.5).abs() < 0.0001
+        ));
+        assert!(graph.tracks[0].midi_events.iter().any(|event| matches!(
+            event.kind,
+            NoteEventKind::Controller { cc: 64, value } if (value - 1.0).abs() < 0.0001
+        )));
     }
 
     #[test]

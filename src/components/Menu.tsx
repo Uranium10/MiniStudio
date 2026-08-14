@@ -5,6 +5,7 @@ import { createPortal } from 'react-dom'
 export type MenuItem =
   | { kind: 'separator' }
   | { kind: 'label'; label: string }
+  | { kind: 'submenu'; label: string; disabled?: boolean; children: MenuItem[] }
   | { kind: 'item'; label: string; keys?: string; danger?: boolean; disabled?: boolean; checked?: boolean; icon?: ReactNode; run(): void }
 
 type Point = { x: number; y: number }
@@ -112,25 +113,18 @@ export function MenuPanel({ items, onClose, anchor, className = '' }: { items: M
     <>
       {!anchor && <span ref={originRef} className="menu-anchor-sentinel" aria-hidden="true" />}
       <FloatingPanel anchor={anchor} getAnchorElement={anchor ? undefined : getAnchorElement} onClose={onClose} className={`menu-panel ${className}`} role="menu">
-        {items.map((item, index) => {
-          if (item.kind === 'separator') return <hr key={`sep-${index}`} />
-          if (item.kind === 'label') return <strong key={`label-${index}`}>{item.label}</strong>
-          return (
-            <button
-              key={`${item.label}-${index}`}
-              type="button"
-              role="menuitem"
-              className={`${item.danger ? 'danger' : ''} ${item.checked ? 'checked' : ''}`}
-              disabled={item.disabled}
-              onClick={() => { item.run(); onClose() }}
-            >
-              <i className="menu-mark">{item.checked ? '✓' : item.icon}</i>
-              <span>{item.label}</span>
-              {item.keys && <kbd>{item.keys}</kbd>}
-            </button>
-          )
-        })}
+        {items.map((item, index) => <MenuEntry key={`${item.kind}-${'label' in item ? item.label : index}-${index}`} item={item} onClose={onClose} />)}
       </FloatingPanel>
     </>
   )
+}
+
+function MenuEntry({ item, onClose }: { item: MenuItem; onClose(): void }) {
+  if (item.kind === 'separator') return <hr />
+  if (item.kind === 'label') return <strong>{item.label}</strong>
+  if (item.kind === 'submenu') return <div className="menu-submenu-wrap">
+    <button type="button" role="menuitem" disabled={item.disabled}><i className="menu-mark" /><span>{item.label}</span><kbd>›</kbd></button>
+    <div className="menu-submenu-panel">{item.children.map((child, index) => <MenuEntry key={`${child.kind}-${'label' in child ? child.label : index}-${index}`} item={child} onClose={onClose} />)}</div>
+  </div>
+  return <button type="button" role="menuitem" className={`${item.danger ? 'danger' : ''} ${item.checked ? 'checked' : ''}`} disabled={item.disabled} onClick={() => { item.run(); onClose() }}><i className="menu-mark">{item.checked ? '✓' : item.icon}</i><span>{item.label}</span>{item.keys && <kbd>{item.keys}</kbd>}</button>
 }

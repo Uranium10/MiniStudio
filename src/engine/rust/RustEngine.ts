@@ -3,8 +3,8 @@ import { Channel } from '@tauri-apps/api/core'
 import type { IAudioEngine } from '../IAudioEngine'
 import type {
   AudioAssetInfo, AudioBackendInfo, AudioDeviceInfo, AudioSettings, EngineCapabilities, EqFrequencyResponse, MidiInputPortInfo,
-  GraphSnapshot, Level, MultibandLevels, OfflineRenderRequest, OfflineRenderResult, PluginDescriptor,
-  ProjectState, StreamStatus,
+  GraphSnapshot, Level, LimiterMetrics, MultibandLevels, OfflineRenderRequest, OfflineRenderResult, PluginDescriptor,
+  ExportSettings, ProjectState, StreamStatus,
   ExportProgress as UiExportProgress,
 } from '../types'
 import { NotSupportedError } from '../types'
@@ -29,11 +29,14 @@ export class RustEngine implements IAudioEngine {
   private readonly liveMidiNotes = new Map<string, Set<number>>()
   private multibandLevels: Record<string, MultibandLevels> = {}
   private distortionSpectra: Record<string, readonly number[]> = {}
+  private limiterMetrics: Record<string, LimiterMetrics> = {}
   private pendingTrackIds: string[] = []
   private multibandMeterIds: string[] = []
   private pendingMultibandMeterIds: string[] = []
   private distortionMeterIds: string[] = []
   private pendingDistortionMeterIds: string[] = []
+  private limiterMeterIds: string[] = []
+  private pendingLimiterMeterIds: string[] = []
   private readonly exportListeners = new Set<(progress: UiExportProgress | null) => void>()
   private readonly pendingRealtime = new Map<string, () => Promise<CommandResult<unknown>>>()
   private realtimeFrame = 0
@@ -87,16 +90,19 @@ export class RustEngine implements IAudioEngine {
     await unwrapCommand(commands.engineUnloadAsset(assetId))
   }
 
-  async exportProject(_project: ProjectState, outputPath: string): Promise<void> {
+  async exportProject(_project: ProjectState, outputPath: string, settings?: ExportSettings): Promise<void> {
     const progress = new Channel<ExportProgress>()
     progress.onmessage = (value) => this.publishExportProgress({ ...value, fraction: finite(value.fraction) })
-    const { sampleRate } = await unwrapCommand(commands.engineGetAudioSettings())
+    const audioSettings = await unwrapCommand(commands.engineGetAudioSettings())
+    const sampleRate = settings?.sampleRate ?? audioSettings.sampleRate
     try {
       await unwrapCommand(commands.engineExportProject({
         outputPath,
-        bitDepth: 24,
+        format: settings?.format ?? 'wav',
+        bitDepth: settings?.bitDepth ?? 24,
+        mp3BitrateKbps: settings?.mp3BitrateKbps ?? 320,
         sampleRate,
-        normalize: false,
+        normalize: settings?.normalize ?? false,
       }, progress))
     } finally {
       this.publishExportProgress(null)
@@ -123,7 +129,12 @@ export class RustEngine implements IAudioEngine {
         ...snapshot.tracks.flatMap((track) => track.effects),
         ...snapshot.buses.flatMap((bus) => bus.effects),
         ...snapshot.master.effects,
-      ].filter((effect) => ['builtin:eq', 'builtin:eq8', 'builtin:distortion', 'builtin:disperser'].includes(effect.type)).map((effect) => effect.id)
+      ].filter((effect) => ['builtin:eq', 'builtin:eq8', 'builtin:distortion', 'builtin:disperser', 'builtin:clipper', 'builtin:roboter', 'builtin:resonator'].includes(effect.type)).map((effect) => effect.id)
+      this.pendingLimiterMeterIds = [
+        ...snapshot.tracks.flatMap((track) => track.effects),
+        ...snapshot.buses.flatMap((bus) => bus.effects),
+        ...snapshot.master.effects,
+      ].filter((effect) => effect.type === 'builtin:mastering-limiter').map((effect) => effect.id)
       await unwrapCommand(commands.engineSyncGraph(toNativeSnapshot(snapshot)))
     } catch (error) {
       this.streamStatus = { ...this.streamStatus, error: describeEngineError(error) }
@@ -177,6 +188,7 @@ export class RustEngine implements IAudioEngine {
   getTrackLevel(trackId: string): Level { return this.trackLevels[trackId] ?? { peak: 0, rms: 0 } }
   getMasterLevel(): Level { return this.masterLevel }
   getMultibandLevels(effectId: string): MultibandLevels { return this.multibandLevels[effectId] ?? EMPTY_MULTIBAND_LEVELS }
+  getLimiterMetrics(effectId: string): LimiterMetrics { return this.limiterMetrics[effectId] ?? EMPTY_LIMITER_METRICS }
   getEffectSpectrum(effectId: string): readonly number[] { return this.distortionSpectra[effectId] ?? EMPTY_DISTORTION_SPECTRUM }
   getDistortionSpectrum(effectId: string): readonly number[] { return this.distortionSpectra[effectId] ?? EMPTY_DISTORTION_SPECTRUM }
 
@@ -235,6 +247,7 @@ export class RustEngine implements IAudioEngine {
         this.trackIds = [...this.pendingTrackIds]
         this.multibandMeterIds = [...this.pendingMultibandMeterIds]
         this.distortionMeterIds = [...this.pendingDistortionMeterIds]
+        this.limiterMeterIds = [...this.pendingLimiterMeterIds]
       }
       for (let index = 0; index < this.trackIds.length; index += 1) {
         const id = this.trackIds[index]
@@ -265,6 +278,20 @@ export class RustEngine implements IAudioEngine {
         if (!id || !source) continue
         this.distortionSpectra[id] = source.map((value) => finite(value))
       }
+      for (let index = 0; index < this.limiterMeterIds.length; index += 1) {
+        const id = this.limiterMeterIds[index]
+        const source = state.limiterMetrics[index]
+        if (!id || !source) continue
+        this.limiterMetrics[id] = {
+          inputPeakDb: finite(source.inputPeakDb, -120),
+          outputPeakDb: finite(source.outputPeakDb, -120),
+          gainReductionDb: finite(source.gainReductionDb),
+          truePeakDb: finite(source.truePeakDb, -120),
+          momentaryLufs: finite(source.momentaryLufs, -120),
+          shortTermLufs: finite(source.shortTermLufs, -120),
+          integratedLufs: finite(source.integratedLufs, -120),
+        }
+      }
       this.streamStatus.latencyMs = finite(state.stream.latencyMs)
       this.streamStatus.xruns = state.stream.xruns
       this.streamStatus.running = state.stream.running
@@ -285,6 +312,7 @@ const EMPTY_MULTIBAND_LEVELS: MultibandLevels = Object.freeze({
   high: Object.freeze({ left: 0, right: 0 }),
 })
 const EMPTY_DISTORTION_SPECTRUM: readonly number[] = Object.freeze(Array.from({ length: 48 }, () => 0))
+const EMPTY_LIMITER_METRICS: LimiterMetrics = Object.freeze({ inputPeakDb: -120, outputPeakDb: -120, gainReductionDb: 0, truePeakDb: -120, momentaryLufs: -120, shortTermLufs: -120, integratedLufs: -120 })
 
 export function describeEngineError(error: unknown): string {
   if (error && typeof error === 'object' && 'kind' in error) {
@@ -314,8 +342,12 @@ function toNativeSnapshot(snapshot: GraphSnapshot): NativeGraphSnapshot {
       id: track.id,
       kind: track.kind,
       name: track.name,
-      clips: track.clips.map((clip) => ({ ...clip, muted: clip.muted ?? false })),
-      midiClips: track.midiClips.map((clip) => ({ id: clip.id, name: clip.name, startSec: clip.startSec, durationSec: clip.durationSec, loopEnabled: clip.loopEnabled, loopStartTicks: clip.loopStartTicks, loopLengthTicks: clip.loopLengthTicks, notes: clip.notes, transposeSemitones: clip.transposeSemitones, velocityScale: clip.velocityScale, muted: clip.muted })),
+      clips: track.clips.map((clip) => {
+        const sourceBpm = Math.max(20, clip.warpSourceBpm ?? snapshot.transport.bpm)
+        const warp = clip.warpMode === 'project' ? snapshot.transport.bpm / sourceBpm : clip.warpMode === 'half' ? snapshot.transport.bpm / sourceBpm * .5 : clip.warpMode === 'double' ? snapshot.transport.bpm / sourceBpm * 2 : 1
+        return { ...clip, muted: clip.muted ?? false, playbackRate: (clip.playbackRate ?? 1) * warp, pitchSemitones: clip.pitchSemitones ?? 0, fineCents: clip.fineCents ?? 0, reversed: clip.reversed ?? false, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ timeSec: point.timeSec, valueDb: point.valueDb, curve: point.curve ?? 0 })) }
+      }),
+      midiClips: track.midiClips.map((clip) => ({ id: clip.id, name: clip.name, startSec: clip.startSec, durationSec: clip.durationSec, loopEnabled: clip.loopEnabled, loopStartTicks: clip.loopStartTicks, loopLengthTicks: clip.loopLengthTicks, notes: clip.notes, ccLanes: clip.ccLanes, transposeSemitones: clip.transposeSemitones, velocityScale: clip.velocityScale, muted: clip.muted })),
       instrument: track.instrument,
       volumeDb: track.volumeDb,
       pan: track.pan,

@@ -70,6 +70,81 @@ fn with_engine<T>(
 
 #[tauri::command]
 #[specta::specta]
+fn list_storage_roots() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        return (b'A'..=b'Z')
+            .map(|letter| format!("{}:\\", letter as char))
+            .filter(|root| std::path::Path::new(root).exists())
+            .collect();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec!["/".to_owned()];
+        if let Ok(entries) = std::fs::read_dir("/Volumes") {
+            roots.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path().to_string_lossy().into_owned()),
+            );
+        }
+        return roots;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        vec!["/".to_owned()]
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Type)]
+#[serde(rename_all = "camelCase")]
+struct MediaDirectoryEntry {
+    path: String,
+    name: String,
+    is_directory: bool,
+}
+
+#[tauri::command]
+#[specta::specta]
+fn list_media_directory(path: String) -> Result<Vec<MediaDirectoryEntry>, EngineError> {
+    let mut result = Vec::new();
+    let entries = std::fs::read_dir(&path).map_err(|error| {
+        EngineError::Asset(format!("cannot read media directory {path}: {error}"))
+    })?;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_directory = file_type.is_dir();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_audio = name
+            .rsplit_once('.')
+            .map(|(_, extension)| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac"
+                )
+            })
+            .unwrap_or(false);
+        if is_directory || (file_type.is_file() && is_audio) {
+            result.push(MediaDirectoryEntry {
+                path: entry.path().to_string_lossy().into_owned(),
+                name,
+                is_directory,
+            });
+        }
+    }
+    result.sort_by(|left, right| {
+        right
+            .is_directory
+            .cmp(&left.is_directory)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(result)
+}
+
+#[tauri::command]
+#[specta::specta]
 fn engine_init(state: State<'_, NativeEngineState>) -> Result<(), EngineError> {
     with_engine(&state, NativeEngine::init)
 }
@@ -559,6 +634,8 @@ fn specta_builder() -> Builder<AppRuntime> {
     Builder::new()
         .dangerously_cast_bigints_to_number()
         .commands(collect_commands![
+            list_storage_roots,
+            list_media_directory,
             engine_init,
             engine_dispose,
             engine_load_audio_file,

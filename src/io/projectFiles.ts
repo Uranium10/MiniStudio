@@ -59,8 +59,8 @@ export async function chooseAudioFile(): Promise<string | null> {
   return path
 }
 
-export async function chooseExportPath(projectName: string): Promise<string | null> {
-  return save({ defaultPath: `${projectName}.wav`, filters: [{ name: 'Wave Audio', extensions: ['wav'] }] })
+export async function chooseExportPath(projectName: string, format: 'wav' | 'mp3' = 'wav'): Promise<string | null> {
+  return save({ defaultPath: `${projectName}.${format}`, filters: [{ name: format === 'mp3' ? 'MP3 Audio' : 'Wave Audio', extensions: [format] }] })
 }
 
 export async function hydrateProjectAudio(engine: IAudioEngine, source: ProjectState): Promise<{ project: ProjectState; missing: Array<{ id: string; name: string }> }> {

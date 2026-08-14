@@ -2,7 +2,7 @@
 export type ShortcutId =
   | 'transport.toggle' | 'transport.home' | 'transport.loop' | 'transport.loopSelection'
   | 'edit.delete' | 'edit.split' | 'edit.undo' | 'edit.redo' | 'edit.duplicate' | 'edit.selectAll'
-  | 'edit.copy' | 'edit.cut' | 'edit.paste' | 'edit.mute'
+  | 'edit.copy' | 'edit.cut' | 'edit.paste' | 'edit.mute' | 'edit.quantize'
   | 'file.new' | 'file.save' | 'file.open' | 'file.export'
   | 'view.zoomIn' | 'view.zoomOut' | 'view.trackIn' | 'view.trackOut' | 'view.fit' | 'view.panel' | 'view.tab'
   | 'view.follow' | 'view.shortcuts' | 'view.pianoRoll' | 'view.bottomPanel' | 'view.inspector' | 'view.browser'
@@ -33,6 +33,7 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
       { id: 'edit.split', label: '플레이헤드에서 분할', keys: 'S' },
       { id: 'edit.mute', label: '선택 클립 뮤트', keys: 'M' },
       { id: 'edit.delete', label: '선택 삭제', keys: 'Delete' },
+      { id: 'edit.quantize', label: '선택 노트/아이템 퀀타이즈', keys: 'Q' },
     ],
   },
   {
@@ -41,7 +42,7 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
       { id: 'file.new', label: '새 프로젝트', keys: 'Ctrl+N' },
       { id: 'file.open', label: '프로젝트 열기', keys: 'Ctrl+O' },
       { id: 'file.save', label: '프로젝트 저장', keys: 'Ctrl+S' },
-      { id: 'file.export', label: '마스터 WAV 내보내기', keys: 'Ctrl+Shift+E' },
+      { id: 'file.export', label: '내보내기', keys: 'Ctrl+Shift+E' },
     ],
   },
   {
@@ -49,8 +50,8 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
     items: [
       { id: 'view.zoomIn', label: '가로 확대', keys: 'E / +' },
       { id: 'view.zoomOut', label: '가로 축소', keys: 'W / -' },
-      { id: 'view.trackIn', label: '트랙 높이 늘리기', keys: 'Shift++' },
-      { id: 'view.trackOut', label: '트랙 높이 줄이기', keys: 'Shift+-' },
+      { id: 'view.trackIn', label: '전체 트랙 높이 늘리기', keys: 'Shift+E' },
+      { id: 'view.trackOut', label: '전체 트랙 높이 줄이기', keys: 'Shift+W' },
       { id: 'view.fit', label: '전체 보기', keys: 'F' },
       { id: 'view.follow', label: '플레이헤드 따라가기', keys: 'Shift+F' },
       { id: 'view.panel', label: '하단 패널 접기 / 펴기', keys: 'Tab' },

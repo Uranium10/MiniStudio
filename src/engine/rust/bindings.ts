@@ -5,6 +5,8 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
+	listStorageRoots: () => __TAURI_INVOKE<string[]>("list_storage_roots"),
+	listMediaDirectory: (path: string) => typedError<MediaDirectoryEntry[], EngineError>(__TAURI_INVOKE("list_media_directory", { path })),
 	engineInit: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_init")),
 	engineDispose: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_dispose")),
 	engineLoadAudioFile: (path: string, onProgress: Channel<DecodeProgress>) => typedError<NativeAssetInfo, EngineError>(__TAURI_INVOKE("engine_load_audio_file", { path, onProgress })),
@@ -71,6 +73,12 @@ export type BusSpec = {
 	volumeDb: number | null,
 };
 
+export type ClipGainPointSpec = {
+	timeSec: number | null,
+	valueDb: number | null,
+	curve?: number | null,
+};
+
 export type ClipSpec = {
 	id: string,
 	assetId: string,
@@ -81,6 +89,13 @@ export type ClipSpec = {
 	fadeInSec: number | null,
 	fadeOutSec: number | null,
 	muted?: boolean,
+	playbackRate?: number | null,
+	pitchSemitones?: number | null,
+	fineCents?: number | null,
+	reversed?: boolean,
+	fadeInCurve?: number | null,
+	fadeOutCurve?: number | null,
+	gainPoints?: ClipGainPointSpec[],
 };
 
 export type DecodeProgress = {
@@ -109,6 +124,7 @@ export type EngineSnapshot = {
 	activeVoiceCounts: number[],
 	multibandLevels: MultibandLevels[],
 	distortionSpectra: ((number | null)[])[],
+	limiterMetrics: LimiterMetrics[],
 };
 
 export type EqFrequencyResponse = {
@@ -126,7 +142,9 @@ export type ExportProgress = {
 
 export type ExportRequest = {
 	outputPath: string,
+	format: string,
 	bitDepth: number,
+	mp3BitrateKbps: number,
 	sampleRate: number,
 	normalize: boolean,
 };
@@ -169,6 +187,16 @@ export type Level = {
 	rms: number | null,
 };
 
+export type LimiterMetrics = {
+	inputPeakDb: number | null,
+	outputPeakDb: number | null,
+	gainReductionDb: number | null,
+	truePeakDb: number | null,
+	momentaryLufs: number | null,
+	shortTermLufs: number | null,
+	integratedLufs: number | null,
+};
+
 export type LoopSpec = {
 	enabled: boolean,
 	startSec: number | null,
@@ -180,6 +208,23 @@ export type MasterSpec = {
 	effects: EffectSpec[],
 };
 
+export type MediaDirectoryEntry = {
+	path: string,
+	name: string,
+	isDirectory: boolean,
+};
+
+export type MidiCcLaneSpec = {
+	/**  MIDI CC 0..127, or -1 for the bipolar pitch-bend wheel. */
+	cc: number,
+	points: MidiCcPointSpec[],
+};
+
+export type MidiCcPointSpec = {
+	ticks: number,
+	value: number,
+};
+
 export type MidiClipSpec = {
 	id: string,
 	name: string,
@@ -189,6 +234,7 @@ export type MidiClipSpec = {
 	loopStartTicks: number,
 	loopLengthTicks: number,
 	notes: MidiNoteSpec[],
+	ccLanes?: MidiCcLaneSpec[],
 	transposeSemitones: number,
 	velocityScale: number | null,
 	muted: boolean,

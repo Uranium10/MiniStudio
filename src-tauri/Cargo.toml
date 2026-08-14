@@ -31,10 +31,12 @@ bytemuck = "1.24"
 crossbeam-queue = "0.3"
 cpal = "0.16"
 hound = "3.5"
+mp3lame-encoder = "0.2.4"
 clack-host = "0.1.1"
 clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "state", "tail", "thread-check"] }
 midir = "0.10"
 rubato = "0.16"
+rustfft = "6.4"
 rtrb = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

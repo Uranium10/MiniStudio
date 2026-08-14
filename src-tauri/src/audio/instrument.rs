@@ -266,6 +266,9 @@ pub struct TestTone {
     velocity_curve: f32,
     sustain_pedal: bool,
     pitch_bend: f32,
+    modulation: f32,
+    modulation_phase: f32,
+    expression: f32,
 }
 impl TestTone {
     pub fn new() -> Self {
@@ -282,6 +285,9 @@ impl TestTone {
             velocity_curve: 1.0,
             sustain_pedal: false,
             pitch_bend: 0.0,
+            modulation: 0.0,
+            modulation_phase: 0.0,
+            expression: 1.0,
         }
     }
 }
@@ -300,6 +306,10 @@ impl Instrument for TestTone {
                 self.handle(events[event_index].kind);
                 event_index += 1;
             }
+            let vibrato =
+                (self.modulation_phase * std::f32::consts::TAU).sin() * self.modulation * 0.5;
+            self.modulation_phase =
+                (self.modulation_phase + 5.0 / self.sample_rate.max(1.0)).fract();
             let mut mixed = 0.0;
             for voice in &mut self.allocator.voices[..self.polyphony.clamp(1, MAX_VOICES)] {
                 if voice.stage == Stage::Idle {
@@ -326,15 +336,17 @@ impl Instrument for TestTone {
                 if voice.stage == Stage::Idle {
                     continue;
                 }
-                let semitones =
-                    voice.pitch as f32 - 69.0 + (voice.tuning / 100.0) + self.pitch_bend * 2.0;
+                let semitones = voice.pitch as f32 - 69.0
+                    + (voice.tuning / 100.0)
+                    + self.pitch_bend * 2.0
+                    + vibrato;
                 let frequency = 440.0 * 2.0_f32.powf(semitones / 12.0);
                 let dt = (frequency / self.sample_rate).min(0.49);
                 let oscillator = oscillator(self.waveform, voice.phase, dt);
                 voice.phase = (voice.phase + dt).fract();
                 mixed += oscillator * voice.env * voice.velocity.max(0.0).powf(self.velocity_curve);
             }
-            let value = (mixed * self.gain * 0.28).tanh();
+            let value = (mixed * self.gain * self.expression * 0.28).tanh();
             out.channels[0][sample] += value;
             out.channels[1][sample] += value;
         }
@@ -355,6 +367,10 @@ impl Instrument for TestTone {
     fn reset(&mut self) {
         self.allocator.all_notes_off();
         self.sustain_pedal = false;
+        self.pitch_bend = 0.0;
+        self.modulation = 0.0;
+        self.modulation_phase = 0.0;
+        self.expression = 1.0;
     }
     fn tail_samples(&self) -> usize {
         (self.release * self.sample_rate) as usize
@@ -400,6 +416,8 @@ impl TestTone {
                     self.allocator.release_sustained()
                 }
             }
+            NoteEventKind::Controller { cc: 1, value } => self.modulation = value.clamp(0.0, 1.0),
+            NoteEventKind::Controller { cc: 11, value } => self.expression = value.clamp(0.0, 1.0),
             NoteEventKind::PitchBend { value } => self.pitch_bend = value.clamp(-1.0, 1.0),
             NoteEventKind::AllNotesOff => self.reset(),
             _ => {}

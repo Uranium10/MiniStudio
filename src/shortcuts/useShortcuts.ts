@@ -2,8 +2,8 @@
 import { useEffect } from 'react'
 import { useEngine } from '../hooks/useEngine'
 import {
-  deleteInContext, exportMasterWav, openProjectFile, saveProjectFile,
-  seekTo, selectAllInContext, splitSelectionAtPlayhead, togglePlayback,
+  copyInContext, deleteInContext, openProjectFile, pasteInContext, saveProjectFile,
+  quantizeInContext, seekTo, selectAllInContext, splitSelectionAtPlayhead, togglePlayback,
 } from '../store/commands'
 import { useProjectStore } from '../store/projectStore'
 import { nextSubTool, useToolStore } from '../store/toolStore'
@@ -50,17 +50,18 @@ export function useShortcuts(): void {
         case 'split': splitSelectionAtPlayhead(); break
         case 'undo': store.undo(); break
         case 'redo': store.redo(); break
-        case 'copy': store.copySelectedClips(); break
+        case 'copy': copyInContext(); break
         case 'cut': store.cutSelectedClips(); break
-        case 'paste': store.pasteClipboard(); break
+        case 'paste': pasteInContext(); break
         case 'duplicate': store.duplicateSelectedClips(); break
-        case 'smartDuplicate': if (store.editFocus === 'pianoRoll') store.duplicateSelectedMidiNotes(); else store.duplicateSelectedClipsSmart(); break
+        case 'smartDuplicate': if (store.selectedAutomationPoints.length) store.duplicateSelectedAutomationPoints(); else if (store.editFocus === 'pianoRoll') store.duplicateSelectedMidiNotes(); else store.duplicateSelectedClipsSmart(); break
         case 'muteClips': store.toggleSelectedClipsMuted(); break
         case 'selectAll': selectAllInContext(); break
+        case 'quantize': quantizeInContext(); break
         case 'zoomIn': zoomHorizontal(1.18); break
         case 'zoomOut': zoomHorizontal(1 / 1.18); break
-        case 'trackIn': store.setTrackHeight(store.trackHeight + 8); break
-        case 'trackOut': store.setTrackHeight(store.trackHeight - 8); break
+        case 'trackIn': store.resizeAllTracks(8); break
+        case 'trackOut': store.resizeAllTracks(-8); break
         case 'fit': store.setZoom(22); break
         case 'follow': store.toggleFollowPlayhead(); store.showToast(store.followPlayhead ? '플레이헤드 따라가기 해제' : '플레이헤드 따라가기'); break
         case 'panel': store.toggleLowerPanel(); break
@@ -68,7 +69,7 @@ export function useShortcuts(): void {
         case 'save': void saveProjectFile(); break
         case 'new': if (window.confirm('현재 프로젝트를 닫고 새 프로젝트를 시작할까요? 저장하지 않은 변경은 사라집니다.')) { void engine.stop(); store.newProject() }; break
         case 'open': void openProjectFile(engine); break
-        case 'export': void exportMasterWav(engine); break
+        case 'export': store.setExportDialogOpen(true); break
         case 'transposeUp':
         case 'transposeDown': transposeSelection(command === 'transposeUp' ? 1 : -1, event.ctrlKey || event.metaKey); break
       }
@@ -110,7 +111,7 @@ function zoomHorizontal(factor: number): void {
 type Command =
   | 'play' | 'home' | 'loop' | 'loopSelection'
   | 'delete' | 'split' | 'undo' | 'redo' | 'duplicate' | 'smartDuplicate' | 'selectAll' | 'copy' | 'cut' | 'paste' | 'muteClips'
-  | 'transposeUp' | 'transposeDown'
+  | 'transposeUp' | 'transposeDown' | 'quantize'
   | 'zoomIn' | 'zoomOut' | 'trackIn' | 'trackOut' | 'fit' | 'follow' | 'panel' | 'tab'
   | 'new' | 'save' | 'open' | 'export'
 
@@ -135,16 +136,19 @@ function keyToCommand(event: KeyboardEvent): Command | null {
   if (mod && key === 'o') return 'open'
   if (mod && event.shiftKey && key === 'e') return 'export'
   if (mod) return null
+  if (event.shiftKey && key === 'e') return 'trackIn'
+  if (event.shiftKey && key === 'w') return 'trackOut'
   if (key === 'w') return 'zoomOut'
   if (key === 'e') return 'zoomIn'
   if (key === 'l') return event.shiftKey ? 'loopSelection' : 'loop'
   if (key === 's') return 'split'
   if (key === 'm') return 'muteClips'
   if (key === 'd') return 'smartDuplicate'
+  if (key === 'q') return 'quantize'
   if (key === 'f') return event.shiftKey ? 'follow' : 'fit'
   if (event.key === 'Tab') return event.shiftKey ? 'tab' : 'panel'
-  if (event.key === '+' || event.key === '=') return event.shiftKey && event.key !== '=' ? 'trackIn' : 'zoomIn'
-  if (event.key === '-' || event.key === '_') return event.shiftKey ? 'trackOut' : 'zoomOut'
+  if (event.key === '+' || event.key === '=') return 'zoomIn'
+  if (event.key === '-' || event.key === '_') return 'zoomOut'
   return null
 }
 

@@ -98,9 +98,42 @@ export function selectAllInContext(): void {
 
 export function deleteInContext(): void {
   const state = store()
+  if (state.selectedClipGainPoint) { const point = state.selectedClipGainPoint; state.removeClipGainPoint(point.trackId, point.clipId, point.pointId); return }
+  if (state.selectedAutomationPoints.length) { state.deleteSelectedAutomationPoints(); return }
   if (state.editFocus === 'pianoRoll' && state.pianoRollOpen && state.editorClip && state.selectedNoteIds.length) {
     state.deleteMidiNotes(state.editorClip.trackId, state.editorClip.clipId, state.selectedNoteIds)
     return
   }
-  state.deleteSelectedClips()
+  if (state.selectedClipIds.length) {
+    state.deleteSelectedClips()
+    return
+  }
+  if (state.editFocus === 'arrangement' && state.selectedTrackId) state.removeSelectedTrack()
+}
+
+export function copyInContext(): void {
+  const state = store()
+  if (state.selectedAutomationPoints.length) state.copySelectedAutomationPoints()
+  else state.copySelectedClips()
+}
+
+export function pasteInContext(): void {
+  const state = store()
+  if (state.selectedAutomationPoints.length || (state.automationClipboard && !state.clipboard)) state.pasteAutomationPoints(state.playheadSec)
+  else state.pasteClipboard()
+}
+
+/** Quantizes notes in the piano roll, otherwise arrangement clips, to the active grid. */
+export function quantizeInContext(): void {
+  const state = store()
+  if (state.editFocus === 'pianoRoll' && state.editorClip && state.selectedNoteIds.length) {
+    const clip = state.project.tracks.find((track) => track.id === state.editorClip!.trackId)?.midiClips.find((item) => item.id === state.editorClip!.clipId)
+    if (!clip) return
+    const selected = new Set(state.selectedNoteIds)
+    state.updateMidiNoteBatch(state.editorClip.trackId, state.editorClip.clipId, clip.notes.filter((note) => selected.has(note.id)).map((note) => ({ id: note.id, patch: { startTicks: Math.max(0, Math.round(note.startTicks / state.gridTicks) * state.gridTicks) } })))
+    return
+  }
+  const selected = new Set(state.selectedClipIds)
+  const step = (state.gridTicks / 960) * (60 / state.project.transport.bpm)
+  for (const track of state.project.tracks) for (const clip of [...track.clips, ...track.midiClips]) if (selected.has(clip.id)) state.updateClip(track.id, clip.id, { startSec: Math.max(0, Math.round(clip.startSec / step) * step) })
 }

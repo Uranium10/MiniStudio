@@ -3,29 +3,166 @@ use super::{
     asset::{decode_asset, AudioAsset},
     command::{param_key, AudioCommand},
     device,
-    dsp::{create_effect, DISTORTION_SPECTRUM_BINS},
+    dsp::{create_effect, DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES},
     graph::{AudioGraph, Bindings},
     instrument::{LiveMidiMessage, NoteEvent, NoteEventKind},
     types::{
         db_to_gain, AudioBackendInfo, AudioDeviceInfo, AudioSettings, DecodeProgress, EffectSpec,
         EngineSnapshot, EqFrequencyResponse, ExportProgress, ExportRequest, ExportResult,
-        GraphSnapshot, Level, MidiInputPortInfo, MultibandLevels, NativeAssetInfo, StereoLevel,
-        StreamStatus,
+        GraphSnapshot, Level, LimiterMetrics, MidiInputPortInfo, MultibandLevels, NativeAssetInfo,
+        StereoLevel, StreamStatus,
     },
     COMMAND_CAPACITY, MAX_BLOCK_SIZE, MAX_EFFECT_METERS, MAX_TRACKS, RETIRED_GRAPH_CAPACITY,
 };
 use cpal::Stream;
 use crossbeam_queue::ArrayQueue;
 use midir::{Ignore, MidiInput, MidiInputConnection};
+use mp3lame_encoder::{
+    max_required_buffer_size, Bitrate, Builder as Mp3Builder, FlushGap, InterleavedPcm, Mode,
+    Quality,
+};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
     collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write},
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         Arc,
     },
 };
+
+enum ExportSink {
+    Wav {
+        writer: hound::WavWriter<BufWriter<File>>,
+        bit_depth: u16,
+    },
+    Mp3 {
+        encoder: mp3lame_encoder::Encoder,
+        writer: BufWriter<File>,
+        encoded: Vec<u8>,
+    },
+}
+
+impl ExportSink {
+    fn new(request: &ExportRequest) -> Result<Self, String> {
+        match request.format.as_str() {
+            "wav" => {
+                let spec = hound::WavSpec {
+                    channels: 2,
+                    sample_rate: request.sample_rate,
+                    bits_per_sample: request.bit_depth,
+                    sample_format: if request.bit_depth == 32 {
+                        hound::SampleFormat::Float
+                    } else {
+                        hound::SampleFormat::Int
+                    },
+                };
+                let writer = hound::WavWriter::create(Path::new(&request.output_path), spec)
+                    .map_err(|error| error.to_string())?;
+                Ok(Self::Wav {
+                    writer,
+                    bit_depth: request.bit_depth,
+                })
+            }
+            "mp3" => {
+                let encoder = Mp3Builder::new()
+                    .ok_or("failed to allocate LAME MP3 encoder")?
+                    .with_num_channels(2)
+                    .map_err(|error| error.to_string())?
+                    .with_sample_rate(request.sample_rate)
+                    .map_err(|error| error.to_string())?
+                    .with_brate(mp3_bitrate(request.mp3_bitrate_kbps)?)
+                    .map_err(|error| error.to_string())?
+                    .with_mode(Mode::JointStereo)
+                    .map_err(|error| error.to_string())?
+                    .with_quality(Quality::NearBest)
+                    .map_err(|error| error.to_string())?
+                    .with_to_write_vbr_tag(false)
+                    .map_err(|error| error.to_string())?
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let writer = BufWriter::new(
+                    File::create(Path::new(&request.output_path))
+                        .map_err(|error| error.to_string())?,
+                );
+                Ok(Self::Mp3 {
+                    encoder,
+                    writer,
+                    encoded: Vec::with_capacity(max_required_buffer_size(MAX_BLOCK_SIZE)),
+                })
+            }
+            format => Err(format!("unsupported export format: {format}")),
+        }
+    }
+
+    fn write_samples(&mut self, samples: &[f32]) -> Result<(), String> {
+        match self {
+            Self::Wav { writer, bit_depth } => {
+                for value in samples {
+                    if *bit_depth == 32 {
+                        writer
+                            .write_sample(*value)
+                            .map_err(|error| error.to_string())?
+                    } else if *bit_depth == 24 {
+                        writer
+                            .write_sample((value.clamp(-1.0, 1.0) * 8_388_607.0) as i32)
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        writer
+                            .write_sample((value.clamp(-1.0, 1.0) * 32_767.0) as i16)
+                            .map_err(|error| error.to_string())?
+                    }
+                }
+                Ok(())
+            }
+            Self::Mp3 {
+                encoder,
+                writer,
+                encoded,
+            } => {
+                encoded.clear();
+                encoded.reserve(max_required_buffer_size(samples.len() / 2));
+                encoder
+                    .encode_to_vec(InterleavedPcm(samples), encoded)
+                    .map_err(|error| error.to_string())?;
+                writer.write_all(encoded).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    fn finalize(self) -> Result<(), String> {
+        match self {
+            Self::Wav { writer, .. } => writer.finalize().map_err(|error| error.to_string()),
+            Self::Mp3 {
+                mut encoder,
+                mut writer,
+                mut encoded,
+            } => {
+                encoded.clear();
+                encoded.reserve(7_200);
+                encoder
+                    .flush_to_vec::<FlushGap>(&mut encoded)
+                    .map_err(|error| error.to_string())?;
+                writer
+                    .write_all(&encoded)
+                    .map_err(|error| error.to_string())?;
+                writer.flush().map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+fn mp3_bitrate(value: u16) -> Result<Bitrate, String> {
+    match value {
+        128 => Ok(Bitrate::Kbps128),
+        192 => Ok(Bitrate::Kbps192),
+        256 => Ok(Bitrate::Kbps256),
+        320 => Ok(Bitrate::Kbps320),
+        _ => Err("MP3 bitrate must be 128, 192, 256, or 320 kbps".into()),
+    }
+}
 use triple_buffer::{triple_buffer, Input, Output};
 
 #[derive(Clone, Copy)]
@@ -38,6 +175,7 @@ pub struct MeterFrame {
     pub active_voice_counts: [u32; MAX_TRACKS],
     pub multiband_levels: [[[f32; 2]; 3]; MAX_EFFECT_METERS],
     pub distortion_spectra: [[f32; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
+    pub limiter_metrics: [[f32; LIMITER_METER_VALUES]; MAX_EFFECT_METERS],
 }
 impl Default for MeterFrame {
     fn default() -> Self {
@@ -53,6 +191,8 @@ impl Default for MeterFrame {
             active_voice_counts: [0; MAX_TRACKS],
             multiband_levels: [[[0.0; 2]; 3]; MAX_EFFECT_METERS],
             distortion_spectra: [[0.0; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
+            limiter_metrics: [[-120.0, -120.0, 0.0, -120.0, -120.0, -120.0, -120.0];
+                MAX_EFFECT_METERS],
         }
     }
 }
@@ -200,6 +340,7 @@ impl AudioCore {
                 .write_multiband_levels(&mut frame.multiband_levels);
             self.graph
                 .write_distortion_spectra(&mut frame.distortion_spectra);
+            self.graph.write_limiter_metrics(&mut frame.limiter_metrics);
             self.meters.publish();
         }
     }
@@ -306,6 +447,7 @@ impl AudioCore {
             .write_multiband_levels(&mut frame.multiband_levels);
         self.graph
             .write_distortion_spectra(&mut frame.distortion_spectra);
+        self.graph.write_limiter_metrics(&mut frame.limiter_metrics);
         self.meters.publish();
     }
 }
@@ -344,6 +486,7 @@ impl Default for NativeEngine {
                 track_ids: Vec::new(),
                 multiband_meter_ids: Vec::new(),
                 distortion_meter_ids: Vec::new(),
+                limiter_meter_ids: Vec::new(),
             },
             last_snapshot: None,
             last_error: None,
@@ -712,6 +855,19 @@ impl NativeEngine {
             .iter()
             .map(|spectrum| spectrum.to_vec())
             .collect();
+        let limiter_metrics = frame.limiter_metrics
+            [..self.bindings.limiter_meter_ids.len().min(MAX_EFFECT_METERS)]
+            .iter()
+            .map(|values| LimiterMetrics {
+                input_peak_db: values[0],
+                output_peak_db: values[1],
+                gain_reduction_db: values[2],
+                true_peak_db: values[3],
+                momentary_lufs: values[4],
+                short_term_lufs: values[5],
+                integrated_lufs: values[6],
+            })
+            .collect();
         EngineSnapshot {
             playhead_sec: frame.position as f64 / f64::from(self.settings.sample_rate),
             track_levels,
@@ -732,6 +888,7 @@ impl NativeEngine {
                 .to_vec(),
             multiband_levels,
             distortion_spectra,
+            limiter_metrics,
         }
     }
     pub fn backends(&self) -> Vec<AudioBackendInfo> {
@@ -863,6 +1020,9 @@ impl NativeEngine {
         if !matches!(request.bit_depth, 16 | 24 | 32) {
             return Err("export bit depth must be 16, 24, or 32".into());
         }
+        if !matches!(request.format.as_str(), "wav" | "mp3") {
+            return Err("export format must be wav or mp3".into());
+        }
         if request.sample_rate != self.settings.sample_rate {
             return Err("export sample rate must match the loaded project sample rate".into());
         }
@@ -931,18 +1091,7 @@ impl NativeEngine {
                 normalization_gain = 0.999 / peak
             }
         }
-        let wav = hound::WavSpec {
-            channels: 2,
-            sample_rate: request.sample_rate,
-            bits_per_sample: request.bit_depth,
-            sample_format: if request.bit_depth == 32 {
-                hound::SampleFormat::Float
-            } else {
-                hound::SampleFormat::Int
-            },
-        };
-        let mut writer = hound::WavWriter::create(Path::new(&request.output_path), wav)
-            .map_err(|e| e.to_string())?;
+        let mut sink = ExportSink::new(request)?;
         let mut graph = graph;
         graph.reset(0);
         let mut output = vec![0.0_f32; MAX_BLOCK_SIZE * 2];
@@ -954,7 +1103,7 @@ impl NativeEngine {
         let mut master = Level::default();
         while pos < total {
             if cancelled.load(Ordering::Relaxed) {
-                writer.finalize().map_err(|e| e.to_string())?;
+                sink.finalize()?;
                 return Ok(ExportResult {
                     output_path: request.output_path.clone(),
                     peak_db: if peak > 0.0 {
@@ -975,22 +1124,12 @@ impl NativeEngine {
                 &mut master,
                 true,
             );
-            for value in &output[..frames * 2] {
-                let value = *value * normalization_gain;
+            for value in &mut output[..frames * 2] {
+                *value *= normalization_gain;
                 peak = peak.max(value.abs());
                 clipped |= value.abs() > 1.0;
-                if request.bit_depth == 32 {
-                    writer.write_sample(value).map_err(|e| e.to_string())?
-                } else if request.bit_depth == 24 {
-                    writer
-                        .write_sample((value.clamp(-1.0, 1.0) * 8_388_607.0) as i32)
-                        .map_err(|e| e.to_string())?
-                } else {
-                    writer
-                        .write_sample((value.clamp(-1.0, 1.0) * 32_767.0) as i16)
-                        .map_err(|e| e.to_string())?
-                }
             }
+            sink.write_samples(&output[..frames * 2])?;
             pos += frames;
             if pos >= next_progress {
                 let base = if request.normalize { 0.5 } else { 0.0 };
@@ -1004,7 +1143,7 @@ impl NativeEngine {
                 next_progress = pos + progress_step
             }
         }
-        writer.finalize().map_err(|e| e.to_string())?;
+        sink.finalize()?;
         Ok(ExportResult {
             output_path: request.output_path.clone(),
             peak_db: if peak > 0.0 {
@@ -1056,6 +1195,43 @@ mod realtime_tests {
     use std::{thread, time::Duration};
 
     #[test]
+    fn validates_supported_mp3_bitrates() {
+        assert!(matches!(mp3_bitrate(128), Ok(Bitrate::Kbps128)));
+        assert!(matches!(mp3_bitrate(320), Ok(Bitrate::Kbps320)));
+        assert!(mp3_bitrate(160).is_err());
+    }
+
+    #[test]
+    fn mp3_sink_writes_a_decodable_frame_stream() {
+        let path = std::env::temp_dir().join(format!(
+            "minidaw-mp3-smoke-{}-{}.mp3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let request = ExportRequest {
+            output_path: path.to_string_lossy().into_owned(),
+            format: "mp3".into(),
+            bit_depth: 24,
+            mp3_bitrate_kbps: 192,
+            sample_rate: 48_000,
+            normalize: false,
+        };
+        let mut sink = ExportSink::new(&request).expect("MP3 encoder should initialize");
+        sink.write_samples(&vec![0.0; 4_800 * 2])
+            .expect("silence should encode");
+        sink.finalize().expect("MP3 stream should flush");
+        let encoded = std::fs::read(&path).expect("MP3 output should exist");
+        assert!(encoded.len() > 1_000);
+        assert!(encoded
+            .windows(2)
+            .any(|bytes| bytes[0] == 0xff && bytes[1] & 0xe0 == 0xe0));
+        std::fs::remove_file(path).expect("temporary MP3 should be removable");
+    }
+
+    #[test]
     #[ignore = "opens the machine's real default audio output"]
     fn native_play_advances_the_audio_clock() {
         let mut engine = NativeEngine::default();
@@ -1101,6 +1277,7 @@ mod realtime_tests {
                             release_velocity: 64,
                             muted: false,
                         }],
+                        cc_lanes: Vec::new(),
                         transpose_semitones: 0,
                         velocity_scale: 1.0,
                         muted: false,

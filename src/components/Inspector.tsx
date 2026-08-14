@@ -2,6 +2,7 @@
 import { ChevronDown, CirclePower, Plus, Radio, SlidersHorizontal, Trash2 } from 'lucide-react'
 import { useCallback, useRef, useState } from 'react'
 import type { EffectInstance, EffectType } from '../engine'
+import { COLORIZER_NAME } from '../effects/builtinEffects'
 import { useEngine } from '../hooks/useEngine'
 import { useProjectStore } from '../store/projectStore'
 import { EditableNumber } from './controls'
@@ -22,6 +23,8 @@ export function Inspector() {
   const engine = useEngine()
   const [effectPicker, setEffectPicker] = useState(false)
   const [effectMenu, setEffectMenu] = useState<{ x: number; y: number; effect: EffectInstance } | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const nameRef = useRef<HTMLInputElement>(null)
   const effectPickerButtonRef = useRef<HTMLButtonElement>(null)
   const getEffectPickerAnchor = useCallback(() => effectPickerButtonRef.current, [])
   const effectMenuItems: MenuItem[] = effectMenu && track ? [
@@ -38,7 +41,7 @@ export function Inspector() {
       <div className="inspector-heading"><span>인스펙터</span><button title="트랙 삭제" onClick={remove}><Trash2 size={14} /></button></div>
       <div className="track-identity">
         <input type="color" value={track.color} onChange={(event) => updateTrack(track.id, { color: event.target.value })} aria-label="Track color" />
-        <div><input className="track-name-input" value={track.name} onChange={(event) => updateTrack(track.id, { name: event.target.value })} /><small>{track.kind === 'instrument' ? `인스트루먼트 · ${track.instrument?.type ?? 'Empty'}` : '스테레오 오디오'}</small></div>
+        <div><input ref={nameRef} className="track-name-input" value={track.name} readOnly={!renaming} title="더블클릭하여 이름 바꾸기" onDoubleClick={() => { setRenaming(true); queueMicrotask(() => { nameRef.current?.focus(); nameRef.current?.select() }) }} onChange={(event) => updateTrack(track.id, { name: event.target.value })} onBlur={() => setRenaming(false)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === 'Escape') event.currentTarget.blur() }} /><small>{track.kind === 'instrument' ? `인스트루먼트 · ${track.instrument?.type ?? 'Empty'}` : '스테레오 오디오'}</small></div>
       </div>
       <Section title="채널">
         <label className="field-row"><span>볼륨</span><input type="range" min="-60" max="12" step="0.1" value={track.volumeDb} onChange={(event) => { const value = Number(event.target.value); updateTrack(track.id, { volumeDb: value }); engine.setTrackVolume(track.id, value) }} /><EditableNumber value={track.volumeDb} min={-60} max={12} step={0.1} onChange={(value) => { updateTrack(track.id, { volumeDb: value }); engine.setTrackVolume(track.id, value) }} format={(value) => `${value.toFixed(1)} dB`} /></label>
@@ -64,12 +67,12 @@ export function Inspector() {
   )
 }
 
-const EFFECTS: Array<{ type: EffectType; name: string; description: string }> = [{ type: 'builtin:eq', name: '4band-EQ', description: '4-band parametric EQ' }, { type: 'builtin:eq8', name: '8band-EQ', description: '8-band parametric EQ' }, { type: 'builtin:utility', name: 'Utility', description: 'Stereo imaging · gain · bass mono' }, { type: 'builtin:compressor', name: 'Compressor', description: '내장 dynamics DSP' }, { type: 'builtin:multiband-compressor', name: 'Multiband Compressor', description: '3-band dynamics · LR4 crossover' }, { type: 'builtin:distortion', name: 'Distortion', description: '3-band Tube · Tape · Saturation · Exciter' }, { type: 'builtin:disperser', name: 'Disperser', description: '다단 all-pass 위상 분산 DSP' }, { type: 'builtin:delay', name: 'Echo Space', description: '내장 stereo delay' }, { type: 'builtin:reverb', name: 'Room Reverb', description: '내장 FDN reverb' }, { type: 'builtin:waveshaper', name: 'Drive Shaper', description: 'Soft · Hard · Sine / 4× OS' }]
+const EFFECTS: Array<{ type: EffectType; name: string; description: string }> = [{ type: 'builtin:eq', name: '4band-EQ', description: '4-band parametric EQ' }, { type: 'builtin:eq8', name: '8band-EQ', description: '8-band parametric EQ' }, { type: 'builtin:utility', name: 'Utility', description: 'Stereo imaging · gain · bass mono' }, { type: 'builtin:compressor', name: 'Compressor', description: '내장 dynamics DSP' }, { type: 'builtin:upward-compressor', name: 'Upward Compressor', description: 'Low-level detail recovery' }, { type: 'builtin:multiband-compressor', name: 'Multiband Compressor', description: '3-band dynamics · LR4 crossover' }, { type: 'builtin:clipper', name: 'Clipper', description: '4× oversampled peak clipping' }, { type: 'builtin:distortion', name: 'Distortion', description: '3-band Tube · Tape · Saturation · Exciter' }, { type: 'builtin:disperser', name: 'Disperser', description: '다단 all-pass 위상 분산 DSP' }, { type: 'builtin:roboter', name: 'Roboter', description: 'Auto-key pitch correction · harmonizer' }, { type: 'builtin:resonator', name: COLORIZER_NAME, description: 'Harmonic spectral resonator' }, { type: 'builtin:mastering-limiter', name: 'Mastering Limiter', description: 'True Peak · LUFS mastering limiter' }, { type: 'builtin:vocoder', name: 'Vocoder', description: 'Sidechain · oscillator filter-bank vocoder' }, { type: 'builtin:lfo-tremolo', name: 'LFO Tremolo', description: 'Volume · pan LFO modulation' }, { type: 'builtin:delay', name: 'Echo Space', description: '내장 stereo delay' }, { type: 'builtin:reverb', name: 'Room Reverb', description: '내장 FDN reverb' }, { type: 'builtin:waveshaper', name: 'Drive Shaper', description: 'Soft · Hard · Sine / 4× OS' }]
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return <section className="inspector-section"><h3>{title}<ChevronDown size={12} /></h3>{children}</section>
 }
 
 function effectName(type: string): string {
-  return ({ 'builtin:eq': '4band-EQ', 'builtin:eq8': '8band-EQ', 'builtin:utility': 'Utility', 'builtin:compressor': 'Compressor', 'builtin:multiband-compressor': 'Multiband Compressor', 'builtin:distortion': 'Distortion', 'builtin:disperser': 'Disperser', 'builtin:delay': 'Analog Delay', 'builtin:reverb': 'Room Reverb', 'builtin:waveshaper': 'Drive Shaper' } as Record<string, string>)[type] ?? 'External Plug-in'
+  return ({ 'builtin:eq': '4band-EQ', 'builtin:eq8': '8band-EQ', 'builtin:utility': 'Utility', 'builtin:compressor': 'Compressor', 'builtin:upward-compressor': 'Upward Compressor', 'builtin:multiband-compressor': 'Multiband Compressor', 'builtin:clipper': 'Clipper', 'builtin:distortion': 'Distortion', 'builtin:disperser': 'Disperser', 'builtin:roboter': 'Roboter', 'builtin:resonator': COLORIZER_NAME, 'builtin:mastering-limiter': 'Mastering Limiter', 'builtin:vocoder': 'Vocoder', 'builtin:lfo-tremolo': 'LFO Tremolo', 'builtin:delay': 'Analog Delay', 'builtin:reverb': 'Room Reverb', 'builtin:waveshaper': 'Drive Shaper' } as Record<string, string>)[type] ?? 'External Plug-in'
 }

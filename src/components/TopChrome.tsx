@@ -1,19 +1,20 @@
 // Studio One-inspired menu and precision tool chrome.
 import {
-  Crosshair, Download, Ear, Eraser, FolderOpen, Magnet, MousePointer2, Pencil, Plus, Redo2,
-  Save, ScanLine, Scissors, Settings, Undo2, VolumeX, ZoomIn, ZoomOut,
+  Crosshair, Download, Ear, Eraser, FolderOpen, Magnet, MousePointer2, PanelRightOpen, Pencil, Redo2,
+  Plus, Save, ScanLine, Scissors, Settings, Undo2, VolumeX, ZoomIn, ZoomOut,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { GRID_OPTIONS, type StreamStatus } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import {
-  deleteInContext, exportMasterWav, importAudio, openProjectFile, saveProjectFile,
+  deleteInContext, importAudio, openProjectFile, saveProjectFile,
   selectAllInContext, splitSelectionAtPlayhead,
 } from '../store/commands'
 import { useProjectStore } from '../store/projectStore'
 import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { MenuPanel, type MenuItem } from './Menu'
+import { TrackAddDialog } from './TrackAddDialog'
 
 export function MenuBar() {
   const projectName = useProjectStore((state) => state.project.meta.name)
@@ -69,6 +70,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
   const hasClipSelection = store.selectedClipIds.length > 0
   const item = (label: string, run: () => void, extra?: Partial<Extract<MenuItem, { kind: 'item' }>>): MenuItem => ({ kind: 'item', label, run, ...extra })
   const separator: MenuItem = { kind: 'separator' }
+  const recentHistory: MenuItem[] = store.history.slice(-8).reverse().map((entry) => item(`${formatHistoryTime(entry.timestamp)}  ${entry.label}`, () => undefined, { disabled: true }))
 
   return [
     {
@@ -84,7 +86,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
         item('프로젝트 저장', () => void saveProjectFile(), { keys: 'Ctrl+S' }),
         separator,
         item('오디오 가져오기…', () => void importAudio(engine)),
-        item('마스터 WAV 내보내기…', () => void exportMasterWav(engine), { keys: 'Ctrl+Shift+E' }),
+        item('내보내기…', () => store.setExportDialogOpen(true), { keys: 'Ctrl+Shift+E' }),
         separator,
         item('오디오 · MIDI 설정…', () => store.setAudioSettingsOpen(true)),
       ],
@@ -102,6 +104,9 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
         separator,
         item('전체 선택', selectAllInContext, { keys: 'Ctrl+A' }),
         item('삭제', deleteInContext, { keys: 'Delete', danger: true }),
+        separator,
+        { kind: 'label', label: '히스토리' },
+        ...(recentHistory.length ? recentHistory : [item('기록된 편집 없음', () => undefined, { disabled: true })]),
       ],
     },
     {
@@ -156,6 +161,10 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
   ]
 }
 
+function formatHistoryTime(timestamp: number): string {
+  return new Intl.DateTimeFormat('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(timestamp))
+}
+
 const tools: Array<{ id: ToolId; label: string; icon: LucideIcon }> = [
   { id: 'arrow', label: '선택', icon: MousePointer2 },
   { id: 'range', label: '범위', icon: ScanLine },
@@ -167,6 +176,7 @@ const tools: Array<{ id: ToolId; label: string; icon: LucideIcon }> = [
 ]
 
 export function ToolBar() {
+  const [trackAddOpen, setTrackAddOpen] = useState(false)
   const toolState = useToolStore()
   const effective = getEffectiveTool(toolState)
   const snap = useProjectStore((state) => state.snapEnabled)
@@ -177,18 +187,18 @@ export function ToolBar() {
   const zoom = useProjectStore((state) => state.pixelsPerSecond)
   const canUndo = useProjectStore((state) => state.past.length > 0)
   const canRedo = useProjectStore((state) => state.future.length > 0)
+  const browserVisible = useProjectStore((state) => state.browserVisible)
   const store = useProjectStore.getState()
   const engine = useEngine()
-  const [exportProgress, setExportProgress] = useState<number | null>(null)
-
-  useEffect(() => engine.onExportProgress((progress) => setExportProgress(progress?.fraction ?? null)), [engine])
 
   return (
     <div className="tool-bar">
+      <TrackAddDialog open={trackAddOpen} onClose={() => setTrackAddOpen(false)} />
       <div className="toolbar-group file-tools">
+        <button className="icon-button add-track-button" title="트랙 추가" onClick={() => setTrackAddOpen(true)}><Plus size={17} /></button>
         <button className="icon-button" title="프로젝트 열기 (Ctrl+O)" onClick={() => void openProjectFile(engine)}><FolderOpen size={16} /></button>
         <button className="icon-button" title="저장 (Ctrl+S)" onClick={() => void saveProjectFile()}><Save size={16} /></button>
-        <button className={`icon-button ${exportProgress !== null ? 'exporting' : ''}`} title={exportProgress !== null ? `내보내기 취소 (${Math.round(exportProgress * 100)}%)` : '마스터 WAV 내보내기 (Ctrl+Shift+E)'} onClick={() => exportProgress !== null ? engine.cancelExport() : void exportMasterWav(engine)}><Download size={16} />{exportProgress !== null && <i className="export-progress" style={{ '--export-progress': `${Math.round(exportProgress * 100)}%` } as React.CSSProperties} />}</button>
+        <button className="icon-button" title="내보내기 (Ctrl+Shift+E)" onClick={() => store.setExportDialogOpen(true)}><Download size={16} /></button>
         <button className="icon-button" title="실행취소 (Ctrl+Z)" disabled={!canUndo} onClick={store.undo}><Undo2 size={16} /></button>
         <button className="icon-button" title="다시 실행 (Ctrl+Shift+Z)" disabled={!canRedo} onClick={store.redo}><Redo2 size={16} /></button>
       </div>
@@ -216,7 +226,7 @@ export function ToolBar() {
         <input aria-label="Timeline zoom" type="range" min="4" max="400" value={zoom} onChange={(event) => store.setZoom(Number(event.target.value))} />
         <button className="icon-button" title="확대 (+)" onClick={() => store.setZoom(zoom * 1.25)}><ZoomIn size={15} /></button>
       </div>
-      <button className="import-button" onClick={() => void importAudio(engine)}><Plus size={15} />오디오 가져오기</button>
+      <button className={`import-button ${browserVisible ? 'active' : ''}`} onClick={() => store.toggleBrowser()}><PanelRightOpen size={15} />미디어 브라우저</button>
     </div>
   )
 }

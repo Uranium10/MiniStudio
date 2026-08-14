@@ -73,6 +73,31 @@ pub struct MultibandLevels {
     pub high: StereoLevel,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LimiterMetrics {
+    pub input_peak_db: f32,
+    pub output_peak_db: f32,
+    pub gain_reduction_db: f32,
+    pub true_peak_db: f32,
+    pub momentary_lufs: f32,
+    pub short_term_lufs: f32,
+    pub integrated_lufs: f32,
+}
+impl Default for LimiterMetrics {
+    fn default() -> Self {
+        Self {
+            input_peak_db: -120.0,
+            output_peak_db: -120.0,
+            gain_reduction_db: 0.0,
+            true_peak_db: -120.0,
+            momentary_lufs: -120.0,
+            short_term_lufs: -120.0,
+            integrated_lufs: -120.0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamStatus {
@@ -95,6 +120,7 @@ pub struct EngineSnapshot {
     pub active_voice_counts: Vec<u32>,
     pub multiband_levels: Vec<MultibandLevels>,
     pub distortion_spectra: Vec<Vec<f32>>,
+    pub limiter_metrics: Vec<LimiterMetrics>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -160,9 +186,26 @@ pub struct MidiClipSpec {
     pub loop_start_ticks: u64,
     pub loop_length_ticks: u64,
     pub notes: Vec<MidiNoteSpec>,
+    #[serde(default)]
+    pub cc_lanes: Vec<MidiCcLaneSpec>,
     pub transpose_semitones: i16,
     pub velocity_scale: f32,
     pub muted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MidiCcLaneSpec {
+    /// MIDI CC 0..127, or -1 for the bipolar pitch-bend wheel.
+    pub cc: i16,
+    pub points: Vec<MidiCcPointSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MidiCcPointSpec {
+    pub ticks: u64,
+    pub value: i16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -202,6 +245,33 @@ pub struct ClipSpec {
     pub fade_out_sec: f64,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default = "default_playback_rate")]
+    pub playback_rate: f64,
+    #[serde(default)]
+    pub pitch_semitones: f64,
+    #[serde(default)]
+    pub fine_cents: f64,
+    #[serde(default)]
+    pub reversed: bool,
+    #[serde(default)]
+    pub fade_in_curve: f32,
+    #[serde(default)]
+    pub fade_out_curve: f32,
+    #[serde(default)]
+    pub gain_points: Vec<ClipGainPointSpec>,
+}
+
+fn default_playback_rate() -> f64 {
+    1.0
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipGainPointSpec {
+    pub time_sec: f64,
+    pub value_db: f32,
+    #[serde(default)]
+    pub curve: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -296,7 +366,9 @@ pub struct DecodeProgress {
 #[serde(rename_all = "camelCase")]
 pub struct ExportRequest {
     pub output_path: String,
+    pub format: String,
     pub bit_depth: u16,
+    pub mp3_bitrate_kbps: u16,
     pub sample_rate: u32,
     pub normalize: bool,
 }

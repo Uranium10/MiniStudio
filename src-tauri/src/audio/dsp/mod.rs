@@ -1,9 +1,15 @@
 // Allocation-free native DSP effects shared by realtime and offline renderers.
-use super::types::{db_to_gain, EffectSpec, EqFrequencyResponse};
+use super::{
+    instrument::{NoteEvent, NoteEventKind},
+    types::{db_to_gain, EffectSpec, EqFrequencyResponse},
+};
 use super::{MAX_BLOCK_SIZE, MAX_CHANNELS};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 pub const DISTORTION_SPECTRUM_BINS: usize = 48;
+pub const LIMITER_METER_VALUES: usize = 7;
 
 pub struct AudioBuffer {
     pub channels: [Vec<f32>; MAX_CHANNELS],
@@ -52,15 +58,19 @@ impl Smoother {
 
 pub trait DspEffect: Send {
     fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize);
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize);
+    /// `events` are sorted by ascending `sample_offset`; offsets are exact
+    /// positions inside this block. Effects that do not consume MIDI receive
+    /// an empty slice so the realtime path never copies irrelevant events.
+    fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize);
     fn process_with_sidechain(
         &mut self,
+        events: &[NoteEvent],
         buffer: &mut AudioBuffer,
         sidechain: Option<&AudioBuffer>,
         frames: usize,
     ) {
         let _ = sidechain;
-        self.process(buffer, frames)
+        self.process(events, buffer, frames)
     }
     fn set_param(&mut self, id: &str, value: f32);
     fn set_bypassed(&mut self, bypassed: bool);
@@ -71,6 +81,9 @@ pub trait DspEffect: Send {
     fn latency_samples(&self) -> usize {
         0
     }
+    fn wants_midi(&self) -> bool {
+        false
+    }
     fn response(&self, _points: usize) -> Option<EqFrequencyResponse> {
         None
     }
@@ -78,6 +91,9 @@ pub trait DspEffect: Send {
         None
     }
     fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        None
+    }
+    fn limiter_metrics(&self) -> Option<[f32; LIMITER_METER_VALUES]> {
         None
     }
 }
@@ -98,6 +114,7 @@ enum FilterKind {
     HighShelf,
     HighPass,
     LowPass,
+    BandPass,
     Notch,
 }
 
@@ -147,6 +164,7 @@ impl Biquad {
                 -2.0 * cos,
                 1.0 - alpha,
             ),
+            FilterKind::BandPass => (alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
             FilterKind::Notch => (1.0, -2.0 * cos, 1.0, 1.0 + alpha, -2.0 * cos, 1.0 - alpha),
             FilterKind::LowShelf => {
                 let s = 2.0 * a.sqrt() * alpha;
@@ -296,7 +314,7 @@ impl DspEffect for ParametricEq {
             b.update_scaled(sr, self.scale, self.adaptive_q)
         }
     }
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
+    fn process(&mut self, _events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
         if self.bypassed {
             for frame in 0..n {
                 self.analyzer
@@ -462,11 +480,12 @@ impl DspEffect for Compressor {
     fn prepare(&mut self, s: f32, _: usize, _: usize) {
         self.sr = s
     }
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
-        self.process_with_sidechain(b, None, n)
+    fn process(&mut self, events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
+        self.process_with_sidechain(events, b, None, n)
     }
     fn process_with_sidechain(
         &mut self,
+        _events: &[NoteEvent],
         b: &mut AudioBuffer,
         sidechain: Option<&AudioBuffer>,
         n: usize,
@@ -674,7 +693,7 @@ impl DspEffect for MultibandCompressor {
             compressor.prepare(sample_rate, max_block, channels)
         }
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
         if self.bypassed {
             self.levels = [[0.0; MAX_CHANNELS]; 3];
             return;
@@ -692,7 +711,7 @@ impl DspEffect for MultibandCompressor {
             }
         }
         for (compressor, band) in self.compressors.iter_mut().zip(self.bands.iter_mut()) {
-            compressor.process(band, frames)
+            compressor.process(&[], band, frames)
         }
         let mut peaks = [[0.0_f32; MAX_CHANNELS]; 3];
         for frame in 0..frames {
@@ -817,7 +836,7 @@ impl DspEffect for Utility {
         self.bass_split
             .configure(self.bass_frequency, self.sample_rate)
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
         if self.bypassed {
             return;
         }
@@ -937,7 +956,7 @@ impl DspEffect for Delay {
         let len = (s * 2.1) as usize;
         self.lines = [vec![0.0; len], vec![0.0; len]]
     }
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
+    fn process(&mut self, _events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
         if self.bypassed || self.lines[0].is_empty() {
             return;
         }
@@ -1087,7 +1106,7 @@ impl DspEffect for Reverb {
         self.update_lfo_rates();
         self.update_lengths()
     }
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
+    fn process(&mut self, _events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
         if self.bypassed || self.lines.len() != 8 {
             return;
         }
@@ -1246,7 +1265,7 @@ impl Waveshaper {
 }
 impl DspEffect for Waveshaper {
     fn prepare(&mut self, _: f32, _: usize, _: usize) {}
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
+    fn process(&mut self, _events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
         if self.bypassed {
             return;
         }
@@ -1577,7 +1596,7 @@ impl DspEffect for Distortion {
         self.update_crossovers();
         self.analyzer.prepare(sample_rate);
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
         if self.bypassed {
             for frame in 0..frames {
                 self.analyzer
@@ -1798,7 +1817,7 @@ impl DspEffect for Disperser {
         self.frequency = self.target_frequency.clamp(20.0, sample_rate * 0.45);
         self.configure();
     }
-    fn process(&mut self, buffer: &mut AudioBuffer, frames: usize) {
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
         if self.bypassed || self.stages == 0 {
             for frame in 0..frames {
                 self.analyzer
@@ -1864,6 +1883,2078 @@ impl DspEffect for Disperser {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LimiterMode {
+    Clean,
+    Transparent,
+    Punch,
+    Loud,
+}
+
+/// ITU-R BS.1770 K-weighted loudness meter. The 400 ms and 3 s windows are
+/// maintained as rolling sums; integrated loudness uses overlapping 400 ms
+/// blocks and the absolute/relative gates from the recommendation.
+struct LoudnessMeter {
+    shelf: Biquad,
+    high_pass: Biquad,
+    powers: Vec<f32>,
+    position: usize,
+    count: usize,
+    momentary_samples: usize,
+    short_samples: usize,
+    momentary_sum: f64,
+    short_sum: f64,
+    hop_samples: usize,
+    hop_count: usize,
+    blocks: Vec<f32>,
+    block_count: usize,
+    momentary_lufs: f32,
+    short_lufs: f32,
+    integrated_lufs: f32,
+}
+impl LoudnessMeter {
+    fn new() -> Self {
+        Self {
+            shelf: Biquad::new(),
+            high_pass: Biquad::new(),
+            powers: Vec::new(),
+            position: 0,
+            count: 0,
+            momentary_samples: 19_200,
+            short_samples: 144_000,
+            momentary_sum: 0.0,
+            short_sum: 0.0,
+            hop_samples: 4_800,
+            hop_count: 0,
+            // One hour of 100 ms blocks, allocated off the audio callback.
+            blocks: vec![0.0; 36_000],
+            block_count: 0,
+            momentary_lufs: -120.0,
+            short_lufs: -120.0,
+            integrated_lufs: -120.0,
+        }
+    }
+    fn prepare(&mut self, sample_rate: f32) {
+        self.momentary_samples = (sample_rate * 0.4).round().max(1.0) as usize;
+        self.short_samples = (sample_rate * 3.0).round().max(1.0) as usize;
+        self.hop_samples = (sample_rate * 0.1).round().max(1.0) as usize;
+        self.powers.resize(self.short_samples, 0.0);
+        self.shelf.configure(
+            FilterKind::HighShelf,
+            1_681.9745,
+            3.999_843_8,
+            0.707_175_25,
+            sample_rate,
+        );
+        self.high_pass
+            .configure(FilterKind::HighPass, 38.13547, 0.0, 0.500_327, sample_rate);
+        self.reset();
+    }
+    #[inline(always)]
+    fn push(&mut self, left: f32, right: f32) {
+        let wl = self.high_pass.process(0, self.shelf.process(0, left));
+        let wr = self.high_pass.process(1, self.shelf.process(1, right));
+        let power = wl * wl + wr * wr;
+        let old_short = self.powers[self.position];
+        self.short_sum += f64::from(power - old_short);
+        if self.count >= self.momentary_samples {
+            let old_momentary = self.powers[(self.position + self.short_samples
+                - self.momentary_samples)
+                % self.short_samples];
+            self.momentary_sum += f64::from(power - old_momentary);
+        } else {
+            self.momentary_sum += f64::from(power);
+        }
+        self.powers[self.position] = power;
+        self.position = (self.position + 1) % self.short_samples;
+        self.count = (self.count + 1).min(self.short_samples);
+        self.hop_count += 1;
+        if self.hop_count >= self.hop_samples {
+            self.hop_count = 0;
+            let momentary_count = self.count.min(self.momentary_samples).max(1);
+            self.momentary_lufs = power_to_lufs(self.momentary_sum / momentary_count as f64);
+            self.short_lufs = power_to_lufs(self.short_sum / self.count.max(1) as f64);
+            if self.count >= self.momentary_samples {
+                let energy = (self.momentary_sum / self.momentary_samples as f64) as f32;
+                let index = self.block_count % self.blocks.len();
+                self.blocks[index] = energy;
+                self.block_count += 1;
+                // Re-evaluate the relative gate once per second, not per sample.
+                if self.block_count % 10 == 0 {
+                    self.integrated_lufs =
+                        integrated_lufs(&self.blocks, self.block_count.min(self.blocks.len()));
+                }
+            }
+        }
+    }
+    fn reset(&mut self) {
+        self.shelf.reset();
+        self.high_pass.reset();
+        self.powers.fill(0.0);
+        self.position = 0;
+        self.count = 0;
+        self.momentary_sum = 0.0;
+        self.short_sum = 0.0;
+        self.hop_count = 0;
+        self.blocks.fill(0.0);
+        self.block_count = 0;
+        self.momentary_lufs = -120.0;
+        self.short_lufs = -120.0;
+        self.integrated_lufs = -120.0;
+    }
+}
+
+pub struct MasteringLimiter {
+    sample_rate: f32,
+    input: Smoother,
+    output: Smoother,
+    release_ms: f32,
+    stereo_link: f32,
+    true_peak: bool,
+    mode: LimiterMode,
+    delay: [Vec<f32>; MAX_CHANNELS],
+    delay_position: usize,
+    lookahead: usize,
+    detector_history: [[f32; 4]; MAX_CHANNELS],
+    output_history: [[f32; 4]; MAX_CHANNELS],
+    envelope: [f32; MAX_CHANNELS],
+    hold: [usize; MAX_CHANNELS],
+    input_peak: f32,
+    output_peak: f32,
+    true_peak_level: f32,
+    gain_reduction_db: f32,
+    loudness: LoudnessMeter,
+    bypassed: bool,
+}
+impl MasteringLimiter {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            input: Smoother::new(1.0, 48_000.0, 0.01),
+            output: Smoother::new(db_to_gain(-1.0), 48_000.0, 0.01),
+            release_ms: 120.0,
+            stereo_link: 1.0,
+            true_peak: true,
+            mode: LimiterMode::Clean,
+            delay: [Vec::new(), Vec::new()],
+            delay_position: 0,
+            lookahead: 240,
+            detector_history: [[0.0; 4]; MAX_CHANNELS],
+            output_history: [[0.0; 4]; MAX_CHANNELS],
+            envelope: [1.0; MAX_CHANNELS],
+            hold: [0; MAX_CHANNELS],
+            input_peak: 0.0,
+            output_peak: 0.0,
+            true_peak_level: 0.0,
+            gain_reduction_db: 0.0,
+            loudness: LoudnessMeter::new(),
+            bypassed: false,
+        }
+    }
+    fn release_coefficient(&self) -> f32 {
+        let scale = match self.mode {
+            LimiterMode::Transparent => 1.5,
+            LimiterMode::Punch => 0.55,
+            LimiterMode::Loud => 0.7,
+            LimiterMode::Clean => 1.0,
+        };
+        (-1.0 / (self.release_ms.max(5.0) * scale * 0.001 * self.sample_rate)).exp()
+    }
+}
+impl DspEffect for MasteringLimiter {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.lookahead = (sample_rate * 0.005).round().max(1.0) as usize;
+        self.delay = [vec![0.0; self.lookahead + 1], vec![0.0; self.lookahead + 1]];
+        self.input = Smoother::new(self.input.target, sample_rate, 0.01);
+        self.output = Smoother::new(self.output.target, sample_rate, 0.01);
+        self.loudness.prepare(sample_rate);
+        self.reset();
+    }
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        let release = self.release_coefficient();
+        let meter_decay = 10.0_f32.powf(-18.0 / 20.0 / self.sample_rate);
+        for frame in 0..frames {
+            let input_gain = if self.bypassed {
+                1.0
+            } else {
+                self.input.next()
+            };
+            let ceiling = if self.bypassed {
+                1.0
+            } else {
+                self.output.next().clamp(0.000_1, 1.0)
+            };
+            // A small reconstruction guard keeps the interpolated waveform below
+            // the requested dBTP ceiling instead of merely clipping sample peaks.
+            let detector_ceiling = if self.true_peak {
+                ceiling * 0.9975
+            } else {
+                ceiling
+            };
+            let mut input = [0.0; MAX_CHANNELS];
+            let mut independent = [1.0; MAX_CHANNELS];
+            for channel in 0..MAX_CHANNELS {
+                input[channel] = buffer.channels[channel][frame] * input_gain;
+                self.input_peak = self
+                    .input_peak
+                    .mul_add(meter_decay, 0.0)
+                    .max(input[channel].abs());
+                let history = &mut self.detector_history[channel];
+                history.rotate_left(1);
+                history[3] = input[channel];
+                let peak = if self.true_peak {
+                    interpolated_peak(*history, 4)
+                } else {
+                    input[channel].abs()
+                };
+                independent[channel] = (detector_ceiling / peak.max(detector_ceiling)).min(1.0);
+            }
+            let linked = independent[0].min(independent[1]);
+            for channel in 0..MAX_CHANNELS {
+                let target = if self.bypassed {
+                    1.0
+                } else {
+                    independent[channel] + (linked - independent[channel]) * self.stereo_link
+                };
+                if target < self.envelope[channel] {
+                    self.envelope[channel] = target;
+                    self.hold[channel] = self.lookahead;
+                } else if self.hold[channel] > 0 {
+                    self.hold[channel] -= 1;
+                } else {
+                    self.envelope[channel] = target + (self.envelope[channel] - target) * release;
+                }
+                self.delay[channel][self.delay_position] = input[channel];
+                let read = (self.delay_position + 1) % self.delay[channel].len();
+                let mut sample = self.delay[channel][read] * self.envelope[channel];
+                if !self.bypassed && matches!(self.mode, LimiterMode::Loud) {
+                    let drive = 1.35;
+                    sample = (sample * drive).tanh() / drive.tanh();
+                }
+                // The final guard is intentionally non-colouring in normal operation;
+                // it only catches numerical/sample peaks missed by interpolation.
+                if !self.bypassed {
+                    sample = sample.clamp(-ceiling, ceiling)
+                }
+                buffer.channels[channel][frame] = sample;
+                self.output_peak = self.output_peak.mul_add(meter_decay, 0.0).max(sample.abs());
+                let history = &mut self.output_history[channel];
+                history.rotate_left(1);
+                history[3] = sample;
+                self.true_peak_level = self
+                    .true_peak_level
+                    .mul_add(meter_decay, 0.0)
+                    .max(interpolated_peak(*history, 4));
+            }
+            self.delay_position = (self.delay_position + 1) % self.delay[0].len();
+            let minimum_gain = self.envelope[0].min(self.envelope[1]);
+            self.gain_reduction_db =
+                (-20.0 * minimum_gain.max(1e-9).log10()).max(self.gain_reduction_db * meter_decay);
+            self.loudness
+                .push(buffer.channels[0][frame], buffer.channels[1][frame]);
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "inputDb" | "inputGainDb" => {
+                self.input.set_target(db_to_gain(value.clamp(-24.0, 24.0)))
+            }
+            "outputDb" | "outputGainDb" | "ceilingDb" => {
+                self.output.set_target(db_to_gain(value.clamp(-24.0, 0.0)))
+            }
+            "releaseMs" => self.release_ms = value.clamp(5.0, 2_000.0),
+            "release" => self.release_ms = (value * 1_000.0).clamp(5.0, 2_000.0),
+            "stereoLink" => self.stereo_link = value.clamp(0.0, 1.0),
+            "truePeak" => self.true_peak = value >= 0.5,
+            "algorithm" | "mode" => {
+                self.mode = match value.round() as i32 {
+                    1 => LimiterMode::Transparent,
+                    2 => LimiterMode::Punch,
+                    3 => LimiterMode::Loud,
+                    _ => LimiterMode::Clean,
+                }
+            }
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        for channel in &mut self.delay {
+            channel.fill(0.0)
+        }
+        self.delay_position = 0;
+        self.detector_history = [[0.0; 4]; MAX_CHANNELS];
+        self.output_history = [[0.0; 4]; MAX_CHANNELS];
+        self.envelope = [1.0; MAX_CHANNELS];
+        self.hold = [0; MAX_CHANNELS];
+        self.input_peak = 0.0;
+        self.output_peak = 0.0;
+        self.true_peak_level = 0.0;
+        self.gain_reduction_db = 0.0;
+        self.loudness.reset();
+    }
+    fn latency_samples(&self) -> usize {
+        self.lookahead
+    }
+    fn limiter_metrics(&self) -> Option<[f32; LIMITER_METER_VALUES]> {
+        Some([
+            amplitude_to_db(self.input_peak),
+            amplitude_to_db(self.output_peak),
+            self.gain_reduction_db,
+            amplitude_to_db(self.true_peak_level),
+            self.loudness.momentary_lufs,
+            self.loudness.short_lufs,
+            self.loudness.integrated_lufs,
+        ])
+    }
+}
+
+struct VocoderBand {
+    analysis: Biquad,
+    carrier: Biquad,
+    envelope: f32,
+}
+impl VocoderBand {
+    fn new() -> Self {
+        Self {
+            analysis: Biquad::new(),
+            carrier: Biquad::new(),
+            envelope: 0.0,
+        }
+    }
+}
+
+/// Constant-Q channel vocoder. Sidechain mode analyses the external modulator
+/// and filters the main input; oscillator/noise modes analyse the main input
+/// and use the selected internal excitation source.
+pub struct Vocoder {
+    sample_rate: f32,
+    source: u8,
+    band_count: usize,
+    pitch_hz: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    formant_shift: f32,
+    bandwidth: f32,
+    mix: Smoother,
+    output: Smoother,
+    phase: f32,
+    noise: u32,
+    bands: Vec<VocoderBand>,
+    bypassed: bool,
+}
+impl Vocoder {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            source: 3,
+            band_count: 16,
+            pitch_hz: 110.0,
+            attack_ms: 5.0,
+            release_ms: 90.0,
+            formant_shift: 0.0,
+            bandwidth: 1.0,
+            mix: Smoother::new(1.0, 48_000.0, 0.01),
+            output: Smoother::new(1.0, 48_000.0, 0.01),
+            phase: 0.0,
+            noise: 0x9e37_79b9,
+            bands: (0..24).map(|_| VocoderBand::new()).collect(),
+            bypassed: false,
+        }
+    }
+    fn configure_bands(&mut self) {
+        let ratio = 2.0_f32.powf(self.formant_shift / 12.0);
+        let q = (self.band_count as f32 / 4.0 * self.bandwidth.recip()).clamp(1.0, 12.0);
+        for (index, band) in self.bands.iter_mut().enumerate() {
+            let t = index as f32 / (self.band_count.saturating_sub(1)).max(1) as f32;
+            let carrier_frequency = 80.0 * (12_000.0_f32 / 80.0).powf(t);
+            let analysis_frequency =
+                (carrier_frequency / ratio).clamp(40.0, self.sample_rate * 0.45);
+            band.analysis.configure(
+                FilterKind::BandPass,
+                analysis_frequency,
+                0.0,
+                q,
+                self.sample_rate,
+            );
+            band.carrier.configure(
+                FilterKind::BandPass,
+                carrier_frequency,
+                0.0,
+                q,
+                self.sample_rate,
+            );
+        }
+    }
+    #[inline(always)]
+    fn oscillator(&mut self) -> f32 {
+        self.phase += self.pitch_hz / self.sample_rate;
+        if self.phase >= 1.0 {
+            self.phase -= 1.0
+        }
+        match self.source {
+            1 => (2.0 * PI * self.phase).sin(),
+            2 => {
+                if self.phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            3 => self.phase * 2.0 - 1.0,
+            4 => {
+                self.noise ^= self.noise << 13;
+                self.noise ^= self.noise >> 17;
+                self.noise ^= self.noise << 5;
+                self.noise as f32 / u32::MAX as f32 * 2.0 - 1.0
+            }
+            _ => 0.0,
+        }
+    }
+}
+impl DspEffect for Vocoder {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.mix = Smoother::new(self.mix.target, sample_rate, 0.01);
+        self.output = Smoother::new(self.output.target, sample_rate, 0.01);
+        self.configure_bands();
+        self.reset();
+    }
+    fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        self.process_with_sidechain(events, buffer, None, frames)
+    }
+    fn process_with_sidechain(
+        &mut self,
+        _events: &[NoteEvent],
+        buffer: &mut AudioBuffer,
+        sidechain: Option<&AudioBuffer>,
+        frames: usize,
+    ) {
+        if self.bypassed {
+            return;
+        }
+        let attack = (-1.0 / (self.attack_ms.max(0.1) * 0.001 * self.sample_rate)).exp();
+        let release = (-1.0 / (self.release_ms.max(1.0) * 0.001 * self.sample_rate)).exp();
+        let normalization = 3.5 / (self.band_count as f32).sqrt();
+        for frame in 0..frames {
+            let dry = [buffer.channels[0][frame], buffer.channels[1][frame]];
+            let internal = self.oscillator();
+            let (modulator, carrier) = if self.source == 0 {
+                if let Some(external) = sidechain {
+                    (
+                        (external.channels[0][frame] + external.channels[1][frame]) * 0.5,
+                        dry,
+                    )
+                } else {
+                    ((dry[0] + dry[1]) * 0.5, [internal; MAX_CHANNELS])
+                }
+            } else {
+                ((dry[0] + dry[1]) * 0.5, [internal; MAX_CHANNELS])
+            };
+            let mut wet = [0.0; MAX_CHANNELS];
+            for band in self.bands.iter_mut().take(self.band_count) {
+                let detected = band.analysis.process(0, modulator).abs();
+                let coefficient = if detected > band.envelope {
+                    attack
+                } else {
+                    release
+                };
+                band.envelope = detected + (band.envelope - detected) * coefficient;
+                for channel in 0..MAX_CHANNELS {
+                    wet[channel] += band.carrier.process(channel, carrier[channel]) * band.envelope;
+                }
+            }
+            let mix = self.mix.next().clamp(0.0, 1.0);
+            let output = self.output.next();
+            for channel in 0..MAX_CHANNELS {
+                buffer.channels[channel][frame] = denormal(
+                    (dry[channel] * (1.0 - mix) + wet[channel] * normalization * mix) * output,
+                )
+            }
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "source" | "modulator" => self.source = value.round().clamp(0.0, 4.0) as u8,
+            "bands" => {
+                self.band_count = match value.round() as usize {
+                    0..=10 => 8,
+                    11..=14 => 12,
+                    15..=20 => 16,
+                    _ => 24,
+                };
+                self.configure_bands()
+            }
+            "pitchHz" | "frequency" => self.pitch_hz = value.clamp(20.0, 2_000.0),
+            "attackMs" => self.attack_ms = value.clamp(0.1, 200.0),
+            "releaseMs" => self.release_ms = value.clamp(5.0, 2_000.0),
+            "formantShift" => {
+                self.formant_shift = value.clamp(-24.0, 24.0);
+                self.configure_bands()
+            }
+            "bandwidth" => {
+                self.bandwidth = value.clamp(0.5, 2.0);
+                self.configure_bands()
+            }
+            "mix" => self.mix.set_target(value.clamp(0.0, 1.0)),
+            "outputDb" => self.output.set_target(db_to_gain(value.clamp(-24.0, 24.0))),
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        for band in &mut self.bands {
+            band.analysis.reset();
+            band.carrier.reset();
+            band.envelope = 0.0
+        }
+        self.phase = 0.0;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LfoWave {
+    Sine,
+    Triangle,
+    Square,
+    Saw,
+}
+pub struct LfoTremolo {
+    sample_rate: f32,
+    rate_hz: f32,
+    volume_depth: Smoother,
+    pan_depth: Smoother,
+    phase_offset: f32,
+    waveform: LfoWave,
+    phase: f32,
+    bypassed: bool,
+}
+impl LfoTremolo {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            rate_hz: 4.0,
+            volume_depth: Smoother::new(0.5, 48_000.0, 0.01),
+            pan_depth: Smoother::new(0.0, 48_000.0, 0.01),
+            phase_offset: 0.25,
+            waveform: LfoWave::Sine,
+            phase: 0.0,
+            bypassed: false,
+        }
+    }
+    #[inline(always)]
+    fn wave(&self, phase: f32) -> f32 {
+        let p = phase - phase.floor();
+        match self.waveform {
+            LfoWave::Sine => (2.0 * PI * p).sin(),
+            LfoWave::Triangle => 1.0 - 4.0 * (p - 0.5).abs(),
+            LfoWave::Square => {
+                if p < 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            LfoWave::Saw => p * 2.0 - 1.0,
+        }
+    }
+}
+impl DspEffect for LfoTremolo {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.volume_depth = Smoother::new(self.volume_depth.target, sample_rate, 0.01);
+        self.pan_depth = Smoother::new(self.pan_depth.target, sample_rate, 0.01);
+    }
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        if self.bypassed {
+            return;
+        }
+        for frame in 0..frames {
+            let left_lfo = self.wave(self.phase);
+            let right_lfo = self.wave(self.phase + self.phase_offset);
+            let volume_depth = self.volume_depth.next().clamp(0.0, 1.0);
+            let volume = 1.0 - volume_depth * (0.5 + 0.25 * (left_lfo + right_lfo));
+            let pan = ((left_lfo + right_lfo) * 0.5 * self.pan_depth.next()).clamp(-1.0, 1.0);
+            let left_gain = ((pan + 1.0) * PI * 0.25).cos() * std::f32::consts::SQRT_2;
+            let right_gain = ((pan + 1.0) * PI * 0.25).sin() * std::f32::consts::SQRT_2;
+            buffer.channels[0][frame] *= volume * left_gain;
+            buffer.channels[1][frame] *= volume * right_gain;
+            self.phase += self.rate_hz / self.sample_rate;
+            if self.phase >= 1.0 {
+                self.phase -= 1.0
+            }
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "rateHz" | "rate" => self.rate_hz = value.clamp(0.01, 30.0),
+            "volumeDepth" | "depth" => self.volume_depth.set_target(value.clamp(0.0, 1.0)),
+            "panDepth" => self.pan_depth.set_target(value.clamp(0.0, 1.0)),
+            "stereoPhase" | "phase" => self.phase_offset = value.clamp(0.0, 1.0),
+            "waveform" => {
+                self.waveform = match value.round() as i32 {
+                    1 => LfoWave::Triangle,
+                    2 => LfoWave::Square,
+                    3 => LfoWave::Saw,
+                    _ => LfoWave::Sine,
+                }
+            }
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        self.phase = 0.0
+    }
+}
+
+pub struct Clipper {
+    sample_rate: f32,
+    input: Smoother,
+    output: Smoother,
+    knee: f32,
+    previous: [f32; MAX_CHANNELS],
+    fir: [[f32; 15]; MAX_CHANNELS],
+    fir_position: [usize; MAX_CHANNELS],
+    flow: [f32; DISTORTION_SPECTRUM_BINS],
+    flow_peak: f32,
+    flow_count: usize,
+    flow_interval: usize,
+    bypassed: bool,
+}
+impl Clipper {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            input: Smoother::new(db_to_gain(6.0), 48_000.0, 0.01),
+            output: Smoother::new(db_to_gain(-1.0), 48_000.0, 0.01),
+            knee: 0.25,
+            previous: [0.0; MAX_CHANNELS],
+            fir: [[0.0; 15]; MAX_CHANNELS],
+            fir_position: [0; MAX_CHANNELS],
+            flow: [0.0; DISTORTION_SPECTRUM_BINS],
+            flow_peak: 0.0,
+            flow_count: 0,
+            flow_interval: 800,
+            bypassed: false,
+        }
+    }
+}
+impl DspEffect for Clipper {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.flow_interval = (sample_rate / 60.0).round().max(1.0) as usize;
+        self.input = Smoother::new(self.input.target, sample_rate, 0.01);
+        self.output = Smoother::new(self.output.target, sample_rate, 0.01);
+        self.reset();
+    }
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        if self.bypassed {
+            return;
+        }
+        for frame in 0..frames {
+            let input_gain = self.input.next();
+            let output_gain = self.output.next();
+            let mut frame_peak = 0.0_f32;
+            for channel in 0..MAX_CHANNELS {
+                let dry = buffer.channels[channel][frame] * input_gain;
+                frame_peak = frame_peak.max(dry.abs());
+                let mut wet = 0.0;
+                for phase in 0..4 {
+                    let fraction = (phase + 1) as f32 * 0.25;
+                    let up = self.previous[channel] + (dry - self.previous[channel]) * fraction;
+                    let clipped = clipper_curve(up, self.knee);
+                    let position = self.fir_position[channel];
+                    self.fir[channel][position] = clipped;
+                    wet = fir_read(&self.fir[channel], position);
+                    self.fir_position[channel] = increment_wrap(position, 15);
+                }
+                self.previous[channel] = dry;
+                buffer.channels[channel][frame] = denormal(wet * output_gain);
+            }
+            self.flow_peak = self.flow_peak.max(frame_peak);
+            self.flow_count += 1;
+            if self.flow_count >= self.flow_interval {
+                self.flow.copy_within(1.., 0);
+                self.flow[DISTORTION_SPECTRUM_BINS - 1] = self.flow_peak.min(2.5);
+                self.flow_peak = 0.0;
+                self.flow_count = 0;
+            }
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "inputDb" | "inputGainDb" => {
+                self.input.set_target(db_to_gain(value.clamp(-24.0, 36.0)))
+            }
+            "outputDb" | "outputGainDb" => {
+                self.output.set_target(db_to_gain(value.clamp(-24.0, 0.0)))
+            }
+            "knee" => self.knee = value.clamp(0.0, 1.0),
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        self.previous = [0.0; MAX_CHANNELS];
+        self.fir = [[0.0; 15]; MAX_CHANNELS];
+        self.fir_position = [0; MAX_CHANNELS];
+        self.flow = [0.0; DISTORTION_SPECTRUM_BINS];
+        self.flow_peak = 0.0;
+        self.flow_count = 0;
+    }
+    fn latency_samples(&self) -> usize {
+        2
+    }
+    fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        Some(self.flow)
+    }
+}
+
+pub struct UpwardCompressor {
+    sample_rate: f32,
+    threshold_db: f32,
+    ratio: f32,
+    attack_ms: f32,
+    release_ms: f32,
+    range_db: f32,
+    stereo_link: f32,
+    mix: Smoother,
+    output: Smoother,
+    detector: [f32; MAX_CHANNELS],
+    gain: [f32; MAX_CHANNELS],
+    bypassed: bool,
+}
+impl UpwardCompressor {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            threshold_db: -32.0,
+            ratio: 3.0,
+            attack_ms: 35.0,
+            release_ms: 240.0,
+            range_db: 12.0,
+            stereo_link: 1.0,
+            mix: Smoother::new(1.0, 48_000.0, 0.01),
+            output: Smoother::new(1.0, 48_000.0, 0.01),
+            detector: [0.0; MAX_CHANNELS],
+            gain: [1.0; MAX_CHANNELS],
+            bypassed: false,
+        }
+    }
+    fn requested_gain(&self, level: f32) -> f32 {
+        let level_db = amplitude_to_db(level);
+        if level_db >= self.threshold_db {
+            return 1.0;
+        }
+        let gain_db =
+            ((self.threshold_db - level_db) * (1.0 - self.ratio.recip())).clamp(0.0, self.range_db);
+        db_to_gain(gain_db)
+    }
+}
+impl DspEffect for UpwardCompressor {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.mix = Smoother::new(self.mix.target, sample_rate, 0.01);
+        self.output = Smoother::new(self.output.target, sample_rate, 0.01);
+    }
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        if self.bypassed {
+            return;
+        }
+        let detector_coefficient = (-1.0 / (0.01 * self.sample_rate)).exp();
+        let attack = (-1.0 / (self.attack_ms.max(0.1) * 0.001 * self.sample_rate)).exp();
+        let release = (-1.0 / (self.release_ms.max(1.0) * 0.001 * self.sample_rate)).exp();
+        for frame in 0..frames {
+            let dry = [buffer.channels[0][frame], buffer.channels[1][frame]];
+            let mut target = [1.0; MAX_CHANNELS];
+            for channel in 0..MAX_CHANNELS {
+                self.detector[channel] = dry[channel] * dry[channel]
+                    + (self.detector[channel] - dry[channel] * dry[channel]) * detector_coefficient;
+                target[channel] = self.requested_gain(self.detector[channel].sqrt());
+            }
+            let linked = target[0].min(target[1]);
+            let mix = self.mix.next().clamp(0.0, 1.0);
+            let output = self.output.next();
+            for channel in 0..MAX_CHANNELS {
+                let requested = target[channel] + (linked - target[channel]) * self.stereo_link;
+                let coefficient = if requested > self.gain[channel] {
+                    attack
+                } else {
+                    release
+                };
+                self.gain[channel] = requested + (self.gain[channel] - requested) * coefficient;
+                let wet = dry[channel] * self.gain[channel];
+                buffer.channels[channel][frame] =
+                    denormal((dry[channel] * (1.0 - mix) + wet * mix) * output);
+            }
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "threshold" | "thresholdDb" => self.threshold_db = value.clamp(-72.0, -6.0),
+            "ratio" => self.ratio = value.clamp(1.0, 20.0),
+            "attackMs" => self.attack_ms = value.clamp(0.1, 500.0),
+            "releaseMs" => self.release_ms = value.clamp(5.0, 2_000.0),
+            "rangeDb" | "range" => self.range_db = value.clamp(0.0, 36.0),
+            "stereoLink" => self.stereo_link = value.clamp(0.0, 1.0),
+            "mix" => self.mix.set_target(value.clamp(0.0, 1.0)),
+            "outputDb" => self.output.set_target(db_to_gain(value.clamp(-24.0, 24.0))),
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        self.detector = [0.0; MAX_CHANNELS];
+        self.gain = [1.0; MAX_CHANNELS]
+    }
+}
+
+const ROBOTER_YIN_FRAME: usize = 1024;
+const ROBOTER_YIN_MAX_LAG: usize = 320;
+const ROBOTER_VOICE_COUNT: usize = 6;
+const ROBOTER_HARMONY_COUNT: usize = 5;
+const ROBOTER_ANALYSIS_HOP: usize = 256;
+
+const MAJOR_PROFILE: [f32; 12] = [
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+];
+const MINOR_PROFILE: [f32; 12] = [
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+];
+const MAJOR_SCALE: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+const MINOR_SCALE: [i32; 7] = [0, 2, 3, 5, 7, 8, 10];
+const ROBOTER_DETUNE_CENTS: [f32; ROBOTER_VOICE_COUNT] = [0.0, -4.0, 3.5, -6.5, 7.0, -3.0];
+const ROBOTER_DRIFT_HZ: [f32; ROBOTER_VOICE_COUNT] = [0.0, 0.13, 0.17, 0.21, 0.25, 0.29];
+const ROBOTER_EXTRA_DELAY_SEC: [f32; ROBOTER_VOICE_COUNT] =
+    [0.0, 0.010, 0.006, 0.009, 0.013, 0.015];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PitchEstimate {
+    frequency: f32,
+    confidence: f32,
+    aperiodicity: f32,
+    voiced: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ChromaEvent {
+    pitch_class: u8,
+    weight: f32,
+}
+impl ChromaEvent {
+    const EMPTY: Self = Self {
+        pitch_class: u8::MAX,
+        weight: 0.0,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct RoboterVoice {
+    phase: f32,
+    drift_phase: f32,
+    current_ratio: f32,
+    target_ratio: f32,
+    gain: f32,
+    target_gain: f32,
+    pan: f32,
+    target_pan: f32,
+    low_state: [f32; MAX_CHANNELS],
+}
+impl RoboterVoice {
+    const fn new() -> Self {
+        Self {
+            phase: 0.0,
+            drift_phase: 0.0,
+            current_ratio: 1.0,
+            target_ratio: 1.0,
+            gain: 0.0,
+            target_gain: 0.0,
+            pan: 0.0,
+            target_pan: 0.0,
+            low_state: [0.0; MAX_CHANNELS],
+        }
+    }
+
+    #[inline(always)]
+    fn render(
+        &mut self,
+        delay: &[Vec<f32>; MAX_CHANNELS],
+        write_position: usize,
+        base_delay: usize,
+        period: f32,
+        sample_rate: f32,
+        voice_index: usize,
+        retime_seconds: f32,
+    ) -> [f32; MAX_CHANNELS] {
+        if retime_seconds <= 0.000_05 {
+            self.current_ratio = self.target_ratio;
+        } else {
+            let coefficient = (-1.0 / (retime_seconds * sample_rate)).exp();
+            self.current_ratio =
+                self.target_ratio + (self.current_ratio - self.target_ratio) * coefficient;
+        }
+        self.drift_phase = (self.drift_phase + ROBOTER_DRIFT_HZ[voice_index] / sample_rate).fract();
+        let drift_cents = (2.0 * PI * self.drift_phase).sin() * 1.5;
+        let ratio = self.current_ratio
+            * 2.0_f32.powf((ROBOTER_DETUNE_CENTS[voice_index] + drift_cents) / 1200.0);
+        let window = (period * 2.0).clamp(sample_rate / 1000.0 * 2.0, sample_rate / 80.0 * 2.0);
+        self.phase = (self.phase + (1.0 - ratio) / window).rem_euclid(1.0);
+        let phase_b = (self.phase + 0.5).fract();
+        let weight_a = 0.5 - 0.5 * (2.0 * PI * self.phase).cos();
+        let weight_b = 1.0 - weight_a;
+        let extra_delay = ROBOTER_EXTRA_DELAY_SEC[voice_index] * sample_rate;
+        let delay_a = base_delay as f32 + extra_delay + self.phase * window;
+        let delay_b = base_delay as f32 + extra_delay + phase_b * window;
+        std::array::from_fn(|channel| {
+            denormal(
+                fractional_read(&delay[channel], write_position as f32 - delay_a) * weight_a
+                    + fractional_read(&delay[channel], write_position as f32 - delay_b) * weight_b,
+            )
+        })
+    }
+
+    #[inline(always)]
+    fn advance_mix(&mut self, sample_rate: f32) {
+        let fade_step = 1.0 / (0.04 * sample_rate).max(1.0);
+        if self.gain < self.target_gain {
+            self.gain = (self.gain + fade_step).min(self.target_gain)
+        } else {
+            self.gain = (self.gain - fade_step).max(self.target_gain)
+        }
+        let pan_step = 1.0 / (0.03 * sample_rate).max(1.0);
+        self.pan += (self.target_pan - self.pan).clamp(-pan_step, pan_step)
+    }
+
+    #[inline(always)]
+    fn mono_bass(&mut self, input: [f32; MAX_CHANNELS], sample_rate: f32) -> [f32; 2] {
+        let coefficient = 1.0 - (-2.0 * PI * 200.0 / sample_rate).exp();
+        for channel in 0..MAX_CHANNELS {
+            self.low_state[channel] += (input[channel] - self.low_state[channel]) * coefficient
+        }
+        let mono_low = (self.low_state[0] + self.low_state[1]) * 0.5;
+        [
+            input[0] - self.low_state[0] + mono_low,
+            input[1] - self.low_state[1] + mono_low,
+        ]
+    }
+}
+
+/// Monophonic vocal pitch correction and automatic diatonic harmonization.
+/// Analysis uses a 1024-sample downsampled YIN frame at a 256-input-sample hop.
+/// Six fixed PSOLA-style granular voices are allocated in `prepare`; processing
+/// only mutates those buffers and never creates or destroys a voice.
+pub struct Roboter {
+    sample_rate: f32,
+    amount: f32,
+    number: usize,
+    downsample_factor: usize,
+    downsample_sum: f32,
+    downsample_count: usize,
+    samples_since_analysis: usize,
+    pitch_ring: [f32; ROBOTER_YIN_FRAME],
+    pitch_position: usize,
+    pitch_filled: usize,
+    raw_midi: f32,
+    smoothed_midi: f32,
+    detected_hz: f32,
+    pitch_confidence: f32,
+    aperiodicity: f32,
+    voiced: bool,
+    chroma_histogram: [f32; 12],
+    chroma_history: Vec<ChromaEvent>,
+    chroma_position: usize,
+    chroma_weight: f32,
+    key_root: usize,
+    key_minor: bool,
+    key_valid: bool,
+    key_confidence: f32,
+    active_intervals: [f32; ROBOTER_HARMONY_COUNT],
+    voices: [RoboterVoice; ROBOTER_VOICE_COUNT],
+    delay: [Vec<f32>; MAX_CHANNELS],
+    write_position: usize,
+    latency: usize,
+    bypassed: bool,
+}
+impl Roboter {
+    pub fn new() -> Self {
+        Self {
+            sample_rate: 48_000.0,
+            amount: 0.72,
+            number: 0,
+            downsample_factor: 2,
+            downsample_sum: 0.0,
+            downsample_count: 0,
+            samples_since_analysis: 0,
+            pitch_ring: [0.0; ROBOTER_YIN_FRAME],
+            pitch_position: 0,
+            pitch_filled: 0,
+            raw_midi: 69.0,
+            smoothed_midi: 69.0,
+            detected_hz: 440.0,
+            pitch_confidence: 0.0,
+            aperiodicity: 1.0,
+            voiced: false,
+            chroma_histogram: [0.0; 12],
+            chroma_history: Vec::new(),
+            chroma_position: 0,
+            chroma_weight: 0.0,
+            key_root: 0,
+            key_minor: false,
+            key_valid: false,
+            key_confidence: 0.0,
+            active_intervals: [0.0; ROBOTER_HARMONY_COUNT],
+            voices: [RoboterVoice::new(); ROBOTER_VOICE_COUNT],
+            delay: [Vec::new(), Vec::new()],
+            write_position: 0,
+            latency: 2_768,
+            bypassed: false,
+        }
+    }
+
+    fn analyse_pitch(&mut self) {
+        let frame = std::array::from_fn(|index| {
+            self.pitch_ring[(self.pitch_position + index) % ROBOTER_YIN_FRAME]
+        });
+        let analysis_rate = self.sample_rate / self.downsample_factor as f32;
+        let estimate = yin_pitch(&frame, analysis_rate);
+        self.pitch_confidence = estimate.confidence;
+        self.aperiodicity = estimate.aperiodicity;
+        self.voiced = estimate.voiced;
+        if estimate.voiced {
+            self.detected_hz = estimate.frequency;
+            self.raw_midi = 69.0 + 12.0 * (estimate.frequency / 440.0).log2();
+            if !self.smoothed_midi.is_finite() || (self.raw_midi - self.smoothed_midi).abs() >= 4.0
+            {
+                self.smoothed_midi = self.raw_midi
+            } else {
+                self.smoothed_midi += (self.raw_midi - self.smoothed_midi) * 0.35
+            }
+        }
+        self.update_chroma();
+        self.update_pitch_targets();
+    }
+
+    fn update_chroma(&mut self) {
+        if self.chroma_history.is_empty() {
+            return;
+        }
+        let old = self.chroma_history[self.chroma_position];
+        if old.pitch_class < 12 {
+            self.chroma_histogram[old.pitch_class as usize] =
+                (self.chroma_histogram[old.pitch_class as usize] - old.weight).max(0.0);
+            self.chroma_weight = (self.chroma_weight - old.weight).max(0.0)
+        }
+        let event = if self.voiced {
+            let pitch_class = self.smoothed_midi.round().rem_euclid(12.0) as u8;
+            let weight = self.pitch_confidence * (1.0 - self.aperiodicity).sqrt();
+            self.chroma_histogram[pitch_class as usize] += weight;
+            self.chroma_weight += weight;
+            ChromaEvent {
+                pitch_class,
+                weight,
+            }
+        } else {
+            ChromaEvent::EMPTY
+        };
+        self.chroma_history[self.chroma_position] = event;
+        self.chroma_position = increment_wrap(self.chroma_position, self.chroma_history.len());
+
+        self.refresh_key_estimate()
+    }
+
+    fn refresh_key_estimate(&mut self) {
+        let distinct = self
+            .chroma_histogram
+            .iter()
+            .filter(|weight| **weight > self.chroma_weight * 0.025)
+            .count();
+        let (root, minor, best_score, second_score) = match_key(&self.chroma_histogram);
+        let evidence = (self.chroma_weight / 20.0).clamp(0.0, 1.0)
+            * ((distinct as f32 - 2.0) / 3.0).clamp(0.0, 1.0);
+        self.key_confidence = ((best_score - second_score) * 3.5).clamp(0.0, 1.0) * evidence;
+        if !self.key_valid {
+            if self.key_confidence >= 0.18 {
+                self.key_root = root;
+                self.key_minor = minor;
+                self.key_valid = true
+            }
+        } else if root != self.key_root || minor != self.key_minor {
+            let current_score =
+                key_profile_score(&self.chroma_histogram, self.key_root, self.key_minor);
+            if self.key_confidence >= 0.24 && best_score > current_score + 0.08 {
+                self.key_root = root;
+                self.key_minor = minor
+            }
+        }
+    }
+
+    fn update_pitch_targets(&mut self) {
+        if !self.voiced {
+            for voice in &mut self.voices {
+                voice.target_ratio = 1.0
+            }
+            return;
+        }
+        let tonal = self.key_valid && self.key_confidence >= 0.18;
+        let (lead_target, degree) = if tonal {
+            nearest_scale_note(self.smoothed_midi, self.key_root, self.key_minor)
+        } else {
+            (self.smoothed_midi.round() as i32, 0)
+        };
+        let depth = if self.amount <= 0.5 {
+            self.amount * 2.0
+        } else {
+            1.0
+        };
+        let lead_shift = (lead_target as f32 - self.smoothed_midi) * depth;
+        self.voices[0].target_ratio = 2.0_f32.powf(lead_shift / 12.0).clamp(0.9, 1.1);
+
+        for harmony in 0..ROBOTER_HARMONY_COUNT {
+            let target = if tonal {
+                diatonic_harmony_note(lead_target, degree, harmony, self.key_root, self.key_minor)
+            } else {
+                lead_target + chromatic_harmony_interval(harmony)
+            };
+            self.active_intervals[harmony] = (target - lead_target) as f32;
+            self.voices[harmony + 1].target_ratio = 2.0_f32
+                .powf((target as f32 - self.smoothed_midi) / 12.0)
+                .clamp(0.45, 2.1)
+        }
+    }
+
+    fn configure_voices(&mut self) {
+        for harmony in 0..ROBOTER_HARMONY_COUNT {
+            let (active, pan) = roboter_voice_layout(self.number, harmony);
+            self.voices[harmony + 1].target_gain = if active { 1.0 } else { 0.0 };
+            self.voices[harmony + 1].target_pan = pan
+        }
+    }
+}
+impl DspEffect for Roboter {
+    fn prepare(&mut self, sample_rate: f32, _: usize, _: usize) {
+        self.sample_rate = sample_rate;
+        self.downsample_factor = (sample_rate / 24_000.0).round().clamp(1.0, 8.0) as usize;
+        let analysis_latency = ROBOTER_YIN_FRAME * self.downsample_factor;
+        let maximum_period = (sample_rate / 80.0).ceil() as usize * 2;
+        let maximum_extra_delay = (sample_rate * 0.015).ceil() as usize;
+        self.latency = analysis_latency + maximum_period + maximum_extra_delay;
+        let delay_length = self.latency + maximum_period + maximum_extra_delay + MAX_BLOCK_SIZE + 8;
+        self.delay = [vec![0.0; delay_length], vec![0.0; delay_length]];
+        let history_length = ((sample_rate * 6.0) / ROBOTER_ANALYSIS_HOP as f32)
+            .round()
+            .max(1.0) as usize;
+        self.chroma_history = vec![ChromaEvent::EMPTY; history_length];
+        self.reset();
+    }
+    fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        if self.bypassed {
+            return;
+        }
+        let retime_seconds = if self.amount <= 0.5 {
+            0.04
+        } else {
+            0.04 * (1.0 - (self.amount - 0.5) * 2.0).max(0.0)
+        };
+        let harmony_normalization = if self.number == 0 {
+            0.0
+        } else {
+            1.0 / (self.number as f32).sqrt()
+        };
+        for frame in 0..frames {
+            let input = [buffer.channels[0][frame], buffer.channels[1][frame]];
+            let mono = (input[0] + input[1]) * 0.5;
+            self.delay[0][self.write_position] = input[0];
+            self.delay[1][self.write_position] = input[1];
+
+            self.downsample_sum += mono;
+            self.downsample_count += 1;
+            self.samples_since_analysis += 1;
+            if self.downsample_count >= self.downsample_factor {
+                self.pitch_ring[self.pitch_position] =
+                    self.downsample_sum / self.downsample_count as f32;
+                self.pitch_position = increment_wrap(self.pitch_position, ROBOTER_YIN_FRAME);
+                self.pitch_filled = (self.pitch_filled + 1).min(ROBOTER_YIN_FRAME);
+                self.downsample_sum = 0.0;
+                self.downsample_count = 0
+            }
+            if self.samples_since_analysis >= ROBOTER_ANALYSIS_HOP
+                && self.pitch_filled == ROBOTER_YIN_FRAME
+            {
+                self.samples_since_analysis = 0;
+                self.analyse_pitch()
+            }
+
+            let delayed = std::array::from_fn(|channel| {
+                fractional_read(
+                    &self.delay[channel],
+                    self.write_position as f32 - self.latency as f32,
+                )
+            });
+            let period = if self.voiced {
+                self.sample_rate / self.detected_hz.clamp(80.0, 1_000.0)
+            } else {
+                self.sample_rate / 220.0
+            };
+            let mut output = if self.voiced && self.amount > 0.0001 {
+                self.voices[0].render(
+                    &self.delay,
+                    self.write_position,
+                    self.latency,
+                    period,
+                    self.sample_rate,
+                    0,
+                    retime_seconds,
+                )
+            } else {
+                delayed
+            };
+
+            for harmony in 0..ROBOTER_HARMONY_COUNT {
+                let voice_index = harmony + 1;
+                self.voices[voice_index].advance_mix(self.sample_rate);
+                if !self.voiced || self.voices[voice_index].gain <= 0.000_01 {
+                    continue;
+                }
+                let mut shifted = self.voices[voice_index].render(
+                    &self.delay,
+                    self.write_position,
+                    self.latency,
+                    period,
+                    self.sample_rate,
+                    voice_index,
+                    0.004,
+                );
+                if harmony == 0 {
+                    shifted = self.voices[voice_index].mono_bass(shifted, self.sample_rate)
+                }
+                let mut pan = self.voices[voice_index].pan;
+                if harmony == 3 && self.detected_hz < 180.0 {
+                    pan *= (self.detected_hz / 180.0).clamp(0.25, 1.0)
+                }
+                let left_pan = if pan > 0.0 { 1.0 - pan } else { 1.0 };
+                let right_pan = if pan < 0.0 { 1.0 + pan } else { 1.0 };
+                let gain = self.voices[voice_index].gain * harmony_normalization;
+                output[0] += shifted[0] * left_pan * gain;
+                output[1] += shifted[1] * right_pan * gain
+            }
+            buffer.channels[0][frame] = denormal(output[0]);
+            buffer.channels[1][frame] = denormal(output[1]);
+            self.write_position = increment_wrap(self.write_position, self.delay[0].len())
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "amount" | "depth" | "robot" => self.amount = value.clamp(0.0, 1.0),
+            "number" | "voices" => {
+                self.number = value.round().clamp(0.0, 5.0) as usize;
+                self.configure_voices()
+            }
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed
+    }
+    fn reset(&mut self) {
+        self.downsample_sum = 0.0;
+        self.downsample_count = 0;
+        self.samples_since_analysis = 0;
+        self.pitch_ring = [0.0; ROBOTER_YIN_FRAME];
+        self.pitch_position = 0;
+        self.pitch_filled = 0;
+        self.raw_midi = 69.0;
+        self.smoothed_midi = 69.0;
+        self.detected_hz = 440.0;
+        self.pitch_confidence = 0.0;
+        self.aperiodicity = 1.0;
+        self.voiced = false;
+        self.chroma_histogram = [0.0; 12];
+        self.chroma_history.fill(ChromaEvent::EMPTY);
+        self.chroma_position = 0;
+        self.chroma_weight = 0.0;
+        self.key_root = 0;
+        self.key_minor = false;
+        self.key_valid = false;
+        self.key_confidence = 0.0;
+        self.active_intervals = [0.0; ROBOTER_HARMONY_COUNT];
+        self.voices = [RoboterVoice::new(); ROBOTER_VOICE_COUNT];
+        self.voices[0].gain = 1.0;
+        self.voices[0].target_gain = 1.0;
+        self.configure_voices();
+        for channel in &mut self.delay {
+            channel.fill(0.0)
+        }
+        self.write_position = 0
+    }
+    fn tail_samples(&self) -> usize {
+        (self.sample_rate * (0.015 + 0.05)).ceil() as usize
+    }
+    fn latency_samples(&self) -> usize {
+        self.latency
+    }
+    fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        let mut metrics = [0.0; DISTORTION_SPECTRUM_BINS];
+        metrics[0] = if self.voiced {
+            self.smoothed_midi
+        } else {
+            -1.0
+        };
+        metrics[1] = self.key_root as f32;
+        metrics[2] = if self.key_valid && self.key_confidence >= 0.18 {
+            if self.key_minor {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            2.0
+        };
+        metrics[3] = self.key_confidence;
+        metrics[4] = if self.voiced { 1.0 } else { 0.0 };
+        metrics[5] = self.pitch_confidence;
+        metrics[6] = self.number as f32;
+        metrics[7..(7 + ROBOTER_HARMONY_COUNT)].copy_from_slice(&self.active_intervals);
+        Some(metrics)
+    }
+}
+
+fn yin_pitch(frame: &[f32; ROBOTER_YIN_FRAME], sample_rate: f32) -> PitchEstimate {
+    let minimum_lag = (sample_rate / 1_000.0).floor().max(2.0) as usize;
+    let maximum_lag = ((sample_rate / 80.0).ceil() as usize)
+        .min(ROBOTER_YIN_MAX_LAG)
+        .min(ROBOTER_YIN_FRAME / 2 - 1);
+    let comparison_samples = ROBOTER_YIN_FRAME - maximum_lag;
+    let rms =
+        (frame.iter().map(|sample| sample * sample).sum::<f32>() / ROBOTER_YIN_FRAME as f32).sqrt();
+    if rms < 0.0015 || maximum_lag <= minimum_lag + 2 {
+        return PitchEstimate::default();
+    }
+    let mut raw_difference = [0.0_f32; ROBOTER_YIN_MAX_LAG + 1];
+    for lag in 1..=maximum_lag {
+        let mut sum = 0.0;
+        for index in 0..comparison_samples {
+            let delta = frame[index] - frame[index + lag];
+            sum += delta * delta
+        }
+        raw_difference[lag] = sum
+    }
+    let mut difference = raw_difference;
+    let mut running_sum = 0.0;
+    difference[0] = 1.0;
+    for lag in 1..=maximum_lag {
+        running_sum += difference[lag];
+        difference[lag] = difference[lag] * lag as f32 / running_sum.max(1e-12)
+    }
+    let mut selected = 0;
+    for lag in minimum_lag..maximum_lag {
+        if difference[lag] < 0.15 && difference[lag] <= difference[lag + 1] {
+            selected = lag;
+            break;
+        }
+    }
+    if selected == 0 {
+        selected = (minimum_lag..=maximum_lag)
+            .min_by(|left, right| difference[*left].total_cmp(&difference[*right]))
+            .unwrap_or(0)
+    }
+    if selected == 0 {
+        return PitchEstimate::default();
+    }
+    let aperiodicity = difference[selected].clamp(0.0, 1.0);
+    let mut lower = (selected as f32 - 1.0).max(minimum_lag as f32);
+    let mut upper = (selected as f32 + 1.0).min(maximum_lag as f32);
+    const GOLDEN: f32 = 0.618_034;
+    let mut left = upper - (upper - lower) * GOLDEN;
+    let mut right = lower + (upper - lower) * GOLDEN;
+    let mut left_value = yin_fractional_difference(frame, left, comparison_samples);
+    let mut right_value = yin_fractional_difference(frame, right, comparison_samples);
+    for _ in 0..12 {
+        if left_value <= right_value {
+            upper = right;
+            right = left;
+            right_value = left_value;
+            left = upper - (upper - lower) * GOLDEN;
+            left_value = yin_fractional_difference(frame, left, comparison_samples)
+        } else {
+            lower = left;
+            left = right;
+            left_value = right_value;
+            right = lower + (upper - lower) * GOLDEN;
+            right_value = yin_fractional_difference(frame, right, comparison_samples)
+        }
+    }
+    let lag = (lower + upper) * 0.5;
+    let frequency = sample_rate / lag.max(1.0);
+    let confidence = (1.0 - aperiodicity).clamp(0.0, 1.0);
+    PitchEstimate {
+        frequency,
+        confidence,
+        aperiodicity,
+        voiced: (80.0..=1_000.0).contains(&frequency) && confidence >= 0.68,
+    }
+}
+
+fn yin_fractional_difference(frame: &[f32; ROBOTER_YIN_FRAME], lag: f32, samples: usize) -> f32 {
+    let mut sum = 0.0;
+    let safe_end = samples
+        .saturating_sub(2)
+        .min(ROBOTER_YIN_FRAME.saturating_sub(lag.ceil() as usize + 2));
+    for index in 1..safe_end {
+        let position = index as f32 + lag;
+        let base = position.floor() as usize;
+        let fraction = position - base as f32;
+        let shifted = frame[base] + (frame[base + 1] - frame[base]) * fraction;
+        let delta = frame[index] - shifted;
+        sum += delta * delta
+    }
+    sum
+}
+
+fn key_profile_score(histogram: &[f32; 12], root: usize, minor: bool) -> f32 {
+    let profile = if minor {
+        &MINOR_PROFILE
+    } else {
+        &MAJOR_PROFILE
+    };
+    let histogram_mean = histogram.iter().sum::<f32>() / 12.0;
+    let profile_mean = profile.iter().sum::<f32>() / 12.0;
+    let mut numerator = 0.0;
+    let mut histogram_energy = 0.0;
+    let mut profile_energy = 0.0;
+    for pitch_class in 0..12 {
+        let observed = histogram[(root + pitch_class) % 12] - histogram_mean;
+        let expected = profile[pitch_class] - profile_mean;
+        numerator += observed * expected;
+        histogram_energy += observed * observed;
+        profile_energy += expected * expected
+    }
+    numerator / (histogram_energy * profile_energy).sqrt().max(1e-9)
+}
+
+fn match_key(histogram: &[f32; 12]) -> (usize, bool, f32, f32) {
+    let mut best = (0, false, f32::NEG_INFINITY);
+    let mut second = f32::NEG_INFINITY;
+    for minor in [false, true] {
+        for root in 0..12 {
+            let score = key_profile_score(histogram, root, minor);
+            if score > best.2 {
+                second = best.2;
+                best = (root, minor, score)
+            } else if score > second {
+                second = score
+            }
+        }
+    }
+    (best.0, best.1, best.2, second)
+}
+
+fn nearest_scale_note(midi: f32, root: usize, minor: bool) -> (i32, usize) {
+    let scale = if minor { &MINOR_SCALE } else { &MAJOR_SCALE };
+    let center = midi.round() as i32;
+    let mut best_note = center;
+    let mut best_degree = 0;
+    let mut best_distance = f32::MAX;
+    for note in (center - 7)..=(center + 7) {
+        let relative = (note - root as i32).rem_euclid(12);
+        if let Some(degree) = scale.iter().position(|pitch| *pitch == relative) {
+            let distance = (note as f32 - midi).abs();
+            if distance < best_distance {
+                best_note = note;
+                best_degree = degree;
+                best_distance = distance
+            }
+        }
+    }
+    (best_note, best_degree)
+}
+
+fn diatonic_harmony_note(
+    lead_note: i32,
+    lead_degree: usize,
+    harmony: usize,
+    root: usize,
+    minor: bool,
+) -> i32 {
+    if harmony == 0 {
+        return lead_note - 12;
+    }
+    let mut steps = match harmony {
+        1 => -2,
+        2 => 2,
+        3 => -5,
+        _ => 4,
+    };
+    if !minor && lead_degree == 6 && harmony == 4 {
+        steps = 5
+    }
+    let scale = if minor { &MINOR_SCALE } else { &MAJOR_SCALE };
+    let tonic = lead_note - scale[lead_degree] - root as i32 + root as i32;
+    let target_degree = lead_degree as i32 + steps;
+    let octave = target_degree.div_euclid(7);
+    let degree = target_degree.rem_euclid(7) as usize;
+    tonic + octave * 12 + scale[degree]
+}
+
+fn chromatic_harmony_interval(harmony: usize) -> i32 {
+    [-12, -4, 4, -9, 7][harmony.min(ROBOTER_HARMONY_COUNT - 1)]
+}
+
+fn roboter_voice_layout(number: usize, harmony: usize) -> (bool, f32) {
+    const ACTIVE: [[bool; ROBOTER_HARMONY_COUNT]; 6] = [
+        [false, false, false, false, false],
+        [true, false, false, false, false],
+        [false, true, true, false, false],
+        [true, true, true, false, false],
+        [false, true, true, true, true],
+        [true, true, true, true, true],
+    ];
+    const PAN: [[f32; ROBOTER_HARMONY_COUNT]; 6] = [
+        [0.0; 5],
+        [0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, -0.60, 0.60, 0.0, 0.0],
+        [0.0, -0.75, 0.75, 0.0, 0.0],
+        [0.0, -0.40, 0.40, -0.85, 0.85],
+        [0.0, -0.45, 0.45, -0.90, 0.90],
+    ];
+    let number = number.min(5);
+    (ACTIVE[number][harmony], PAN[number][harmony])
+}
+
+const COLORIZER_FFT_SIZE: usize = 4096;
+const COLORIZER_HOP_SIZE: usize = COLORIZER_FFT_SIZE / 4;
+const COLORIZER_BINS: usize = COLORIZER_FFT_SIZE / 2 + 1;
+const COLORIZER_MASK_SMOOTH_FRAMES: usize = 4;
+const MAX_ACTIVE_PITCHES: usize = 12;
+const COLORIZER_METER_BINS: usize = DISTORTION_SPECTRUM_BINS / 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum ChordSource {
+    AutoDetect,
+    Manual,
+    MidiInput,
+}
+
+/// Fixed-capacity control-rate pitch snapshot. It is deliberately independent
+/// from both UI presets and MIDI routing so spectral DSP only sees pitch data.
+#[derive(Clone, Copy, Debug)]
+struct ActivePitches {
+    pitches: [u8; MAX_ACTIVE_PITCHES],
+    count: usize,
+    confidence: f32,
+    changed: bool,
+}
+impl ActivePitches {
+    fn from_mask(mask: u16, previous: u16) -> Self {
+        let mut pitches = [0; MAX_ACTIVE_PITCHES];
+        let mut count = 0;
+        for pitch in 0..12 {
+            if mask & (1 << pitch) != 0 {
+                pitches[count] = pitch as u8;
+                count += 1;
+            }
+        }
+        Self {
+            pitches,
+            count,
+            confidence: 1.0,
+            changed: mask != previous,
+        }
+    }
+    fn mask(&self) -> u16 {
+        self.pitches[..self.count]
+            .iter()
+            .fold(0_u16, |mask, pitch| mask | (1 << pitch))
+    }
+}
+
+struct ColorizerChannel {
+    input_ring: Vec<f32>,
+    dry_delay: Vec<f32>,
+    ola_ring: Vec<f32>,
+    spectrum: Vec<Complex32>,
+    scratch: Vec<Complex32>,
+    held: Vec<f32>,
+    phase: Vec<f32>,
+    previous_magnitude: Vec<f32>,
+}
+impl ColorizerChannel {
+    fn new(scratch_len: usize) -> Self {
+        Self {
+            input_ring: vec![0.0; COLORIZER_FFT_SIZE],
+            dry_delay: vec![0.0; COLORIZER_FFT_SIZE],
+            ola_ring: vec![0.0; COLORIZER_FFT_SIZE],
+            spectrum: vec![Complex32::new(0.0, 0.0); COLORIZER_FFT_SIZE],
+            scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
+            held: vec![0.0; COLORIZER_BINS],
+            phase: vec![0.0; COLORIZER_BINS],
+            previous_magnitude: vec![0.0; COLORIZER_BINS],
+        }
+    }
+    fn clear(&mut self) {
+        self.input_ring.fill(0.0);
+        self.dry_delay.fill(0.0);
+        self.ola_ring.fill(0.0);
+        self.spectrum.fill(Complex32::new(0.0, 0.0));
+        self.scratch.fill(Complex32::new(0.0, 0.0));
+        self.held.fill(0.0);
+        self.phase.fill(0.0);
+        self.previous_magnitude.fill(0.0);
+    }
+}
+
+/// Harmonic STFT resonator shown to users as `Colorizer`.
+///
+/// FFT plans, scratch, rings, masks, and phase state are all prepared before
+/// processing. `process` performs no heap allocation or locking.
+struct Colorizer {
+    sample_rate: f32,
+    bypassed: bool,
+    source: ChordSource,
+    manual_mask: u16,
+    midi_mask: u16,
+    applied_mask: u16,
+    midi_notes: [u8; 128],
+    resonance: f32,
+    decay: f32,
+    depth: f32,
+    mix: Smoother,
+    mask_current: Vec<f32>,
+    mask_start: Vec<f32>,
+    mask_target: Vec<f32>,
+    mask_dirty: bool,
+    mask_smooth_remaining: usize,
+    window: Vec<f32>,
+    forward: Arc<dyn Fft<f32>>,
+    inverse: Arc<dyn Fft<f32>>,
+    channels: [ColorizerChannel; MAX_CHANNELS],
+    ring_position: usize,
+    samples_seen: usize,
+    samples_until_frame: usize,
+    meter: [f32; DISTORTION_SPECTRUM_BINS],
+}
+impl Colorizer {
+    fn new() -> Self {
+        let mut planner = FftPlanner::<f32>::new();
+        let forward = planner.plan_fft_forward(COLORIZER_FFT_SIZE);
+        let inverse = planner.plan_fft_inverse(COLORIZER_FFT_SIZE);
+        let scratch_len = forward
+            .get_inplace_scratch_len()
+            .max(inverse.get_inplace_scratch_len());
+        Self {
+            sample_rate: 48_000.0,
+            bypassed: false,
+            source: ChordSource::Manual,
+            manual_mask: 0b1010_1101_0101,
+            midi_mask: 0,
+            applied_mask: 0,
+            midi_notes: [0; 128],
+            resonance: 0.62,
+            decay: 0.45,
+            depth: 0.82,
+            mix: Smoother::new(0.72, 48_000.0, 0.015),
+            mask_current: vec![1.0; COLORIZER_BINS],
+            mask_start: vec![1.0; COLORIZER_BINS],
+            mask_target: vec![1.0; COLORIZER_BINS],
+            mask_dirty: true,
+            mask_smooth_remaining: 0,
+            window: vec![0.0; COLORIZER_FFT_SIZE],
+            forward,
+            inverse,
+            channels: [
+                ColorizerChannel::new(scratch_len),
+                ColorizerChannel::new(scratch_len),
+            ],
+            ring_position: 0,
+            samples_seen: 0,
+            samples_until_frame: COLORIZER_FFT_SIZE,
+            meter: [0.0; DISTORTION_SPECTRUM_BINS],
+        }
+    }
+    fn active_mask(&self) -> u16 {
+        match self.source {
+            ChordSource::MidiInput => self.midi_mask,
+            ChordSource::Manual | ChordSource::AutoDetect => self.manual_mask,
+        }
+    }
+    fn update_active_pitches(&mut self) {
+        let pitches = ActivePitches::from_mask(self.active_mask(), self.applied_mask);
+        let _confidence = pitches.confidence;
+        if pitches.changed {
+            self.applied_mask = pitches.mask();
+            self.mask_dirty = true;
+        }
+    }
+    fn rebuild_mask(&mut self) {
+        if !self.mask_dirty {
+            return;
+        }
+        self.mask_start.copy_from_slice(&self.mask_current);
+        let pitch_mask = self.active_mask();
+        let midi_closed = self.source == ChordSource::MidiInput && pitch_mask == 0;
+        let sigma = 1.55 * (1.0 - self.resonance).powi(2) + 0.075;
+        let bin_width = self.sample_rate / COLORIZER_FFT_SIZE as f32;
+        for (bin, gain) in self.mask_target.iter_mut().enumerate() {
+            let frequency = bin as f32 * self.sample_rate / COLORIZER_FFT_SIZE as f32;
+            if midi_closed {
+                *gain = 0.0;
+                continue;
+            }
+            let harmonic_mask = if (40.0..=12_000.0).contains(&frequency) && pitch_mask != 0 {
+                let midi_pitch = 69.0 + 12.0 * (frequency / 440.0).log2();
+                let pitch_class = midi_pitch.rem_euclid(12.0);
+                // A bell narrower than one FFT bin can miss a low note
+                // completely. Widen only as much as the local bin resolution
+                // requires, preserving the requested logarithmic Q elsewhere.
+                let resolution_sigma = if frequency > bin_width * 0.55 {
+                    12.0 * ((frequency + bin_width * 0.5) / (frequency - bin_width * 0.5)).log2()
+                        * 0.55
+                } else {
+                    3.0
+                };
+                let effective_sigma = sigma.max(resolution_sigma);
+                let mut sum = 0.0_f32;
+                for pitch in 0..12 {
+                    if pitch_mask & (1 << pitch) == 0 {
+                        continue;
+                    }
+                    let direct = (pitch_class - pitch as f32).abs();
+                    let distance = direct.min(12.0 - direct);
+                    sum += (-0.5 * (distance / effective_sigma).powi(2)).exp();
+                }
+                sum.min(1.0)
+            } else {
+                0.0
+            };
+            *gain = harmonic_mask + (1.0 - harmonic_mask) * (1.0 - self.depth);
+        }
+        self.mask_smooth_remaining = COLORIZER_MASK_SMOOTH_FRAMES;
+        self.mask_dirty = false;
+    }
+    fn advance_mask(&mut self) {
+        self.rebuild_mask();
+        if self.mask_smooth_remaining == 0 {
+            return;
+        }
+        let completed = COLORIZER_MASK_SMOOTH_FRAMES - self.mask_smooth_remaining + 1;
+        let amount = completed as f32 / COLORIZER_MASK_SMOOTH_FRAMES as f32;
+        for bin in 0..COLORIZER_BINS {
+            self.mask_current[bin] =
+                self.mask_start[bin] + (self.mask_target[bin] - self.mask_start[bin]) * amount;
+        }
+        self.mask_smooth_remaining -= 1;
+    }
+    fn settle_mask_before_audio(&mut self) {
+        if self.samples_seen != 0 {
+            return;
+        }
+        self.rebuild_mask();
+        self.mask_current.copy_from_slice(&self.mask_target);
+        self.mask_smooth_remaining = 0;
+    }
+    fn decay_coefficient(&self) -> f32 {
+        if self.decay <= 1e-5 {
+            return 0.0;
+        }
+        let seconds = 0.035 * (240.0_f32).powf(self.decay);
+        (-(COLORIZER_HOP_SIZE as f32) / (seconds * self.sample_rate))
+            .exp()
+            .min(0.999_95)
+    }
+    fn handle_event(&mut self, event: NoteEventKind) {
+        match event {
+            NoteEventKind::NoteOn {
+                pitch, velocity, ..
+            } if velocity > 0.0 => {
+                self.midi_notes[pitch as usize] = self.midi_notes[pitch as usize].saturating_add(1)
+            }
+            NoteEventKind::NoteOn { pitch, .. } | NoteEventKind::NoteOff { pitch, .. } => {
+                self.midi_notes[pitch as usize] = self.midi_notes[pitch as usize].saturating_sub(1)
+            }
+            NoteEventKind::AllNotesOff => self.midi_notes.fill(0),
+            _ => return,
+        }
+        let mut mask = 0_u16;
+        for (pitch, count) in self.midi_notes.iter().enumerate() {
+            if *count > 0 {
+                mask |= 1 << (pitch % 12)
+            }
+        }
+        if mask != self.midi_mask {
+            self.midi_mask = mask;
+            self.update_active_pitches();
+        }
+    }
+    fn render_frame(&mut self) {
+        self.advance_mask();
+        let decay = self.decay_coefficient();
+        self.meter[..COLORIZER_METER_BINS].fill(0.0);
+        for channel in &mut self.channels {
+            process_colorizer_frame(
+                channel,
+                &self.forward,
+                &self.inverse,
+                &self.window,
+                &self.mask_current,
+                self.sample_rate,
+                self.ring_position,
+                decay,
+                &mut self.meter[..COLORIZER_METER_BINS],
+            );
+        }
+        for value in &mut self.meter[..COLORIZER_METER_BINS] {
+            *value *= 0.5;
+        }
+        for index in 0..COLORIZER_METER_BINS {
+            let frequency = colorizer_meter_frequency(index);
+            let bin = ((frequency * COLORIZER_FFT_SIZE as f32 / self.sample_rate).round() as usize)
+                .min(COLORIZER_BINS - 1);
+            self.meter[COLORIZER_METER_BINS + index] = self.mask_current[bin];
+        }
+    }
+}
+impl DspEffect for Colorizer {
+    fn prepare(&mut self, sample_rate: f32, _max_block: usize, _channels: usize) {
+        self.sample_rate = sample_rate.max(8_000.0);
+        let mut planner = FftPlanner::<f32>::new();
+        self.forward = planner.plan_fft_forward(COLORIZER_FFT_SIZE);
+        self.inverse = planner.plan_fft_inverse(COLORIZER_FFT_SIZE);
+        let scratch_len = self
+            .forward
+            .get_inplace_scratch_len()
+            .max(self.inverse.get_inplace_scratch_len());
+        self.channels = [
+            ColorizerChannel::new(scratch_len),
+            ColorizerChannel::new(scratch_len),
+        ];
+        for (index, value) in self.window.iter_mut().enumerate() {
+            *value = 0.5 - 0.5 * (2.0 * PI * index as f32 / COLORIZER_FFT_SIZE as f32).cos();
+        }
+        self.mix = Smoother::new(self.mix.target, self.sample_rate, 0.015);
+        self.reset();
+        self.mask_dirty = true;
+        self.rebuild_mask();
+        self.mask_current.copy_from_slice(&self.mask_target);
+        self.mask_smooth_remaining = 0;
+        self.applied_mask = self.active_mask();
+    }
+    fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
+        if self.bypassed {
+            return;
+        }
+        debug_assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sample_offset <= pair[1].sample_offset));
+        let mut event_index = 0;
+        for frame in 0..frames.min(MAX_BLOCK_SIZE) {
+            if self.source == ChordSource::MidiInput {
+                while event_index < events.len()
+                    && events[event_index].sample_offset as usize == frame
+                {
+                    self.handle_event(events[event_index].kind);
+                    event_index += 1;
+                }
+            }
+            let mix = self.mix.next();
+            for channel in 0..MAX_CHANNELS {
+                let input = buffer.channels[channel][frame];
+                let state = &mut self.channels[channel];
+                state.input_ring[self.ring_position] = input;
+                let dry = state.dry_delay[self.ring_position];
+                state.dry_delay[self.ring_position] = input;
+                let wet = state.ola_ring[self.ring_position];
+                state.ola_ring[self.ring_position] = 0.0;
+                buffer.channels[channel][frame] = denormal(dry + (wet - dry) * mix);
+            }
+            self.ring_position = increment_wrap(self.ring_position, COLORIZER_FFT_SIZE);
+            self.samples_seen = self.samples_seen.saturating_add(1);
+            self.samples_until_frame -= 1;
+            if self.samples_until_frame == 0 {
+                self.render_frame();
+                self.samples_until_frame = COLORIZER_HOP_SIZE;
+            }
+        }
+    }
+    fn set_param(&mut self, id: &str, value: f32) {
+        match id {
+            "midi" => {
+                let source = if value >= 0.5 {
+                    ChordSource::MidiInput
+                } else {
+                    ChordSource::Manual
+                };
+                if source != self.source {
+                    self.source = source;
+                    self.applied_mask = self.active_mask();
+                    self.mask_dirty = true;
+                    self.settle_mask_before_audio();
+                }
+            }
+            "resonance" => {
+                self.resonance = value.clamp(0.0, 1.0);
+                self.mask_dirty = true;
+                self.settle_mask_before_audio();
+            }
+            "decay" => self.decay = value.clamp(0.0, 1.0),
+            "depth" => {
+                self.depth = value.clamp(0.0, 1.0);
+                self.mask_dirty = true;
+                self.settle_mask_before_audio();
+            }
+            "mix" => self.mix.set_target(value.clamp(0.0, 1.0)),
+            _ if id.starts_with("pitch") => {
+                if let Ok(pitch) = id[5..].parse::<usize>() {
+                    if pitch < 12 {
+                        if value >= 0.5 {
+                            self.manual_mask |= 1 << pitch
+                        } else {
+                            self.manual_mask &= !(1 << pitch)
+                        }
+                        self.update_active_pitches();
+                        self.settle_mask_before_audio();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.bypassed = bypassed;
+    }
+    fn reset(&mut self) {
+        for channel in &mut self.channels {
+            channel.clear();
+        }
+        self.midi_notes.fill(0);
+        self.midi_mask = 0;
+        self.applied_mask = self.active_mask();
+        self.mask_dirty = true;
+        self.ring_position = 0;
+        self.samples_seen = 0;
+        self.samples_until_frame = COLORIZER_FFT_SIZE;
+        self.meter.fill(0.0);
+    }
+    fn tail_samples(&self) -> usize {
+        if self.decay <= 1e-5 {
+            COLORIZER_FFT_SIZE
+        } else {
+            let seconds = 0.035 * (240.0_f32).powf(self.decay);
+            COLORIZER_FFT_SIZE + (seconds * 9.21 * self.sample_rate) as usize
+        }
+    }
+    fn latency_samples(&self) -> usize {
+        COLORIZER_FFT_SIZE
+    }
+    fn wants_midi(&self) -> bool {
+        self.source == ChordSource::MidiInput
+    }
+    fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        Some(self.meter)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_colorizer_frame(
+    channel: &mut ColorizerChannel,
+    forward: &Arc<dyn Fft<f32>>,
+    inverse: &Arc<dyn Fft<f32>>,
+    window: &[f32],
+    mask: &[f32],
+    sample_rate: f32,
+    ring_position: usize,
+    decay: f32,
+    meter: &mut [f32],
+) {
+    for index in 0..COLORIZER_FFT_SIZE {
+        let input_index = (ring_position + index) % COLORIZER_FFT_SIZE;
+        channel.spectrum[index] =
+            Complex32::new(channel.input_ring[input_index] * window[index], 0.0);
+    }
+    forward.process_with_scratch(&mut channel.spectrum, &mut channel.scratch);
+    let mut flux = 0.0_f32;
+    let mut energy = 1e-12_f32;
+    for bin in 0..COLORIZER_BINS {
+        let magnitude = channel.spectrum[bin].norm();
+        flux += (magnitude - channel.previous_magnitude[bin]).max(0.0);
+        energy += magnitude;
+        channel.previous_magnitude[bin] = magnitude;
+    }
+    let frame_decay = if flux / energy > 0.18 {
+        decay * 0.35
+    } else {
+        decay
+    };
+    for bin in 0..COLORIZER_BINS {
+        let input = channel.spectrum[bin];
+        let input_magnitude = input.norm();
+        let filtered = input_magnitude * mask[bin];
+        let previous = channel.held[bin];
+        let held = if frame_decay <= 1e-8 {
+            filtered
+        } else {
+            filtered.max(previous * frame_decay)
+        };
+        channel.held[bin] = denormal(held);
+        if held <= 1e-20 {
+            channel.spectrum[bin] = Complex32::new(0.0, 0.0);
+            continue;
+        }
+        let input_phase = input.arg();
+        let expected =
+            2.0 * PI * bin as f32 * COLORIZER_HOP_SIZE as f32 / COLORIZER_FFT_SIZE as f32;
+        let propagated = wrap_phase(channel.phase[bin] + expected);
+        let fresh = (filtered / (held + 1e-20)).clamp(0.0, 1.0);
+        let phase_vector = Complex32::from_polar(fresh, input_phase)
+            + Complex32::from_polar(1.0 - fresh, propagated);
+        let phase = if phase_vector.norm_sqr() > 1e-12 {
+            phase_vector.arg()
+        } else {
+            propagated
+        };
+        channel.phase[bin] = wrap_phase(phase);
+        channel.spectrum[bin] = Complex32::from_polar(held, phase);
+        if bin > 0 && bin < COLORIZER_FFT_SIZE / 2 {
+            channel.spectrum[COLORIZER_FFT_SIZE - bin] = channel.spectrum[bin].conj();
+        }
+    }
+    inverse.process_with_scratch(&mut channel.spectrum, &mut channel.scratch);
+    let normalization = 1.0 / (COLORIZER_FFT_SIZE as f32 * 1.5);
+    for index in 0..COLORIZER_FFT_SIZE {
+        let output_index = (ring_position + index) % COLORIZER_FFT_SIZE;
+        channel.ola_ring[output_index] +=
+            channel.spectrum[index].re * window[index] * normalization;
+    }
+    for (index, value) in meter.iter_mut().enumerate() {
+        let frequency = colorizer_meter_frequency(index);
+        let bin = ((frequency * COLORIZER_FFT_SIZE as f32 / sample_rate).round() as usize)
+            .min(COLORIZER_BINS - 1);
+        let amplitude = channel.held[bin] * (2.0 / COLORIZER_FFT_SIZE as f32);
+        *value += amplitude.max(0.0).sqrt().min(1.0);
+    }
+}
+
+#[inline(always)]
+fn colorizer_meter_frequency(index: usize) -> f32 {
+    40.0 * (12_000.0_f32 / 40.0).powf(index as f32 / (COLORIZER_METER_BINS - 1) as f32)
+}
+
+#[inline(always)]
+fn wrap_phase(phase: f32) -> f32 {
+    (phase + PI).rem_euclid(2.0 * PI) - PI
+}
+
 pub fn create_effect(spec: &EffectSpec, sr: f32) -> Option<Box<dyn DspEffect>> {
     if spec.kind.starts_with("vst3:") || spec.kind.starts_with("clap:") {
         return super::plugin::create_external_effect(spec, sr);
@@ -1879,6 +3970,13 @@ pub fn create_effect(spec: &EffectSpec, sr: f32) -> Option<Box<dyn DspEffect>> {
         "builtin:waveshaper" => Box::new(Waveshaper::new()),
         "builtin:distortion" => Box::new(Distortion::new()),
         "builtin:disperser" => Box::new(Disperser::new()),
+        "builtin:mastering-limiter" => Box::new(MasteringLimiter::new()),
+        "builtin:vocoder" => Box::new(Vocoder::new()),
+        "builtin:lfo-tremolo" => Box::new(LfoTremolo::new()),
+        "builtin:clipper" => Box::new(Clipper::new()),
+        "builtin:upward-compressor" => Box::new(UpwardCompressor::new()),
+        "builtin:roboter" => Box::new(Roboter::new()),
+        "builtin:resonator" => Box::new(Colorizer::new()),
         _ => return None,
     };
     fx.prepare(sr, MAX_BLOCK_SIZE, MAX_CHANNELS);
@@ -1919,6 +4017,64 @@ fn kind_from_value(v: f32) -> FilterKind {
         5 => FilterKind::Notch,
         _ => FilterKind::Bell,
     }
+}
+#[inline(always)]
+fn amplitude_to_db(value: f32) -> f32 {
+    20.0 * value.max(1e-6).log10()
+}
+#[inline(always)]
+fn power_to_lufs(power: f64) -> f32 {
+    if power <= 1e-12 {
+        -120.0
+    } else {
+        (-0.691 + 10.0 * power.log10()) as f32
+    }
+}
+fn integrated_lufs(blocks: &[f32], count: usize) -> f32 {
+    let absolute_energy = 10.0_f32.powf((-70.0 + 0.691) / 10.0);
+    let mut absolute_sum = 0.0_f64;
+    let mut absolute_count = 0_usize;
+    for &energy in blocks.iter().take(count) {
+        if energy >= absolute_energy {
+            absolute_sum += f64::from(energy);
+            absolute_count += 1;
+        }
+    }
+    if absolute_count == 0 {
+        return -120.0;
+    }
+    let ungated = absolute_sum / absolute_count as f64;
+    let relative_energy = (ungated * 0.1) as f32;
+    let mut gated_sum = 0.0_f64;
+    let mut gated_count = 0_usize;
+    for &energy in blocks.iter().take(count) {
+        if energy >= absolute_energy.max(relative_energy) {
+            gated_sum += f64::from(energy);
+            gated_count += 1;
+        }
+    }
+    if gated_count == 0 {
+        -120.0
+    } else {
+        power_to_lufs(gated_sum / gated_count as f64)
+    }
+}
+#[inline(always)]
+fn interpolated_peak(history: [f32; 4], factor: usize) -> f32 {
+    let mut peak = history[1].abs().max(history[2].abs());
+    for phase in 1..factor {
+        peak = peak.max(
+            catmull(
+                history[0],
+                history[1],
+                history[2],
+                history[3],
+                phase as f32 / factor as f32,
+            )
+            .abs(),
+        )
+    }
+    peak
 }
 fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     0.5 * ((2.0 * p1)
@@ -2017,6 +4173,21 @@ fn shape(curve: Curve, x: f32) -> f32 {
     }
 }
 #[inline(always)]
+fn clipper_curve(input: f32, knee: f32) -> f32 {
+    let knee = knee.clamp(0.0, 1.0);
+    if knee <= 1e-5 {
+        return input.clamp(-1.0, 1.0);
+    }
+    let sign = input.signum();
+    let magnitude = input.abs();
+    let start = 1.0 - knee;
+    if magnitude <= start {
+        input
+    } else {
+        sign * (start + knee * ((magnitude - start) / knee).tanh())
+    }
+}
+#[inline(always)]
 fn fir_read(history: &[f32; 15], position: usize) -> f32 {
     const TAPS: [(usize, f32); 9] = [
         (0, -0.001682),
@@ -2110,7 +4281,7 @@ mod tests {
         let mut buffer = AudioBuffer::new();
         buffer.channels[0][0] = 1.0;
         buffer.channels[1][0] = -1.0;
-        effect.process(&mut buffer, 1);
+        effect.process(&[], &mut buffer, 1);
         assert!(buffer.channels[0][0].abs() < 1e-6);
         assert!(buffer.channels[1][0].abs() < 1e-6)
     }
@@ -2127,7 +4298,7 @@ mod tests {
         buffer.channels[1][..MAX_BLOCK_SIZE].fill(0.25);
         detector.channels[0][..MAX_BLOCK_SIZE].fill(1.0);
         detector.channels[1][..MAX_BLOCK_SIZE].fill(1.0);
-        effect.process_with_sidechain(&mut buffer, Some(&detector), MAX_BLOCK_SIZE);
+        effect.process_with_sidechain(&[], &mut buffer, Some(&detector), MAX_BLOCK_SIZE);
         assert!(buffer.channels[0][MAX_BLOCK_SIZE - 1] < 0.1)
     }
     #[test]
@@ -2140,7 +4311,7 @@ mod tests {
             buffer.channels[0][frame] = sample;
             buffer.channels[1][frame] = sample;
         }
-        effect.process(&mut buffer, MAX_BLOCK_SIZE);
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
         assert!(buffer
             .channels
             .iter()
@@ -2172,7 +4343,7 @@ mod tests {
                 buffer.channels[0][frame] = sample;
                 buffer.channels[1][frame] = sample;
             }
-            effect.process(&mut buffer, MAX_BLOCK_SIZE);
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
             assert!(buffer
                 .channels
                 .iter()
@@ -2226,7 +4397,7 @@ mod tests {
         let mut buffer = AudioBuffer::new();
         buffer.channels[0][0] = 1.0;
         buffer.channels[1][0] = 1.0;
-        effect.process(&mut buffer, MAX_BLOCK_SIZE);
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
         assert!(buffer
             .channels
             .iter()
@@ -2237,7 +4408,7 @@ mod tests {
         let mut dry = AudioBuffer::new();
         dry.channels[0][0] = 0.25;
         dry.channels[1][0] = -0.25;
-        effect.process(&mut dry, 1);
+        effect.process(&[], &mut dry, 1);
         assert_eq!(dry.channels[0][0], 0.25);
         assert_eq!(dry.channels[1][0], -0.25)
     }
@@ -2255,7 +4426,7 @@ mod tests {
                 buffer.channels[0][frame] = sample;
                 buffer.channels[1][frame] = sample;
             }
-            effect.process(&mut buffer, MAX_BLOCK_SIZE);
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
             let spectrum = effect.effect_spectrum().expect("effect spectrum");
             assert!(spectrum.iter().all(|value| value.is_finite()));
             assert!(spectrum.iter().any(|value| *value > 0.0));
@@ -2296,6 +4467,515 @@ mod tests {
                 .map(|(offset, coefficient)| history[(position + 15 - offset) % 15] * coefficient)
                 .sum::<f32>();
             assert!((fir_read(&history, position) - reference).abs() < 1e-6)
+        }
+    }
+    #[test]
+    fn clean_limiter_respects_sample_ceiling_and_reports_loudness() {
+        let mut limiter = MasteringLimiter::new();
+        limiter.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        limiter.set_param("outputDb", -1.0);
+        let ceiling = db_to_gain(-1.0) + 1e-5;
+        let mut saw_audio = false;
+        let mut reconstruction = [[0.0_f32; 4]; MAX_CHANNELS];
+        for block in 0..220 {
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let sample_index = block * MAX_BLOCK_SIZE + frame;
+                let sample = (2.0 * PI * 997.0 * sample_index as f32 / 48_000.0).sin() * 1.8;
+                buffer.channels[0][frame] = sample;
+                buffer.channels[1][frame] = sample;
+            }
+            limiter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for frame in 0..MAX_BLOCK_SIZE {
+                for channel in 0..MAX_CHANNELS {
+                    let sample = buffer.channels[channel][frame];
+                    assert!(sample.is_finite());
+                    assert!(sample.abs() <= ceiling);
+                    reconstruction[channel].rotate_left(1);
+                    reconstruction[channel][3] = sample;
+                    let reconstructed = interpolated_peak(reconstruction[channel], 4);
+                    assert!(
+                        reconstructed <= ceiling + 0.001,
+                        "true peak {reconstructed} exceeded ceiling {ceiling}"
+                    );
+                    saw_audio |= sample.abs() > 0.1;
+                }
+            }
+        }
+        assert!(saw_audio);
+        let metrics = limiter.limiter_metrics().expect("limiter meters");
+        assert!(metrics.iter().all(|value| value.is_finite()));
+        assert!(metrics[2] > 0.0);
+        assert!(metrics[4] > -120.0)
+    }
+    #[test]
+    fn vocoder_uses_external_modulator_and_stays_finite() {
+        let mut vocoder = Vocoder::new();
+        vocoder.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        vocoder.set_param("source", 0.0);
+        let mut energy = 0.0_f32;
+        for block in 0..24 {
+            let mut carrier = AudioBuffer::new();
+            let mut modulator = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let index = block * MAX_BLOCK_SIZE + frame;
+                let c = (2.0 * PI * 220.0 * index as f32 / 48_000.0).sin() * 0.7;
+                let m = (2.0 * PI * 440.0 * index as f32 / 48_000.0).sin() * 0.8;
+                carrier.channels[0][frame] = c;
+                carrier.channels[1][frame] = c;
+                modulator.channels[0][frame] = m;
+                modulator.channels[1][frame] = m;
+            }
+            vocoder.process_with_sidechain(&[], &mut carrier, Some(&modulator), MAX_BLOCK_SIZE);
+            for sample in carrier
+                .channels
+                .iter()
+                .flat_map(|channel| &channel[..MAX_BLOCK_SIZE])
+            {
+                assert!(sample.is_finite());
+                energy += sample * sample;
+            }
+        }
+        assert!(energy > 1e-6)
+    }
+    #[test]
+    fn tremolo_modulates_volume_and_pan_without_non_finite_samples() {
+        let mut tremolo = LfoTremolo::new();
+        tremolo.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        tremolo.set_param("volumeDepth", 1.0);
+        tremolo.set_param("panDepth", 1.0);
+        tremolo.set_param("rateHz", 10.0);
+        let mut minimum = f32::MAX;
+        let mut maximum = f32::MIN;
+        for _ in 0..32 {
+            let mut buffer = AudioBuffer::new();
+            buffer.channels[0][..MAX_BLOCK_SIZE].fill(0.5);
+            buffer.channels[1][..MAX_BLOCK_SIZE].fill(0.5);
+            tremolo.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for sample in buffer
+                .channels
+                .iter()
+                .flat_map(|channel| &channel[..MAX_BLOCK_SIZE])
+            {
+                assert!(sample.is_finite());
+                minimum = minimum.min(*sample);
+                maximum = maximum.max(*sample);
+            }
+        }
+        assert!(maximum - minimum > 0.2)
+    }
+    #[test]
+    fn clipper_limits_peaks_and_publishes_realtime_flow() {
+        let mut clipper = Clipper::new();
+        clipper.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        clipper.set_param("inputDb", 0.0);
+        clipper.set_param("outputDb", -1.0);
+        let mut maximum = 0.0_f32;
+        for block in 0..8 {
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let index = block * MAX_BLOCK_SIZE + frame;
+                let sample = (2.0 * PI * 997.0 * index as f32 / 48_000.0).sin() * 2.0;
+                buffer.channels[0][frame] = sample;
+                buffer.channels[1][frame] = sample;
+            }
+            clipper.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for sample in buffer
+                .channels
+                .iter()
+                .flat_map(|channel| &channel[..MAX_BLOCK_SIZE])
+            {
+                assert!(sample.is_finite());
+                maximum = maximum.max(sample.abs())
+            }
+        }
+        assert!(maximum <= 1.0);
+        let flow = clipper.effect_spectrum().expect("clipper peak flow");
+        assert!(flow.iter().all(|value| value.is_finite()));
+        assert!(flow.iter().any(|value| *value > 1.0));
+        assert_eq!(clipper_curve(4.0, 0.0), 1.0)
+    }
+    #[test]
+    fn upward_compressor_lifts_quiet_material_without_non_finite_samples() {
+        let mut compressor = UpwardCompressor::new();
+        compressor.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        compressor.set_param("threshold", -24.0);
+        compressor.set_param("rangeDb", 18.0);
+        compressor.set_param("attackMs", 1.0);
+        let mut input_energy = 0.0_f32;
+        let mut output_energy = 0.0_f32;
+        for block in 0..40 {
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let index = block * MAX_BLOCK_SIZE + frame;
+                let sample = (2.0 * PI * 220.0 * index as f32 / 48_000.0).sin() * 0.01;
+                buffer.channels[0][frame] = sample;
+                buffer.channels[1][frame] = sample;
+                if block > 20 {
+                    input_energy += sample * sample * 2.0
+                }
+            }
+            compressor.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            if block > 20 {
+                for sample in buffer
+                    .channels
+                    .iter()
+                    .flat_map(|channel| &channel[..MAX_BLOCK_SIZE])
+                {
+                    assert!(sample.is_finite());
+                    output_energy += sample * sample
+                }
+            }
+        }
+        assert!(output_energy > input_energy * 2.0)
+    }
+    #[test]
+    fn roboter_yin_detects_sine_and_saw_within_one_cent() {
+        let sample_rate = 24_000.0;
+        for frequency in [82.41_f32, 440.0, 987.77] {
+            for saw in [false, true] {
+                let frame = std::array::from_fn(|index| {
+                    let phase = frequency * index as f32 / sample_rate;
+                    if saw {
+                        (phase.fract() * 2.0 - 1.0) * 0.35
+                    } else {
+                        (2.0 * PI * phase).sin() * 0.35
+                    }
+                });
+                let estimate = yin_pitch(&frame, sample_rate);
+                let error_cents = 1200.0 * (estimate.frequency / frequency).log2();
+                assert!(
+                    estimate.voiced,
+                    "frequency={frequency} saw={saw} confidence={}",
+                    estimate.confidence
+                );
+                let tolerance = if (frequency - 440.0).abs() < 0.01 {
+                    1.0
+                } else {
+                    3.0
+                };
+                assert!(
+                    error_cents.abs() <= tolerance,
+                    "frequency={frequency} saw={saw} pitch={} error={error_cents} cents",
+                    estimate.frequency
+                )
+            }
+        }
+    }
+    #[test]
+    fn roboter_key_profiles_identify_transposed_major_and_minor() {
+        for (root, minor) in [(0, false), (7, false), (9, true), (3, true)] {
+            let profile = if minor { MINOR_PROFILE } else { MAJOR_PROFILE };
+            let mut histogram = [0.0_f32; 12];
+            for pitch_class in 0..12 {
+                histogram[(root + pitch_class) % 12] = profile[pitch_class]
+            }
+            let (detected_root, detected_minor, best, second) = match_key(&histogram);
+            assert_eq!((detected_root, detected_minor), (root, minor));
+            assert!(best > second)
+        }
+    }
+    #[test]
+    fn roboter_key_hysteresis_rejects_marginal_mid_phrase_change() {
+        let mut roboter = Roboter::new();
+        roboter.key_valid = true;
+        roboter.key_root = 0;
+        roboter.key_minor = false;
+        roboter.chroma_weight = 100.0;
+        let mut marginal = None;
+        for step in 50..100 {
+            let blend = step as f32 / 100.0;
+            let histogram = std::array::from_fn(|pitch_class| {
+                MAJOR_PROFILE[pitch_class] * (1.0 - blend)
+                    + MAJOR_PROFILE[(pitch_class + 12 - 7) % 12] * blend
+            });
+            let (root, minor, best, _) = match_key(&histogram);
+            let current = key_profile_score(&histogram, 0, false);
+            if root == 7 && !minor && best <= current + 0.08 {
+                marginal = Some(histogram);
+                break;
+            }
+        }
+        let histogram = marginal.expect("a marginal C-to-G candidate");
+        roboter.chroma_histogram = histogram;
+        roboter.refresh_key_estimate();
+        assert_eq!((roboter.key_root, roboter.key_minor), (0, false));
+
+        roboter.chroma_histogram =
+            std::array::from_fn(|pitch_class| MAJOR_PROFILE[(pitch_class + 12 - 7) % 12]);
+        roboter.refresh_key_estimate();
+        assert_eq!((roboter.key_root, roboter.key_minor), (7, false))
+    }
+    #[test]
+    fn roboter_diatonic_intervals_follow_scale_and_leading_tone_exception() {
+        for root in 0..12 {
+            for minor in [false, true] {
+                let scale = if minor { &MINOR_SCALE } else { &MAJOR_SCALE };
+                let tonic = 60 + root as i32;
+                for degree in 0..7 {
+                    let lead = tonic + scale[degree];
+                    let down_third = diatonic_harmony_note(lead, degree, 1, root, minor);
+                    let up_third = diatonic_harmony_note(lead, degree, 2, root, minor);
+                    assert!([3, 4].contains(&(lead - down_third)));
+                    assert!([3, 4].contains(&(up_third - lead)));
+                    for harmony in 1..ROBOTER_HARMONY_COUNT {
+                        let note = diatonic_harmony_note(lead, degree, harmony, root, minor);
+                        assert!(scale.contains(&((note - root as i32).rem_euclid(12))))
+                    }
+                }
+                if !minor {
+                    let leading = tonic + MAJOR_SCALE[6];
+                    let upper = diatonic_harmony_note(leading, 6, 4, root, false);
+                    assert_eq!(upper - leading, 8)
+                }
+            }
+        }
+    }
+    #[test]
+    fn roboter_reports_and_realizes_common_dry_latency() {
+        let mut roboter = Roboter::new();
+        roboter.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        roboter.set_param("amount", 0.0);
+        let expected = roboter.latency_samples();
+        let mut observed = None;
+        let blocks = expected.div_ceil(MAX_BLOCK_SIZE) + 2;
+        for block in 0..blocks {
+            let mut buffer = AudioBuffer::new();
+            if block == 0 {
+                buffer.channels[0][0] = 1.0;
+                buffer.channels[1][0] = 1.0
+            }
+            roboter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for frame in 0..MAX_BLOCK_SIZE {
+                if buffer.channels[0][frame].abs() > 0.9 {
+                    observed = Some(block * MAX_BLOCK_SIZE + frame);
+                    break;
+                }
+            }
+        }
+        assert_eq!(observed, Some(expected));
+        assert!(roboter.tail_samples() >= (48_000.0 * 0.06) as usize)
+    }
+    #[test]
+    fn roboter_harmony_changes_fade_and_processing_stays_finite() {
+        let mut roboter = Roboter::new();
+        roboter.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        roboter.set_param("amount", 1.0);
+        let mut energy = 0.0_f32;
+        let mut maximum_jump = 0.0_f32;
+        let mut previous = [0.0_f32; MAX_CHANNELS];
+        let delay_capacity = roboter.delay[0].capacity();
+        let history_capacity = roboter.chroma_history.capacity();
+        for block in 0..72 {
+            if block == 32 {
+                roboter.set_param("number", 5.0)
+            }
+            if block == 56 {
+                roboter.set_param("number", 0.0)
+            }
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let index = block * MAX_BLOCK_SIZE + frame;
+                let sample = (2.0 * PI * 445.0 * index as f32 / 48_000.0).sin() * 0.3;
+                buffer.channels[0][frame] = sample;
+                buffer.channels[1][frame] = sample;
+            }
+            roboter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for channel in 0..MAX_CHANNELS {
+                for sample in &buffer.channels[channel][..MAX_BLOCK_SIZE] {
+                    assert!(sample.is_finite());
+                    energy += sample * sample;
+                    maximum_jump = maximum_jump.max((*sample - previous[channel]).abs());
+                    previous[channel] = *sample
+                }
+            }
+        }
+        assert!(energy > 1.0);
+        assert!(roboter.voiced);
+        assert!((roboter.voices[0].target_ratio - 1.0).abs() > 0.001);
+        assert!(maximum_jump < 0.7, "sample discontinuity {maximum_jump}");
+        assert_eq!(roboter.delay[0].capacity(), delay_capacity);
+        assert_eq!(roboter.chroma_history.capacity(), history_capacity)
+    }
+    #[test]
+    fn colorizer_reports_and_realizes_exact_latency() {
+        let mut effect = Colorizer::new();
+        effect.set_param("mix", 0.0);
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        let mut observed = None;
+        for block in 0..6 {
+            let mut buffer = AudioBuffer::new();
+            if block == 0 {
+                buffer.channels[0][0] = 1.0;
+                buffer.channels[1][0] = 1.0;
+            }
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            for frame in 0..MAX_BLOCK_SIZE {
+                if buffer.channels[0][frame].abs() > 0.99 {
+                    observed = Some(block * MAX_BLOCK_SIZE + frame);
+                    break;
+                }
+            }
+        }
+        assert_eq!(effect.latency_samples(), COLORIZER_FFT_SIZE);
+        assert_eq!(observed, Some(COLORIZER_FFT_SIZE))
+    }
+    #[test]
+    fn colorizer_hann_cola_reconstructs_below_minus_60_db() {
+        let mut effect = Colorizer::new();
+        effect.set_param("depth", 0.0);
+        effect.set_param("decay", 0.0);
+        effect.set_param("mix", 1.0);
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        let total = COLORIZER_FFT_SIZE + COLORIZER_HOP_SIZE * 12;
+        let input: Vec<f32> = (0..total)
+            .map(|sample| {
+                let time = sample as f32 / 48_000.0;
+                (2.0 * PI * 173.0 * time).sin() * 0.23
+                    + (2.0 * PI * 997.0 * time).sin() * 0.17
+                    + (2.0 * PI * 4_123.0 * time).sin() * 0.09
+            })
+            .collect();
+        let mut output = Vec::with_capacity(total);
+        for start in (0..total).step_by(MAX_BLOCK_SIZE) {
+            let frames = (total - start).min(MAX_BLOCK_SIZE);
+            let mut buffer = AudioBuffer::new();
+            buffer.channels[0][..frames].copy_from_slice(&input[start..start + frames]);
+            buffer.channels[1][..frames].copy_from_slice(&input[start..start + frames]);
+            effect.process(&[], &mut buffer, frames);
+            output.extend_from_slice(&buffer.channels[0][..frames]);
+        }
+        let start = COLORIZER_FFT_SIZE + COLORIZER_HOP_SIZE * 3;
+        let mut signal = 0.0_f64;
+        let mut error = 0.0_f64;
+        for index in start..total {
+            let expected = input[index - COLORIZER_FFT_SIZE];
+            signal += f64::from(expected * expected);
+            let delta = output[index] - expected;
+            error += f64::from(delta * delta);
+        }
+        let relative_db = 10.0 * (error.max(1e-30) / signal.max(1e-30)).log10();
+        assert!(
+            relative_db < -60.0,
+            "COLA reconstruction error {relative_db:.1} dB"
+        )
+    }
+    #[test]
+    fn colorizer_mask_tracks_pitch_classes_across_octaves() {
+        let mut effect = Colorizer::new();
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        effect.set_param("depth", 1.0);
+        effect.set_param("resonance", 0.9);
+        for pitch in 0..12 {
+            effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
+        }
+        effect.rebuild_mask();
+        for frequency in [65.406_f32, 130.813, 261.626, 523.251, 1046.502] {
+            let bin = (frequency * COLORIZER_FFT_SIZE as f32 / 48_000.0).round() as usize;
+            assert!(
+                effect.mask_target[bin] > 0.72,
+                "C octave {frequency} Hz was closed"
+            )
+        }
+        let off_bin = (369.994 * COLORIZER_FFT_SIZE as f32 / 48_000.0).round() as usize;
+        assert!(effect.mask_target[off_bin] < 0.2)
+    }
+    #[test]
+    fn colorizer_decay_is_finite_and_midi_gate_closes_without_notes() {
+        let mut effect = Colorizer::new();
+        effect.set_param("decay", 1.0);
+        effect.set_param("depth", 1.0);
+        effect.set_param("mix", 1.0);
+        effect.set_param("midi", 1.0);
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        assert!(effect.wants_midi());
+        effect.rebuild_mask();
+        assert!(effect.mask_target.iter().all(|gain| *gain == 0.0));
+        let event = NoteEvent {
+            sample_offset: 0,
+            kind: NoteEventKind::NoteOn {
+                note_id: 1,
+                pitch: 60,
+                velocity: 1.0,
+                tuning_cents: 0.0,
+            },
+        };
+        let mut energy = 0.0_f64;
+        for block in 0..20 {
+            let mut buffer = AudioBuffer::new();
+            if block == 0 {
+                buffer.channels[0][COLORIZER_HOP_SIZE / 2] = 1.0;
+                buffer.channels[1][COLORIZER_HOP_SIZE / 2] = 1.0;
+                effect.process(&[event], &mut buffer, MAX_BLOCK_SIZE);
+            } else {
+                effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            }
+            for sample in &buffer.channels[0][..MAX_BLOCK_SIZE] {
+                assert!(sample.is_finite());
+                energy += f64::from(sample * sample);
+            }
+        }
+        assert_eq!(effect.midi_mask, 1);
+        assert!(energy.is_finite());
+        assert!(effect.decay_coefficient() < 1.0)
+    }
+    #[test]
+    fn colorizer_held_phase_is_stable_and_realtime_buffers_do_not_grow() {
+        let mut effect = Colorizer::new();
+        effect.set_param("decay", 0.88);
+        effect.set_param("depth", 0.0);
+        effect.set_param("mix", 1.0);
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        let capacities: [(usize, usize, usize, usize, usize); MAX_CHANNELS] =
+            std::array::from_fn(|channel| {
+                (
+                    effect.channels[channel].input_ring.capacity(),
+                    effect.channels[channel].ola_ring.capacity(),
+                    effect.channels[channel].spectrum.capacity(),
+                    effect.channels[channel].scratch.capacity(),
+                    effect.channels[channel].held.capacity(),
+                )
+            });
+        let mut output = Vec::new();
+        for block in 0..20 {
+            let mut buffer = AudioBuffer::new();
+            if block < 8 {
+                for frame in 0..MAX_BLOCK_SIZE {
+                    let sample = block * MAX_BLOCK_SIZE + frame;
+                    let value = (2.0 * PI * 440.0 * sample as f32 / 48_000.0).sin() * 0.3;
+                    buffer.channels[0][frame] = value;
+                    buffer.channels[1][frame] = value;
+                }
+            }
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            output.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
+        }
+        let tail_start = COLORIZER_FFT_SIZE + 8 * MAX_BLOCK_SIZE + COLORIZER_HOP_SIZE;
+        let period = (48_000.0_f32 / 445.3125).round() as usize;
+        let mut correlation = 0.0_f64;
+        let mut left_energy = 0.0_f64;
+        let mut right_energy = 0.0_f64;
+        for index in tail_start..output.len() - period {
+            correlation += f64::from(output[index] * output[index + period]);
+            left_energy += f64::from(output[index] * output[index]);
+            right_energy += f64::from(output[index + period] * output[index + period]);
+        }
+        let normalized = correlation / (left_energy * right_energy).sqrt().max(1e-20);
+        assert!(
+            normalized > 0.9,
+            "unstable held phase correlation {normalized:.3}"
+        );
+        for channel in 0..MAX_CHANNELS {
+            assert_eq!(
+                capacities[channel],
+                (
+                    effect.channels[channel].input_ring.capacity(),
+                    effect.channels[channel].ola_ring.capacity(),
+                    effect.channels[channel].spectrum.capacity(),
+                    effect.channels[channel].scratch.capacity(),
+                    effect.channels[channel].held.capacity(),
+                )
+            )
         }
     }
 }

@@ -21,6 +21,17 @@ project rebuild path.
 - Timeline canvases cap device pixel ratio at 1.5, redraw only the visible
   horizontal region, cull off-screen clips, and coalesce scroll drawing to one
   animation frame per lane.
+- Extended timelines cap each backing canvas at 30,000 horizontal pixels while
+  retaining the full CSS/time coordinate space, avoiding browser canvas-size
+  failures and unbounded per-track bitmap allocation at extreme zoom levels.
+- Clip-gain and fade edits redraw waveform amplitude at most once per animation
+  frame. Only visible waveform columns are traversed; gain nodes are sorted once
+  per clip, sampled with a forward cursor, and converted through a 0.1 dB lookup
+  table instead of repeated exponentiation.
+- Arrangement scrolling uses one shared listener. Vertical-only movement stays
+  entirely on the compositor; track canvases are invalidated only when the
+  horizontal time window changes, avoiding the former listener/redraw fan-out
+  across every track.
 - The piano roll uses separate grid, note, gesture, and velocity Canvas layers.
   Sorted notes enter the visible range through binary search; drag previews stay
   transient, and multi-note move/resize/quantize operations commit as one batch

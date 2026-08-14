@@ -10,6 +10,7 @@ import type {
   GraphSnapshot,
   Level,
   MultibandLevels,
+  LimiterMetrics,
   DistortionSpectrum,
   OfflineRenderRequest,
   OfflineRenderResult,
@@ -17,6 +18,7 @@ import type {
   ProjectState,
   StreamStatus,
   ExportProgress,
+  ExportSettings,
 } from './types'
 
 export interface IAudioEngine {
@@ -24,7 +26,7 @@ export interface IAudioEngine {
   dispose(): Promise<void>
   loadAudioFile(path: string): Promise<AudioAssetInfo>
   unloadAsset(assetId: string): Promise<void>
-  exportProject(project: ProjectState, outputPath: string): Promise<void>
+  exportProject(project: ProjectState, outputPath: string, settings?: ExportSettings): Promise<void>
   cancelExport(): void
   onExportProgress(cb: (progress: ExportProgress | null) => void): () => void
   syncGraph(snapshot: GraphSnapshot): Promise<void>
@@ -53,6 +55,7 @@ export interface IAudioEngine {
   getTrackLevel(trackId: string): Level
   getMasterLevel(): Level
   getMultibandLevels(effectId: string): MultibandLevels
+  getLimiterMetrics(effectId: string): LimiterMetrics
   getEffectSpectrum(effectId: string): DistortionSpectrum
   getDistortionSpectrum(effectId: string): DistortionSpectrum
   listAudioBackends(): Promise<AudioBackendInfo[]>

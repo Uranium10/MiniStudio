@@ -26,6 +26,8 @@ describe('project store performance invariants', () => {
     useProjectStore.getState().updateMasterVolume(-4)
 
     expect(useProjectStore.getState().past).toHaveLength(1)
+    expect(useProjectStore.getState().history).toHaveLength(1)
+    expect(useProjectStore.getState().history[0]?.timestamp).toBeTypeOf('number')
     useProjectStore.getState().undo()
     expect(useProjectStore.getState().project.master.volumeDb).toBe(initial)
   })

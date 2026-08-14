@@ -4,6 +4,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { Inspector } from './components/Inspector'
 import { AudioSettingsDialog } from './components/AudioSettingsDialog'
 import { BrowserPanel } from './components/BrowserPanel'
+import { ExportDialog } from './components/ExportDialog'
 import { LowerPanel } from './components/LowerPanel'
 import { MissingAssetsDialog } from './components/MissingAssetsDialog'
 import { PianoRollPanel } from './components/PianoRollPanel'
@@ -27,6 +28,7 @@ export default function App() {
   const pianoRollHeight = useProjectStore((state) => state.pianoRollHeight)
   const inspectorVisible = useProjectStore((state) => state.inspectorVisible)
   const browserVisible = useProjectStore((state) => state.browserVisible)
+  const browserDock = useProjectStore((state) => state.browserDock)
   const toast = useProjectStore((state) => state.toast)
   useShortcuts()
 
@@ -71,14 +73,19 @@ export default function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
+    let dragPaths: string[] = []
+    const logical = (value: number) => value / Math.max(1, window.devicePixelRatio || 1)
     void getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type !== 'drop') return
-      for (const path of event.payload.paths.filter((candidate) => /\.(wav|mp3|flac|ogg|m4a)$/i.test(candidate))) {
-        void engine.loadAudioFile(path).then((asset) => useProjectStore.getState().addAssetAsTrack(asset)).catch(() => useProjectStore.getState().showToast('드롭한 오디오를 읽을 수 없습니다'))
-      }
+      const payload = event.payload
+      if (payload.type === 'enter') dragPaths = payload.paths.filter((candidate) => /\.(wav|mp3|flac|ogg|m4a|aac)$/i.test(candidate))
+      if (payload.type === 'leave') { dragPaths = []; window.dispatchEvent(new CustomEvent('minidaw-native-audio-drag', { detail: { type: 'leave' } })); return }
+      if (payload.type !== 'over' && payload.type !== 'drop' && payload.type !== 'enter') return
+      const paths = payload.type === 'drop' ? payload.paths.filter((candidate) => /\.(wav|mp3|flac|ogg|m4a|aac)$/i.test(candidate)) : dragPaths
+      window.dispatchEvent(new CustomEvent('minidaw-native-audio-drag', { detail: { type: payload.type, paths, x: logical(payload.position.x), y: logical(payload.position.y) } }))
+      if (payload.type === 'drop') dragPaths = []
     }).then((dispose) => { unlisten = dispose }).catch(() => { /* Browser preview has no Tauri event bridge. */ })
     return () => unlisten?.()
-  }, [engine])
+  }, [])
 
   return (
     <div
@@ -88,16 +95,18 @@ export default function App() {
     >
       <MenuBar />
       <ToolBar />
-      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'} ${browserVisible ? 'browser-visible' : ''}`}>
-        {browserVisible && <BrowserPanel />}
+      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'} ${browserVisible ? 'browser-visible' : ''} browser-${browserDock}`}>
+        {browserVisible && browserDock === 'left' && <BrowserPanel />}
         {inspectorVisible && <Inspector />}
         <Timeline />
+        {browserVisible && browserDock === 'right' && <BrowserPanel />}
       </main>
       <PianoRollPanel />
       <LowerPanel />
       <TransportBar />
       <MissingAssetsDialog />
       <AudioSettingsDialog />
+      <ExportDialog />
       <ShortcutsDialog />
       <VirtualPiano />
       {toast && <button className="toast" type="button" title="클릭하여 닫기" onClick={() => useProjectStore.getState().clearToast()}><span role="status">{toast}</span></button>}
@@ -115,7 +124,11 @@ function automationValueAt(lane: AutomationLane, sec: number): number | null {
   const from = points[right - 1]!
   const to = points[right]!
   const mix = (sec - from.timeSec) / Math.max(0.000_001, to.timeSec - from.timeSec)
-  return from.value + (to.value - from.value) * mix
+  const linearMid = (from.value + to.value) / 2
+  const bend = Math.max(-1, Math.min(1, from.curve ?? 0)) * (lane.max - lane.min) * .35
+  const control = 2 * (linearMid + bend) - .5 * (from.value + to.value)
+  const inverse = 1 - mix
+  return Math.max(lane.min, Math.min(lane.max, inverse * inverse * from.value + 2 * inverse * mix * control + mix * mix * to.value))
 }
 
 /** Read-mode automation. Native smoothers make the 30 fps control stream click-free. */
@@ -135,10 +148,11 @@ function graphStructureSignature(project: ProjectState): string {
   const fields: Array<string | number | boolean> = [project.transport.bpm, project.transport.loop.enabled, project.transport.loop.startSec, project.transport.loop.endSec]
   for (const track of project.tracks) {
     fields.push(track.id, track.kind, track.outputBusId ?? '')
-    for (const clip of track.clips) fields.push(clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec, clip.gainDb, clip.fadeInSec, clip.fadeOutSec, clip.muted ?? false)
+    for (const clip of track.clips) { fields.push(clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec, clip.gainDb, clip.fadeInSec, clip.fadeOutSec, clip.fadeInCurve ?? 0, clip.fadeOutCurve ?? 0, clip.muted ?? false, clip.playbackRate ?? 1, clip.pitchSemitones ?? 0, clip.fineCents ?? 0, clip.reversed ?? false, clip.warpMode ?? 'none', clip.warpSourceBpm ?? project.transport.bpm); for (const point of clip.gainPoints ?? []) fields.push(point.id, point.timeSec, point.valueDb, point.curve ?? 0) }
     for (const clip of track.midiClips) {
       fields.push(clip.id, clip.startSec, clip.durationSec, clip.loopEnabled, clip.loopStartTicks, clip.loopLengthTicks, clip.transposeSemitones, clip.velocityScale, clip.muted)
       for (const note of clip.notes) fields.push(note.id, note.pitch, note.velocity, note.startTicks, note.lengthTicks, note.releaseVelocity, note.muted)
+      for (const lane of clip.ccLanes) { fields.push(lane.cc); for (const point of lane.points) fields.push(point.ticks, point.value) }
     }
     if (track.instrument) fields.push(track.instrument.id, track.instrument.type, track.instrument.bypassed)
     for (const effect of track.effects) fields.push(effect.id, effect.type, effect.bypassed, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '')
