@@ -39,4 +39,18 @@ describe('project store performance invariants', () => {
     expect(useProjectStore.getState().project).toBe(project)
     expect(getProjectSnapshot().transport.playheadSec).toBe(27.5)
   })
+
+  it('updates a clip gain envelope without cloning unrelated tracks or waveform buffers', () => {
+    const before = useProjectStore.getState().project
+    const audioTrack = before.tracks.find((track) => track.kind === 'audio')!
+    const clip = audioTrack.clips[0]!
+    const untouchedTrack = before.tracks.find((track) => track.id !== audioTrack.id)!
+
+    useProjectStore.getState().upsertClipGainPoint(audioTrack.id, clip.id, { timeSec: clip.durationSec / 2, valueDb: -6 })
+    const after = useProjectStore.getState().project
+
+    expect(after.assets).toBe(before.assets)
+    expect(after.tracks.find((track) => track.id === untouchedTrack.id)).toBe(untouchedTrack)
+    expect(after.tracks.find((track) => track.id === audioTrack.id)).not.toBe(audioTrack)
+  })
 })

@@ -28,10 +28,21 @@ use vst3_host::{
     Plugin, Vst3Host,
 };
 
-/// Loaded plugin shared between the command worker and (on macOS) the UI main thread.
-type SharedPlugin = Arc<Mutex<Option<Plugin>>>;
+/// Loaded plug-in shared by the process main/control thread, the realtime
+/// worker and the native editor. The outer slot supports load/unload; the
+/// inner stable `Arc` lets a platform window and the audio worker retain the
+/// exact same instance without holding the slot lock for vendor calls.
+type SharedPlugin = Arc<Mutex<Option<Arc<Mutex<Plugin>>>>>;
 
+#[allow(dead_code)]
 fn main() {
+    run();
+}
+
+/// Run the helper protocol in the current process. Exported through the
+/// library as well so a packaged DAW can re-exec its own signed binary in
+/// helper mode instead of locating a machine-specific sidecar path.
+pub fn run() {
     // Before anything else — certainly before a plugin binary is loaded and can run its own
     // code — take the protocol channel away from stdout. A hosted plugin shares this
     // process's descriptors and third-party plugins do print; on the shared stdout a single
@@ -48,7 +59,12 @@ fn main() {
         macos::run(plugin, protocol);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::run(plugin, protocol);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // No UI run loop needed: process commands on this (main) thread directly.
         let mut protocol = protocol;
@@ -124,20 +140,30 @@ fn handle(
 ) -> HostResponse {
     // Convenience: run a closure against the loaded plugin or report "no plugin".
     fn with<F: FnOnce(&mut Plugin) -> HostResponse>(p: &SharedPlugin, f: F) -> HostResponse {
-        let mut guard = match p.lock() {
+        let instance = match p.lock() {
             Ok(g) => g,
             Err(_) => {
                 return HostResponse::Error {
                     message: "plugin lock poisoned".to_string(),
                 }
             }
-        };
-        match guard.as_mut() {
-            Some(pl) => f(pl),
-            None => HostResponse::Error {
-                message: "No plugin loaded".to_string(),
-            },
         }
+        .as_ref()
+        .cloned();
+        let Some(instance) = instance else {
+            return HostResponse::Error {
+                message: "No plugin loaded".to_string(),
+            };
+        };
+        let mut plugin = match instance.lock() {
+            Ok(plugin) => plugin,
+            Err(_) => {
+                return HostResponse::Error {
+                    message: "plugin instance lock poisoned".to_string(),
+                }
+            }
+        };
+        f(&mut plugin)
     }
 
     match command {
@@ -170,7 +196,7 @@ fn handle(
                     let info = p.info().clone();
                     let compatibility = p.class_compatibility().to_vec();
                     let output_channels = p.output_channel_count() as i32;
-                    *plugin.lock().unwrap() = Some(p);
+                    *plugin.lock().unwrap() = Some(Arc::new(Mutex::new(p)));
                     HostResponse::PluginInfo {
                         vendor: info.vendor,
                         name: info.name,
@@ -631,6 +657,9 @@ fn handle(
         }),
         HostCommand::CreateGui => gui_request(gui, true),
         HostCommand::CloseGui => gui_request(gui, false),
+        HostCommand::AttachRealtime { .. } | HostCommand::DetachRealtime => HostResponse::Error {
+            message: "shared-memory realtime transport is unavailable on this platform".to_string(),
+        },
         HostCommand::Shutdown => HostResponse::Success {
             message: "shutting down".to_string(),
         },
@@ -675,6 +704,189 @@ fn gui_request(gui: Option<&GuiChannel>, open: bool) -> HostResponse {
             message: "Plugin GUI is not supported across process isolation on this platform"
                 .to_string(),
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::*;
+    use std::sync::mpsc;
+    use winapi::um::winuser::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    };
+
+    struct CommandRequest {
+        command: HostCommand,
+        reply: mpsc::SyncSender<HostResponse>,
+    }
+
+    /// Windows VST3 lifecycle and editor calls must stay on the process main
+    /// thread, and that thread must continuously dispatch Win32 messages. A
+    /// reader worker owns stdin/stdout only; it never enters vendor code.
+    pub fn run(plugin: SharedPlugin, mut protocol: ProtocolChannel) {
+        let (command_tx, command_rx) = mpsc::sync_channel::<CommandRequest>(64);
+
+        std::thread::Builder::new()
+            .name("vst3-helper-protocol".into())
+            .spawn(move || {
+                let stdin = io::stdin();
+                for line in stdin.lock().lines() {
+                    let Some(command) = parse_line(line, &mut protocol) else {
+                        continue;
+                    };
+                    if matches!(command, HostCommand::Shutdown) {
+                        eprintln!("Shutting down helper process");
+                        break;
+                    }
+                    let (reply, receive) = mpsc::sync_channel(1);
+                    if command_tx.send(CommandRequest { command, reply }).is_err() {
+                        break;
+                    }
+                    let response = receive.recv().unwrap_or(HostResponse::Error {
+                        message: "helper main thread stopped".to_string(),
+                    });
+                    respond(&mut protocol, &response);
+                }
+                // Dropping the sender is the main loop's shutdown signal.
+            })
+            .expect("failed to spawn VST3 helper protocol thread");
+
+        let mut sample_rate = 44_100.0;
+        let mut editor: Option<vst3_host::PluginWindow> = None;
+        let mut realtime: Option<vst3_host::realtime_ipc::RealtimeServer> = None;
+        loop {
+            match command_rx.recv_timeout(std::time::Duration::from_millis(4)) {
+                Ok(request) => {
+                    let response = match request.command {
+                        HostCommand::CreateGui => open_editor(&plugin, &mut editor),
+                        HostCommand::CloseGui => {
+                            if let Some(mut window) = editor.take() {
+                                window.close();
+                            }
+                            HostResponse::Success {
+                                message: "editor closed".to_string(),
+                            }
+                        }
+                        HostCommand::AttachRealtime { descriptor } => {
+                            realtime.take();
+                            let instance =
+                                plugin.lock().ok().and_then(|slot| slot.as_ref().cloned());
+                            match instance {
+                                Some(instance) => {
+                                    match vst3_host::realtime_ipc::RealtimeServer::attach(
+                                        &descriptor,
+                                        instance,
+                                    ) {
+                                        Ok(server) => {
+                                            realtime = Some(server);
+                                            HostResponse::Success {
+                                                message: "realtime transport attached".to_string(),
+                                            }
+                                        }
+                                        Err(message) => HostResponse::Error { message },
+                                    }
+                                }
+                                None => HostResponse::Error {
+                                    message: "No plugin loaded".to_string(),
+                                },
+                            }
+                        }
+                        HostCommand::DetachRealtime => {
+                            realtime.take();
+                            HostResponse::Success {
+                                message: "realtime transport detached".to_string(),
+                            }
+                        }
+                        HostCommand::UnloadPlugin => {
+                            realtime.take();
+                            handle(HostCommand::UnloadPlugin, &plugin, &mut sample_rate, None)
+                        }
+                        command @ HostCommand::LoadPlugin { .. } if realtime.is_some() => {
+                            realtime.take();
+                            handle(command, &plugin, &mut sample_rate, None)
+                        }
+                        command => handle(command, &plugin, &mut sample_rate, None),
+                    };
+                    let _ = request.reply.send(response);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            if let Some(window) = editor.as_mut() {
+                let _ = window.service_platform_events();
+                if window.closed_by_user() {
+                    window.close();
+                    editor = None;
+                }
+            }
+            if !pump_messages() {
+                break;
+            }
+        }
+        if let Some(mut window) = editor {
+            window.close();
+        }
+        realtime.take();
+        if let Ok(mut slot) = plugin.lock() {
+            slot.take();
+        }
+    }
+
+    fn open_editor(
+        plugin: &SharedPlugin,
+        editor: &mut Option<vst3_host::PluginWindow>,
+    ) -> HostResponse {
+        if editor
+            .as_ref()
+            .is_some_and(vst3_host::PluginWindow::is_open)
+        {
+            let (width, height) = plugin
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().cloned())
+                .and_then(|instance| instance.lock().ok()?.get_editor_size().ok())
+                .unwrap_or((800, 600));
+            return HostResponse::GuiCreated { width, height };
+        }
+        editor.take();
+        let instance = match plugin.lock().ok().and_then(|slot| slot.as_ref().cloned()) {
+            Some(instance) => instance,
+            None => {
+                return HostResponse::Error {
+                    message: "No plugin loaded".to_string(),
+                }
+            }
+        };
+        let (width, height) = instance
+            .lock()
+            .ok()
+            .and_then(|plugin| plugin.get_editor_size().ok())
+            .unwrap_or((800, 600));
+        let mut window = vst3_host::PluginWindow::new(instance);
+        match window.open() {
+            Ok(()) => {
+                *editor = Some(window);
+                HostResponse::GuiCreated { width, height }
+            }
+            Err(error) => HostResponse::Error {
+                message: format!("failed to open isolated editor: {error}"),
+            },
+        }
+    }
+
+    fn pump_messages() -> bool {
+        unsafe {
+            let mut message: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if message.message == WM_QUIT {
+                    return false;
+                }
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        true
     }
 }
 
@@ -786,12 +998,15 @@ mod macos {
         mtm: MainThreadMarker,
         app: &NSApplication,
     ) -> std::result::Result<(Retained<NSWindow>, i32, i32), String> {
-        let mut guard = plugin
+        let instance = plugin
             .lock()
-            .map_err(|_| "plugin lock poisoned".to_string())?;
-        let p = guard
-            .as_mut()
+            .map_err(|_| "plugin slot lock poisoned".to_string())?
+            .as_ref()
+            .cloned()
             .ok_or_else(|| "No plugin loaded".to_string())?;
+        let mut p = instance
+            .lock()
+            .map_err(|_| "plugin instance lock poisoned".to_string())?;
         if !p.has_editor() {
             return Err("Plugin does not have a GUI editor".to_string());
         }
@@ -849,9 +1064,10 @@ mod macos {
     }
 
     fn close_editor_window(plugin: &SharedPlugin, window: Option<Retained<NSWindow>>) {
-        if let Ok(mut guard) = plugin.lock() {
-            if let Some(p) = guard.as_mut() {
-                let _ = p.close_editor();
+        let instance = plugin.lock().ok().and_then(|slot| slot.as_ref().cloned());
+        if let Some(instance) = instance {
+            if let Ok(mut plugin) = instance.lock() {
+                let _ = plugin.close_editor();
             }
         }
         if let Some(w) = window {

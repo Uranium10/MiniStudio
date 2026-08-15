@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { MIDI_PPQ, secondsPerBeat } from '../engine'
 import { createDemoProject } from './demoProject'
 import { automationOptionsForTrack, effectDefaults, useProjectStore } from './projectStore'
 
@@ -105,7 +106,7 @@ describe('multi-track selection and routing', () => {
   })
 
   it('restores a deleted instrument and its plug-in assignment through undo', () => {
-    const id = useProjectStore.getState().addInstrumentTrack({ format: 'vst3', uid: 'test', name: 'Test Instrument', vendor: 'MiniDAW', path: 'test.vst3' })
+    const id = useProjectStore.getState().addInstrumentTrack({ format: 'vst3', uid: 'test', name: 'Test Instrument', vendor: 'MiniStudio', path: 'test.vst3' })
     useProjectStore.getState().removeTrack(id)
     expect(useProjectStore.getState().project.tracks.some((track) => track.id === id)).toBe(false)
     expect(useProjectStore.getState().history.at(-1)?.label).toContain('삭제')
@@ -127,11 +128,40 @@ describe('multi-track selection and routing', () => {
     const track = useProjectStore.getState().project.tracks.find((item) => item.kind === 'instrument')!
     const clipIds = track.midiClips.map((clip) => clip.id)
     const originalType = track.instrument?.type
-    useProjectStore.getState().replaceTrackInstrument(track.id, { format: 'clap', uid: 'replacement', name: 'Replacement', vendor: 'MiniDAW', path: 'replacement.clap' })
+    useProjectStore.getState().replaceTrackInstrument(track.id, { format: 'clap', uid: 'replacement', name: 'Replacement', vendor: 'MiniStudio', path: 'replacement.clap' })
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)?.instrument?.type).toBe('clap:replacement')
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)?.midiClips.map((clip) => clip.id)).toEqual(clipIds)
     useProjectStore.getState().undo()
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)?.instrument?.type).toBe(originalType)
+  })
+
+  it('sizes new MIDI clips from their duration and grows them for out-of-range events', () => {
+    const trackId = useProjectStore.getState().addInstrumentTrack()
+    const bpm = useProjectStore.getState().project.transport.bpm
+    const clipId = useProjectStore.getState().addMidiClip(trackId, 0, 1)!
+    let clip = useProjectStore.getState().project.tracks.find((track) => track.id === trackId)!.midiClips.find((item) => item.id === clipId)!
+    expect(clip.loopLengthTicks).toBe(Math.round(1 / secondsPerBeat(bpm) * MIDI_PPQ))
+
+    const noteEnd = clip.loopLengthTicks + MIDI_PPQ * 2
+    useProjectStore.getState().addMidiNote(trackId, clipId, { pitch: 60, velocity: 100, startTicks: noteEnd - 240, lengthTicks: 240, releaseVelocity: 64, muted: false })
+    clip = useProjectStore.getState().project.tracks.find((track) => track.id === trackId)!.midiClips.find((item) => item.id === clipId)!
+    expect(clip.durationSec).toBeCloseTo(noteEnd / MIDI_PPQ * secondsPerBeat(bpm), 6)
+    expect(clip.loopLengthTicks).toBe(noteEnd)
+
+    useProjectStore.getState().upsertMidiControlPoints(trackId, clipId, 1, [{ ticks: noteEnd + 480, value: 64 }])
+    clip = useProjectStore.getState().project.tracks.find((track) => track.id === trackId)!.midiClips.find((item) => item.id === clipId)!
+    expect(clip.loopLengthTicks).toBe(noteEnd + 481)
+  })
+
+  it('starts the transient shaper neutral with a balanced detector', () => {
+    expect(effectDefaults('builtin:transient-shaper')).toEqual({ attack: 0, sustain: 0, thresholdDb: -36, speed: .5, clip: 0 })
+  })
+
+  it('seeds external rack effects from their published parameter defaults', () => {
+    const track = useProjectStore.getState().project.tracks[0]!
+    useProjectStore.getState().addEffect(track.id, 'vst3:test-effect', { format: 'vst3', uid: 'test-effect', name: 'Test Effect', vendor: 'MiniStudio', path: 'test.vst3', parameters: [{ id: 'macro-1', name: 'Macro 1', module: 'Macros', min: 0, max: 1, defaultValue: .37 }] })
+    const effect = useProjectStore.getState().project.tracks[0]!.effects.at(-1)!
+    expect(effect.params).toEqual({ 'macro-1': .37 })
   })
 
   it('focuses every inserted effect and duplicates its complete state next to the source', () => {

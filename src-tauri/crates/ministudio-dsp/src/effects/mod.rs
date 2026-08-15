@@ -12,5 +12,7 @@ include!("vocoder.rs");
 include!("tremolo.rs");
 include!("clipper.rs");
 include!("upward.rs");
+include!("transient.rs");
 include!("roboter.rs");
 include!("colorizer.rs");
+include!("formant.rs");

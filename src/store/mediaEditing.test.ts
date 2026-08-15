@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import type { AudioAssetInfo } from '../engine'
 import { quantizeInContext } from './commands'
 import { createDemoProject } from './demoProject'
-import { automationOptionsForTrack, clipSourceStep, useProjectStore } from './projectStore'
+import { automationOptionsForTrack, clipSourceStep, snapTicksWithSwing, useProjectStore } from './projectStore'
 
 const asset: AudioAssetInfo = { id: 'drop-asset', path: 'C:\\Samples\\kick.wav', name: 'kick.wav', durationSec: 2, sampleRate: 48_000, numChannels: 2, peaks: new Float32Array([0, .5]) }
 
@@ -39,9 +39,20 @@ describe('media placement and quantize', () => {
     const midi = instrument.midiClips[0]!
     const note = midi.notes[0]!
     store.updateMidiNotes(instrument.id, midi.id, [note.id], { startTicks: 733 })
-    useProjectStore.setState({ editorClip: { trackId: instrument.id, clipId: midi.id }, selectedNoteIds: [note.id], editFocus: 'pianoRoll' })
+    useProjectStore.setState({ editorClip: { trackId: instrument.id, clipId: midi.id }, selectedNoteIds: [note.id], editFocus: 'pianoRoll', pianoGridTicks: 480 })
     quantizeInContext()
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === instrument.id)!.midiClips[0]!.notes.find((item) => item.id === note.id)!.startTicks).toBe(960)
+  })
+
+  it('keeps arrangement and piano-roll quantize settings independent and swings offbeats', () => {
+    const store = useProjectStore.getState()
+    store.setGridTicks(960)
+    store.setPianoGridTicks(240)
+    store.setArrangementSwing(20)
+    store.setPianoSwing(60)
+    expect(useProjectStore.getState()).toMatchObject({ gridTicks: 960, pianoGridTicks: 240, arrangementSwing: 20, pianoSwing: 60 })
+    expect(snapTicksWithSwing(240, 240, 50)).toBe(300)
+    expect(snapTicksWithSwing(480, 240, 50)).toBe(480)
   })
 
   it('keeps the base clip gain permanent while editing removable envelope points', () => {

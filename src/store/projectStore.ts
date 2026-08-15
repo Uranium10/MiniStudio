@@ -40,7 +40,11 @@ type ProjectStore = {
   pianoRollZoom: number
   trackHeight: number
   snapEnabled: boolean
+  pianoSnapEnabled: boolean
   gridTicks: number
+  pianoGridTicks: number
+  arrangementSwing: number
+  pianoSwing: number
   followPlayhead: boolean
   lowerPanelHeight: number
   mixerPanelHeight: number
@@ -179,7 +183,11 @@ type ProjectStore = {
   resizeSelectedTracks(delta: number): void
   resizeAllTracks(delta: number): void
   toggleSnap(): void
+  togglePianoSnap(): void
   setGridTicks(ticks: number): void
+  setPianoGridTicks(ticks: number): void
+  setArrangementSwing(value: number): void
+  setPianoSwing(value: number): void
   toggleFollowPlayhead(): void
   setLowerPanelHeight(value: number): void
   toggleLowerPanel(): void
@@ -194,6 +202,19 @@ type ProjectStore = {
 /** Snap step in seconds for the shared musical grid. */
 export function snapSeconds(gridTicks: number, bpm: number): number {
   return gridTicks / MIDI_PPQ * secondsPerBeat(bpm)
+}
+
+/** Quantize a tick position while delaying every second subdivision by swing %. */
+export function snapTicksWithSwing(ticks: number, gridTicks: number, swing = 0): number {
+  const size = Math.max(1, Math.round(gridTicks))
+  const step = Math.round(ticks / size)
+  const delayed = step % 2 !== 0 ? size * Math.max(0, Math.min(100, swing)) / 200 : 0
+  return Math.max(0, Math.round(step * size + delayed))
+}
+
+export function snapTimeWithSwing(seconds: number, gridTicks: number, bpm: number, swing = 0): number {
+  const ticks = seconds / secondsPerBeat(bpm) * MIDI_PPQ
+  return snapTicksWithSwing(ticks, gridTicks, swing) / MIDI_PPQ * secondsPerBeat(bpm)
 }
 
 export function clipSourceStep(clip: Clip, projectBpm: number): number {
@@ -220,6 +241,20 @@ export function midiDuplicateStepTicks(notes: readonly Pick<MidiNote, 'startTick
   const start = Math.min(...notes.map((note) => note.startTicks))
   const end = Math.max(...notes.map((note) => note.startTicks + note.lengthTicks))
   return musicalDuplicateStepTicks(Math.max(1, end - start), signature)
+}
+
+/**
+ * MIDI edits may extend past the current event edge. Grow the arrangement item
+ * to keep that material visible; explicit arrangement trimming still owns
+ * shrinking behavior.
+ */
+function extendMidiClipToContent(clip: MidiClip, bpm: number): MidiClip {
+  const noteEnd = clip.notes.reduce((end, note) => Math.max(end, note.startTicks + note.lengthTicks), 0)
+  const controllerEnd = clip.ccLanes.reduce((end, lane) => lane.points.reduce((laneEnd, point) => Math.max(laneEnd, point.ticks + 1), end), 0)
+  const contentEnd = Math.max(noteEnd, controllerEnd)
+  const durationTicks = Math.max(1, Math.round(clip.durationSec / secondsPerBeat(bpm) * MIDI_PPQ))
+  if (contentEnd <= durationTicks) return clip
+  return { ...clip, durationSec: contentEnd / MIDI_PPQ * secondsPerBeat(bpm), loopLengthTicks: Math.max(clip.loopLengthTicks, contentEnd) }
 }
 
 // Audio peaks are large immutable Float32Arrays. Project edits clone only the
@@ -295,7 +330,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   const replaceMidiClip = (current: ProjectState, trackIndex: number, clipIndex: number, clip: MidiClip, historyKey = '') => {
     const sourceTrack = current.tracks[trackIndex]!
     const midiClips = sourceTrack.midiClips.slice()
-    midiClips[clipIndex] = clip
+    midiClips[clipIndex] = extendMidiClipToContent(clip, current.transport.bpm)
     const tracks = current.tracks.slice()
     tracks[trackIndex] = { ...sourceTrack, midiClips }
     commitProject(current, { ...current, tracks }, historyKey)
@@ -326,7 +361,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     pianoRollZoom: 66,
     trackHeight: 72,
     snapEnabled: true,
-    gridTicks: 240,
+    pianoSnapEnabled: true,
+    gridTicks: 960,
+    pianoGridTicks: 240,
+    arrangementSwing: 0,
+    pianoSwing: 0,
     followPlayhead: true,
     lowerPanelHeight: 350,
     mixerPanelHeight: 350,
@@ -523,22 +562,41 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     },
     upsertAutomationPoint: (trackId, laneId, point) => {
       const id = point.id ?? crypto.randomUUID()
-      mutateProject((project) => {
-        const lane = project.tracks.find((track) => track.id === trackId)?.automationLanes?.find((item) => item.id === laneId)
-        if (!lane) return
-        const value = Math.max(lane.min, Math.min(lane.max, point.value))
-        const index = lane.points.findIndex((item) => item.id === id)
-        const next = { id, timeSec: Math.max(0, point.timeSec), value, ...(index >= 0 && lane.points[index]!.curve != null ? { curve: lane.points[index]!.curve } : {}) }
-        if (index >= 0) lane.points[index] = next
-        else lane.points.push(next)
-        lane.points.sort((left, right) => left.timeSec - right.timeSec)
-      }, { historyKey: `automation:${trackId}:${laneId}:${id}` })
+      const current = get().project
+      const trackIndex = current.tracks.findIndex((track) => track.id === trackId)
+      const track = current.tracks[trackIndex]
+      const laneIndex = track?.automationLanes?.findIndex((item) => item.id === laneId) ?? -1
+      if (!track || laneIndex < 0) return null
+      const lane = track.automationLanes![laneIndex]!
+      const pointIndex = lane.points.findIndex((item) => item.id === id)
+      const value = Math.max(lane.min, Math.min(lane.max, point.value))
+      const next = { id, timeSec: Math.max(0, point.timeSec), value, ...(pointIndex >= 0 && lane.points[pointIndex]!.curve != null ? { curve: lane.points[pointIndex]!.curve } : {}) }
+      const points = lane.points.slice()
+      if (pointIndex >= 0) points[pointIndex] = next; else points.push(next)
+      points.sort((left, right) => left.timeSec - right.timeSec)
+      const lanes = track.automationLanes!.slice()
+      lanes[laneIndex] = { ...lane, points }
+      const tracks = current.tracks.slice()
+      tracks[trackIndex] = { ...track, automationLanes: lanes }
+      commitProject(current, { ...current, tracks }, `automation:${trackId}:${laneId}:${id}`)
       return id
     },
-    setAutomationCurve: (trackId, laneId, pointId, curve) => mutateProject((project) => {
-      const point = project.tracks.find((track) => track.id === trackId)?.automationLanes?.find((lane) => lane.id === laneId)?.points.find((item) => item.id === pointId)
-      if (point) point.curve = Math.max(-1, Math.min(1, curve))
-    }, { historyKey: `automation-curve:${trackId}:${laneId}:${pointId}` }),
+    setAutomationCurve: (trackId, laneId, pointId, curve) => {
+      const current = get().project
+      const trackIndex = current.tracks.findIndex((track) => track.id === trackId)
+      const track = current.tracks[trackIndex]
+      const laneIndex = track?.automationLanes?.findIndex((lane) => lane.id === laneId) ?? -1
+      const lane = laneIndex >= 0 ? track!.automationLanes![laneIndex]! : undefined
+      const pointIndex = lane?.points.findIndex((item) => item.id === pointId) ?? -1
+      if (!track || !lane || pointIndex < 0) return
+      const points = lane.points.slice()
+      points[pointIndex] = { ...points[pointIndex]!, curve: Math.max(-1, Math.min(1, curve)) }
+      const lanes = track.automationLanes!.slice()
+      lanes[laneIndex] = { ...lane, points }
+      const tracks = current.tracks.slice()
+      tracks[trackIndex] = { ...track, automationLanes: lanes }
+      commitProject(current, { ...current, tracks }, `automation-curve:${trackId}:${laneId}:${pointId}`)
+    },
     removeAutomationPoint: (trackId, laneId, pointId) => mutateProject((project) => {
       const lane = project.tracks.find((track) => track.id === trackId)?.automationLanes?.find((item) => item.id === laneId)
       if (lane) lane.points = lane.points.filter((point) => point.id !== pointId)
@@ -580,9 +638,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const lane = state.project.tracks.find((track) => track.id === first.trackId)?.automationLanes?.find((item) => item.id === first.laneId)
       const points = lane?.points.filter((point) => selected.has(point.id)) ?? []
       if (!points.length) return
-      const step = snapSeconds(state.gridTicks, state.project.transport.bpm)
       const extent = Math.max(...points.map((point) => point.timeSec)) - Math.min(...points.map((point) => point.timeSec))
-      const delta = Math.max(step, Math.ceil(Math.max(extent, .000_001) / step) * step)
+      const ticksPerSecond = MIDI_PPQ / secondsPerBeat(state.project.transport.bpm)
+      const delta = studioOneDuplicateStepTicks(Math.max(1, Math.round(extent * ticksPerSecond)), state.gridTicks, state.snapEnabled) / ticksPerSecond
       const ids: AutomationPointRef[] = []
       mutateProject((project) => {
         const target = project.tracks.find((track) => track.id === first.trackId)?.automationLanes?.find((item) => item.id === first.laneId)
@@ -691,18 +749,26 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       commitProject(current, { ...current, tracks }, `clip:${trackId}:${clipId}:${Object.keys(patch).sort().join(',')}`)
     },
     upsertClipGainPoint: (trackId, clipId, point) => {
-      const id = point.id ?? crypto.randomUUID(); let found = false
-      mutateProject((project) => {
-        const clip = project.tracks.find((track) => track.id === trackId)?.clips.find((item) => item.id === clipId)
-        if (!clip) return
-        clip.gainPoints ??= []
-        const index = clip.gainPoints.findIndex((item) => item.id === id)
-        const curve = point.curve ?? (index >= 0 ? clip.gainPoints[index]!.curve : undefined)
-        const next = { id, timeSec: Math.max(0, Math.min(clip.durationSec, point.timeSec)), valueDb: Math.max(-60, Math.min(12, point.valueDb)), ...(curve == null ? {} : { curve: Math.max(-1, Math.min(1, curve)) }) }
-        if (index >= 0) clip.gainPoints[index] = next; else clip.gainPoints.push(next)
-        clip.gainPoints.sort((left, right) => left.timeSec - right.timeSec); found = true
-      }, { historyKey: `clip-gain-point:${trackId}:${clipId}:${id}` })
-      return found ? id : null
+      const id = point.id ?? crypto.randomUUID()
+      const current = get().project
+      const trackIndex = current.tracks.findIndex((track) => track.id === trackId)
+      const track = current.tracks[trackIndex]
+      const clipIndex = track?.clips.findIndex((clip) => clip.id === clipId) ?? -1
+      if (!track || clipIndex < 0) return null
+      const clip = track.clips[clipIndex]!
+      const gainPoints = clip.gainPoints ?? []
+      const pointIndex = gainPoints.findIndex((item) => item.id === id)
+      const curve = point.curve ?? (pointIndex >= 0 ? gainPoints[pointIndex]!.curve : undefined)
+      const next = { id, timeSec: Math.max(0, Math.min(clip.durationSec, point.timeSec)), valueDb: Math.max(-60, Math.min(12, point.valueDb)), ...(curve == null ? {} : { curve: Math.max(-1, Math.min(1, curve)) }) }
+      const points = gainPoints.slice()
+      if (pointIndex >= 0) points[pointIndex] = next; else points.push(next)
+      points.sort((left, right) => left.timeSec - right.timeSec)
+      const clips = track.clips.slice()
+      clips[clipIndex] = { ...clip, gainPoints: points }
+      const tracks = current.tracks.slice()
+      tracks[trackIndex] = { ...track, clips }
+      commitProject(current, { ...current, tracks }, `clip-gain-point:${trackId}:${clipId}:${id}`)
+      return id
     },
     removeClipGainPoint: (trackId, clipId, pointId) => {
       mutateProject((project) => { const clip = project.tracks.find((track) => track.id === trackId)?.clips.find((item) => item.id === clipId); if (clip) clip.gainPoints = (clip.gainPoints ?? []).filter((point) => point.id !== pointId) }, { historyLabel: '클립 게인 포인트 삭제' })
@@ -807,17 +873,23 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const endSec = Math.max(...clips.map((clip) => clip.startSec + clip.durationSec))
       const ticksPerSecond = MIDI_PPQ / secondsPerBeat(state.project.transport.bpm)
       const extentTicks = Math.max(1, Math.ceil((endSec - startSec) * ticksPerSecond - 1e-6))
-      const deltaTicks = musicalDuplicateStepTicks(extentTicks, state.project.transport.timeSignature)
+      const deltaTicks = studioOneDuplicateStepTicks(extentTicks, state.gridTicks, state.snapEnabled)
       const deltaSec = deltaTicks / ticksPerSecond
       const nextIds: string[] = []
-      mutateProject((project) => {
-        for (const track of project.tracks) {
-          const audioCopies = track.clips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec } })
-          const midiCopies = track.midiClips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec, notes: clip.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: clip.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) } })
-          track.clips.push(...audioCopies)
-          track.midiClips.push(...midiCopies)
+      // This command used to clone the entire project (assets, effects and all
+      // tracks) before adding a handful of clips. Preserve unaffected track
+      // references and only copy arrays that actually receive duplicates.
+      const tracks = state.project.tracks.map((track) => {
+        const audioCopies = track.clips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec, gainPoints: clip.gainPoints?.map((point) => ({ ...point, id: crypto.randomUUID() })) } })
+        const midiCopies = track.midiClips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec, notes: clip.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: clip.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) } })
+        if (!audioCopies.length && !midiCopies.length) return track
+        return {
+          ...track,
+          clips: audioCopies.length ? [...track.clips, ...audioCopies] : track.clips,
+          midiClips: midiCopies.length ? [...track.midiClips, ...midiCopies] : track.midiClips,
         }
       })
+      commitProject(state.project, { ...state.project, tracks }, '', '클립 복제')
       set({ selectedClipIds: nextIds })
     },
     copySelectedClips: () => {
@@ -890,16 +962,20 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     },
     duplicateClip: (trackId, clipId) => {
       const id = crypto.randomUUID()
-      let found = false
-      mutateProject((project) => {
-        const track = project.tracks.find((candidate) => candidate.id === trackId)
-        const clip = track?.clips.find((candidate) => candidate.id === clipId)
-        if (track && clip) { track.clips.push({ ...clip, id }); found = true; return }
-        const midi = track?.midiClips.find((candidate) => candidate.id === clipId)
-        if (track && midi) { track.midiClips.push({ ...midi, id, notes: midi.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: midi.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) }); found = true }
-      })
-      if (found) set({ selectedClipIds: [id] })
-      return found ? id : null
+      const current = get().project
+      const trackIndex = current.tracks.findIndex((candidate) => candidate.id === trackId)
+      if (trackIndex < 0) return null
+      const track = current.tracks[trackIndex]!
+      const clip = track.clips.find((candidate) => candidate.id === clipId)
+      const midi = track.midiClips.find((candidate) => candidate.id === clipId)
+      if (!clip && !midi) return null
+      const tracks = current.tracks.slice()
+      tracks[trackIndex] = clip
+        ? { ...track, clips: [...track.clips, { ...clip, id, gainPoints: clip.gainPoints?.map((point) => ({ ...point, id: crypto.randomUUID() })) }] }
+        : { ...track, midiClips: [...track.midiClips, { ...midi!, id, notes: midi!.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: midi!.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) }] }
+      commitProject(current, { ...current, tracks }, '', '클립 복제')
+      set({ selectedClipIds: [id] })
+      return id
     },
     addSilentClip: (trackId, startSec, durationSec) => mutateProject((project) => {
       project.tracks.find((track) => track.id === trackId)?.clips.push({ id: crypto.randomUUID(), assetId: '', name: 'Empty clip', startSec, offsetSec: 0, durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0 })
@@ -932,7 +1008,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       mutateProject((project) => {
         const track = project.tracks.find((candidate) => candidate.id === trackId && candidate.kind === 'instrument')
         if (!track) return
-        track.midiClips.push({ id, name: 'MIDI Clip', startSec: Math.max(0, startSec), durationSec: Math.max(0.25, durationSec), loopEnabled: false, loopStartTicks: 0, loopLengthTicks: 15_360, notes: [], ccLanes: [], transposeSemitones: 0, velocityScale: 1, muted: false, color: null })
+        const clippedDuration = Math.max(0.25, durationSec)
+        const loopLengthTicks = Math.max(1, Math.round(clippedDuration / secondsPerBeat(project.transport.bpm) * MIDI_PPQ))
+        track.midiClips.push({ id, name: 'MIDI Clip', startSec: Math.max(0, startSec), durationSec: clippedDuration, loopEnabled: false, loopStartTicks: 0, loopLengthTicks, notes: [], ccLanes: [], transposeSemitones: 0, velocityScale: 1, muted: false, color: null })
         created = true
       })
       if (created) queueMicrotask(() => get().openMidiEditor(trackId, id))
@@ -1039,7 +1117,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (!clip) return
       const selected = new Set(state.selectedNoteIds)
       const notes = clip.notes.filter((note) => selected.has(note.id))
-      const deltaTicks = midiDuplicateStepTicks(notes, state.project.transport.timeSignature)
+      const noteStart = Math.min(...notes.map((note) => note.startTicks))
+      const noteEnd = Math.max(...notes.map((note) => note.startTicks + note.lengthTicks))
+      const deltaTicks = studioOneDuplicateStepTicks(Math.max(1, noteEnd - noteStart), state.pianoGridTicks, state.pianoSnapEnabled)
       if (deltaTicks > 0) get().duplicateMidiNotes(editor.trackId, editor.clipId, state.selectedNoteIds, deltaTicks, 0)
     },
     deleteMidiNotes: (trackId, clipId, noteIds) => {
@@ -1085,7 +1165,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     addEffect: (trackId, type, plugin) => {
       const id = crypto.randomUUID()
       mutateProject((project) => {
-        project.tracks.find((track) => track.id === trackId)?.effects.push({ id, type, bypassed: false, params: effectDefaults(type), plugin })
+        project.tracks.find((track) => track.id === trackId)?.effects.push({ id, type, bypassed: false, params: plugin ? Object.fromEntries((plugin.parameters ?? []).map((parameter) => [parameter.id, parameter.defaultValue])) : effectDefaults(type), plugin })
       })
       set({ focusedEffectId: id, rackTarget: { kind: 'track', id: trackId }, lowerTab: 'effects', lowerPanelCollapsed: false })
     },
@@ -1161,7 +1241,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     addTargetEffect: (target, type, plugin) => {
       const id = crypto.randomUUID()
       mutateProject((project) => {
-        targetEffects(project, target)?.push({ id, type, bypassed: false, params: effectDefaults(type), plugin })
+        targetEffects(project, target)?.push({ id, type, bypassed: false, params: plugin ? Object.fromEntries((plugin.parameters ?? []).map((parameter) => [parameter.id, parameter.defaultValue])) : effectDefaults(type), plugin })
       })
       set({ focusedEffectId: id, rackTarget: target, lowerTab: 'effects', lowerPanelCollapsed: false })
     },
@@ -1214,7 +1294,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         if (effect) effect.sidechain = { enabled, sourceTrackId: sourceId }
       })
     },
-    setBpm: (bpm) => { if (Number.isFinite(bpm)) mutateProject((project) => { project.transport.bpm = Math.max(20, Math.min(300, bpm)) }, { historyKey: 'transport:bpm' }) },
+    setBpm: (bpm) => { if (Number.isFinite(bpm)) mutateProject((project) => { project.transport.bpm = Math.round(Math.max(20, Math.min(300, bpm)) * 100) / 100 }, { historyKey: 'transport:bpm' }) },
     setTimeSignature: (signature) => mutateProject((project) => {
       project.transport.timeSignature = { numerator: Math.max(1, Math.min(32, Math.round(signature.numerator))), denominator: [1, 2, 4, 8, 16].includes(signature.denominator) ? signature.denominator : 4 }
     }),
@@ -1257,7 +1337,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       set({ trackHeight: nextDefault })
     },
     toggleSnap: () => set((state) => ({ snapEnabled: !state.snapEnabled })),
+    togglePianoSnap: () => set((state) => ({ pianoSnapEnabled: !state.pianoSnapEnabled })),
     setGridTicks: (ticks) => set({ gridTicks: Math.max(1, Math.round(ticks)) }),
+    setPianoGridTicks: (ticks) => set({ pianoGridTicks: Math.max(1, Math.round(ticks)) }),
+    setArrangementSwing: (value) => set({ arrangementSwing: Math.max(0, Math.min(100, value)) }),
+    setPianoSwing: (value) => set({ pianoSwing: Math.max(0, Math.min(100, value)) }),
     toggleFollowPlayhead: () => set((state) => ({ followPlayhead: !state.followPlayhead })),
     setLowerPanelHeight: (value) => set((state) => {
       const height = state.lowerTab === 'effects'
@@ -1342,7 +1426,9 @@ export function effectDefaults(type: EffectInstance['type']): Record<string, num
   if (type === 'builtin:lfo-tremolo') return { rateHz: 4, waveform: 0, volumeDepth: .5, panDepth: 0, stereoPhase: .25 }
   if (type === 'builtin:clipper') return { inputDb: 6, knee: .25, outputDb: -1, oversample: 4 }
   if (type === 'builtin:upward-compressor') return { threshold: -32, ratio: 3, attackMs: 35, releaseMs: 240, rangeDb: 12, stereoLink: 1, mix: 1, outputDb: 0 }
+  if (type === 'builtin:transient-shaper') return { attack: 0, sustain: 0, thresholdDb: -36, speed: .5, clip: 0 }
   if (type === 'builtin:roboter') return { amount: .72, number: 0 }
+  if (type === 'builtin:formant-shifter') return { mode: 0, pitchSemitones: 0, formantSemitones: 0, formantLink: 1, mix: 1, outputDb: 0 }
   if (type === 'builtin:resonator') return { midi: 0, key: 0, scale: 0, pitch0: 1, pitch1: 0, pitch2: 1, pitch3: 0, pitch4: 1, pitch5: 1, pitch6: 0, pitch7: 1, pitch8: 0, pitch9: 1, pitch10: 0, pitch11: 1, resonance: .62, decay: .45, depth: .82, mix: .72 }
   if (type === 'builtin:utility') return { inputMode: 0, invertLeft: 0, invertRight: 0, width: 1, gainDb: 0, balance: 0, mono: 0, bassMono: 0, bassFreq: 120, mute: 0, dcBlock: 0 }
   if (type === 'builtin:delay') return { time: 0.25, feedback: 0.3, mix: 0.25, damping: 0.35, pingPong: 0 }
@@ -1360,6 +1446,7 @@ const titleParameter = (id: string) => id
 function automationRange(id: string, value: number): Pick<AutomationOption, 'min' | 'max' | 'defaultValue'> {
   const key = id.toLowerCase()
   if (key.includes('freq')) return { min: 20, max: 20_000, defaultValue: value }
+  if (key.includes('semitone')) return { min: -24, max: 24, defaultValue: value }
   if (key.includes('gain') || key.includes('threshold') || key.includes('makeup') || key.includes('output')) return { min: -60, max: 24, defaultValue: value }
   if (key.includes('attack') || key.includes('release') || key.includes('time') || key.includes('decay')) return { min: 0, max: Math.max(2, value * 4), defaultValue: value }
   if (key.includes('ratio')) return { min: 1, max: 20, defaultValue: value }
@@ -1367,6 +1454,16 @@ function automationRange(id: string, value: number): Pick<AutomationOption, 'min
   if (key.includes('pan') || key.includes('balance')) return { min: -1, max: 1, defaultValue: value }
   if (key.includes('mode') || key.includes('type') || key.includes('waveform') || key.includes('oversample')) return { min: 0, max: Math.max(4, value), defaultValue: value }
   return { min: 0, max: 1, defaultValue: value }
+}
+
+/** Studio One-style Duplicate: exact extent with Snap off, otherwise the
+ * smallest binary musical grid block that can contain the selection. */
+export function studioOneDuplicateStepTicks(extentTicks: number, gridTicks: number, snapEnabled: boolean): number {
+  if (extentTicks <= 0) return 0
+  if (!snapEnabled) return Math.max(1, Math.round(extentTicks))
+  let step = Math.max(1, Math.round(gridTicks))
+  while (step < extentTicks) step *= 2
+  return step
 }
 
 function recordArmedAutomation(track: Track, playheadSec: number, targetKind: AutomationLane['targetKind'], targetId: string, parameterId: string, value: number, playing: boolean): Track {
@@ -1414,7 +1511,10 @@ export function automationOptionsForTrack(track: Track): AutomationOption[] {
   for (const effect of track.effects) {
     const name = effect.plugin?.name ?? effect.type.replace('builtin:', '')
     const params = { ...effectDefaults(effect.type), ...effect.params }
-    addParams('effect', effect.id, name, params)
+    if (effect.type === 'builtin:transient-shaper') {
+      const ranges: Record<string, { min: number; max: number }> = { attack: { min: -1, max: 1 }, sustain: { min: -1, max: 1 }, thresholdDb: { min: -72, max: 0 }, speed: { min: 0, max: 1 }, clip: { min: 0, max: 1 } }
+      for (const [parameterId, value] of Object.entries(params)) options.push({ targetKind: 'effect', targetId: effect.id, parameterId, category: name, label: titleParameter(parameterId), min: ranges[parameterId]?.min ?? 0, max: ranges[parameterId]?.max ?? 1, defaultValue: value })
+    } else addParams('effect', effect.id, name, params)
     options.push({ targetKind: 'effect', targetId: effect.id, parameterId: '__bypass', category: name, label: 'Bypass', min: 0, max: 1, defaultValue: effect.bypassed ? 1 : 0 })
     for (const parameter of effect.plugin?.parameters ?? []) options.push({ targetKind: 'effect', targetId: effect.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
   }

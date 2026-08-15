@@ -1,6 +1,6 @@
-# Track automation
+﻿# Track automation
 
-MiniDAW stores automation lanes with each track. The arrangement header's small disclosure button opens the lane area and creates a Volume lane the first time it is used.
+MiniStudio stores automation lanes with each track. The arrangement header's small disclosure button opens the lane area and creates a Volume lane the first time it is used.
 
 - Double-click an automation curve to create a point.
 - Drag a point to change time and value. Timeline snap is shared with clips and notes.

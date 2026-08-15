@@ -53,7 +53,7 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
       { id: 'view.trackIn', label: '전체 트랙 높이 늘리기', keys: 'Shift+E' },
       { id: 'view.trackOut', label: '전체 트랙 높이 줄이기', keys: 'Shift+W' },
       { id: 'view.fit', label: '전체 보기', keys: 'F' },
-      { id: 'view.follow', label: '플레이헤드 따라가기', keys: 'Shift+F' },
+      { id: 'view.follow', label: '오토 스크롤', keys: 'Shift+F' },
       { id: 'view.panel', label: '하단 패널 접기 / 펴기', keys: 'Tab' },
       { id: 'view.tab', label: '믹서 / 디바이스 전환', keys: 'Shift+Tab' },
       { id: 'view.shortcuts', label: '단축키 도움말', keys: 'F1' },

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "MiniDAW desktop file and dialog permissions",
-  "windows": ["main"],
+  "description": "MiniStudio desktop file and dialog permissions",
+  "windows": ["main", "plugin-*"],
   "permissions": [
     "core:default",
     "dialog:default",

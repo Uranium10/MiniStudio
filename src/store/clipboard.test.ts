@@ -1,7 +1,7 @@
 // Clip clipboard, loop range, and effective mix-gain regression tests.
 import { beforeEach, describe, expect, it } from 'vitest'
 import { effectiveBusGainDb, effectiveMasterGainDb, MIDI_PPQ, MUTE_GAIN_DB, secondsPerBeat } from '../engine'
-import { midiDuplicateStepTicks, musicalDuplicateStepTicks, useProjectStore } from './projectStore'
+import { midiDuplicateStepTicks, studioOneDuplicateStepTicks, useProjectStore } from './projectStore'
 import { createDemoProject } from './demoProject'
 
 const reset = () => useProjectStore.getState().setProject(createDemoProject())
@@ -71,11 +71,12 @@ describe('clip clipboard', () => {
   it('D-style duplication advances selected arrangement clips by the next musical block', () => {
     const store = useProjectStore.getState()
     const originals = audioTrack().clips.slice(0, 2)
+    const untouchedInstrument = store.project.tracks.find((track) => track.kind === 'instrument')!
     const start = Math.min(...originals.map((clip) => clip.startSec))
     const end = Math.max(...originals.map((clip) => clip.startSec + clip.durationSec))
     const ticksPerSecond = MIDI_PPQ / secondsPerBeat(store.project.transport.bpm)
     const extentTicks = Math.max(1, Math.ceil((end - start) * ticksPerSecond - 1e-6))
-    const expectedDelta = musicalDuplicateStepTicks(extentTicks, store.project.transport.timeSignature) / ticksPerSecond
+    const expectedDelta = studioOneDuplicateStepTicks(extentTicks, store.gridTicks, store.snapEnabled) / ticksPerSecond
     useProjectStore.setState({ selectedClipIds: originals.map((clip) => clip.id), editFocus: 'arrangement' })
     store.duplicateSelectedClipsSmart()
     const selected = new Set(useProjectStore.getState().selectedClipIds)
@@ -83,6 +84,7 @@ describe('clip clipboard', () => {
 
     expect(copies).toHaveLength(originals.length)
     expect(copies.map((clip) => clip.startSec)).toEqual(originals.map((clip) => clip.startSec + expectedDelta))
+    expect(useProjectStore.getState().project.tracks.find((track) => track.id === untouchedInstrument.id)).toBe(untouchedInstrument)
   })
 
   it('tracks arrangement and piano-roll focus independently of panel visibility', () => {
@@ -139,7 +141,7 @@ describe('MIDI note duplication', () => {
     expect(useProjectStore.getState().selectedNoteIds).toEqual(ids)
   })
 
-  it('D-style duplication advances a short selection by half a bar', () => {
+  it('D-style duplication advances to the next logical piano grid block', () => {
     const store = useProjectStore.getState()
     const track = store.project.tracks.find((item) => item.kind === 'instrument')!
     const clip = track.midiClips[0]!
@@ -149,7 +151,14 @@ describe('MIDI note duplication', () => {
     const updated = useProjectStore.getState().project.tracks.find((item) => item.id === track.id)!.midiClips[0]!
     const selected = new Set(useProjectStore.getState().selectedNoteIds)
     const copies = updated.notes.filter((note) => selected.has(note.id))
-    expect(copies.map((note) => note.startTicks)).toEqual(originals.map((note) => note.startTicks + 1920))
+    const start = Math.min(...originals.map((note) => note.startTicks))
+    const end = Math.max(...originals.map((note) => note.startTicks + note.lengthTicks))
+    const delta = studioOneDuplicateStepTicks(end - start, store.pianoGridTicks, store.pianoSnapEnabled)
+    expect(copies.map((note) => note.startTicks)).toEqual(originals.map((note) => note.startTicks + delta))
+  })
+
+  it('uses the exact selected extent when piano Snap is off', () => {
+    expect(studioOneDuplicateStepTicks(777, 240, false)).toBe(777)
   })
 })
 

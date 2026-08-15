@@ -1,7 +1,7 @@
 // Engine-aware project commands shared by the menu bar, toolbar, and shortcuts.
 import { describeEngineError, type IAudioEngine } from '../engine'
 import { chooseAudioFile, chooseExportPath, hydrateProjectAudio, openProject, saveProject } from '../io/projectFiles'
-import { getProjectSnapshot, useProjectStore } from './projectStore'
+import { getProjectSnapshot, snapTicksWithSwing, snapTimeWithSwing, useProjectStore } from './projectStore'
 
 const store = () => useProjectStore.getState()
 
@@ -151,10 +151,9 @@ export function quantizeInContext(): void {
     const clip = state.project.tracks.find((track) => track.id === state.editorClip!.trackId)?.midiClips.find((item) => item.id === state.editorClip!.clipId)
     if (!clip) return
     const selected = new Set(state.selectedNoteIds)
-    state.updateMidiNoteBatch(state.editorClip.trackId, state.editorClip.clipId, clip.notes.filter((note) => selected.has(note.id)).map((note) => ({ id: note.id, patch: { startTicks: Math.max(0, Math.round(note.startTicks / state.gridTicks) * state.gridTicks) } })))
+    state.updateMidiNoteBatch(state.editorClip.trackId, state.editorClip.clipId, clip.notes.filter((note) => selected.has(note.id)).map((note) => ({ id: note.id, patch: { startTicks: snapTicksWithSwing(note.startTicks, state.pianoGridTicks, state.pianoSwing) } })))
     return
   }
   const selected = new Set(state.selectedClipIds)
-  const step = (state.gridTicks / 960) * (60 / state.project.transport.bpm)
-  for (const track of state.project.tracks) for (const clip of [...track.clips, ...track.midiClips]) if (selected.has(clip.id)) state.updateClip(track.id, clip.id, { startSec: Math.max(0, Math.round(clip.startSec / step) * step) })
+  for (const track of state.project.tracks) for (const clip of [...track.clips, ...track.midiClips]) if (selected.has(clip.id)) state.updateClip(track.id, clip.id, { startSec: snapTimeWithSwing(clip.startSec, state.gridTicks, state.project.transport.bpm, state.arrangementSwing) })
 }

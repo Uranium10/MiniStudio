@@ -54,6 +54,11 @@
 
 #![deny(missing_docs)]
 
+// The signed application can include the helper implementation as a module
+// and re-exec itself in host mode. Keep the library's public crate name
+// available inside that shared source file as it is when compiled as a bin.
+extern crate self as vst3_host;
+
 pub mod audio;
 pub mod error;
 pub mod host;
@@ -68,13 +73,20 @@ pub mod window;
 
 pub mod discovery;
 
-#[cfg(feature = "egui-widgets")]
+#[cfg(any(feature = "egui-widgets", feature = "embedded-editor"))]
 pub mod embed;
 
 #[cfg(feature = "cpal-backend")]
 pub mod backends;
 
 pub mod process_isolation;
+
+#[cfg(feature = "process-isolation")]
+pub mod realtime_ipc;
+
+#[cfg(feature = "process-isolation")]
+#[path = "bin/vst3-host-helper.rs"]
+pub mod helper_process;
 
 #[cfg(feature = "midi-input")]
 pub mod midi_input;
@@ -91,7 +103,7 @@ pub use discovery::{
     BusLayout, ClassInfo, DetailedPluginInfo, FactoryInfo, PluginReport, SafeDiscoveryReport,
     SafeDiscoverySkip, DEFAULT_PROBE_TIMEOUT,
 };
-#[cfg(feature = "egui-widgets")]
+#[cfg(any(feature = "egui-widgets", feature = "embedded-editor"))]
 pub use embed::{EditorRect, EmbeddedEditor};
 pub use error::{Error, Result};
 pub use host::{DiscoveryProgress, ProbeResult, Vst3Host, Vst3HostBuilder};

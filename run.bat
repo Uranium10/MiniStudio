@@ -1,13 +1,17 @@
 @echo off
 setlocal
-rem Start the MiniDAW Tauri development application.
+rem Start the MiniStudio Tauri development application.
 
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-rem Keep Rust's heavily-mutated build cache outside the Desktop workspace.
-rem Antivirus/indexers can briefly lock incremental object files in src-tauri\target.
-set "CARGO_TARGET_DIR=C:\tmp\minidaw-msvc-target"
+rem Keep Rust's heavily-mutated build cache outside the workspace and on the
+rem same drive as the checkout. Override this per machine when desired.
+if defined MINISTUDIO_CARGO_TARGET_DIR (
+  set "CARGO_TARGET_DIR=%MINISTUDIO_CARGO_TARGET_DIR%"
+) else (
+  set "CARGO_TARGET_DIR=%~d0\tmp\ministudio-msvc-target"
+)
 if not exist "%USERPROFILE%\.cargo\bin\cargo.exe" (
-  echo [MiniDAW] Cargo was not found at "%USERPROFILE%\.cargo\bin\cargo.exe".
+  echo [MiniStudio] Cargo was not found at "%USERPROFILE%\.cargo\bin\cargo.exe".
   echo Install Rust with rustup, then run this file again.
   pause
   exit /b 1
@@ -22,14 +26,14 @@ if defined VSINSTALL (
   call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=amd64 -host_arch=amd64
   if errorlevel 1 exit /b 1
 ) else (
-  echo [MiniDAW] Visual Studio C++ Build Tools were not found.
+  echo [MiniStudio] Visual Studio C++ Build Tools were not found.
   pause
   exit /b 1
 )
 
 where cargo.exe >nul 2>&1
 if errorlevel 1 (
-  echo [MiniDAW] Cargo is not available after environment setup.
+  echo [MiniStudio] Cargo is not available after environment setup.
   pause
   exit /b 1
 )
@@ -38,7 +42,7 @@ if /i "%~1"=="--check" (
   cargo --version
   cargo metadata --manifest-path src-tauri\Cargo.toml --no-deps --format-version 1 >nul
   if errorlevel 1 exit /b 1
-  echo [MiniDAW] Rust and Visual Studio environments are ready.
+  echo [MiniStudio] Rust and Visual Studio environments are ready.
   exit /b 0
 )
 

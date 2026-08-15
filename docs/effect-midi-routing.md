@@ -1,6 +1,6 @@
-# Effect MIDI routing contract
+﻿# Effect MIDI routing contract
 
-MiniDAW's native effect contract already accepts a sorted `&[NoteEvent]`. Each
+MiniStudio's native effect contract already accepts a sorted `&[NoteEvent]`. Each
 `sample_offset` is an exact offset inside the current audio block; it must never
 be rounded to the block boundary. Effects that return `false` from
 `wants_midi()` receive the shared empty slice.

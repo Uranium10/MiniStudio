@@ -65,6 +65,7 @@ egui-widgets = [
     "egui",
     "raw-window-handle",
 ]
+embedded-editor = ["raw-window-handle"]
 midi-input = ["dep:midir"]
 process-isolation = []
 
@@ -178,4 +179,11 @@ features = [
     "winuser",
     "windef",
     "libloaderapi",
+    "processthreadsapi",
+    "memoryapi",
+    "handleapi",
+    "synchapi",
+    "winbase",
+    "errhandlingapi",
+    "wingdi",
 ]

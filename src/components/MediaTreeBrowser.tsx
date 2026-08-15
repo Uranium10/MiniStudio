@@ -10,13 +10,15 @@ type LocationTab = { id: string; title: string; root: string | null }
 type FsNode = { path: string; name: string; directory: boolean }
 type Context = { x: number; y: number; path: string | null; title: string }
 
-const STORAGE_KEY = 'minidaw.media-browser.tabs.v2'
+const STORAGE_KEY = 'ministudio.media-browser.tabs.v3'
+const PREVIOUS_STORAGE_KEY = 'ministudio.media-browser.tabs.v2'
+const LEGACY_STORAGE_KEY = 'minidaw.media-browser.tabs.v2'
 
 export function MediaTreeBrowser({ query, onQueryChange }: { query: string; onQueryChange(value: string): void }) {
   const engine = useEngine()
-  const initialTabs = useMemo(loadTabs, [])
-  const [tabs, setTabs] = useState<LocationTab[]>(initialTabs)
-  const [activeId, setActiveId] = useState(initialTabs[0]!.id)
+  const initial = useMemo(loadLocationState, [])
+  const [tabs, setTabs] = useState<LocationTab[]>(initial.tabs)
+  const [activeId, setActiveId] = useState(initial.activeId)
   const [roots, setRoots] = useState<string[]>([])
   const [revision, setRevision] = useState(0)
   const [context, setContext] = useState<Context | null>(null)
@@ -24,7 +26,7 @@ export function MediaTreeBrowser({ query, onQueryChange }: { query: string; onQu
   const [searching, setSearching] = useState(false)
   const active = tabs.find((tab) => tab.id === activeId) ?? tabs[0]!
 
-  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(tabs)) }, [tabs])
+  useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify({ tabs, activeId })) }, [activeId, tabs])
   useEffect(() => { void commands.listStorageRoots().then((items) => setRoots(items.length ? items : fallbackRoots())).catch(() => setRoots(fallbackRoots())) }, [])
   useEffect(() => {
     const needle = query.trim()
@@ -116,12 +118,21 @@ function FolderNode({ node, depth, query, initiallyOpen = false, drive = false, 
   </div>
 }
 
-function loadTabs(): LocationTab[] {
+function loadLocationState(): { tabs: LocationTab[]; activeId: string } {
   try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') as LocationTab[]
-    if (Array.isArray(value) && value.length) return value.filter((tab) => typeof tab.id === 'string' && (tab.root === null || typeof tab.root === 'string'))
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const value = JSON.parse(raw) as { tabs?: LocationTab[]; activeId?: string }
+      const tabs = validTabs(value.tabs)
+      if (tabs.length) return { tabs, activeId: tabs.some((tab) => tab.id === value.activeId) ? value.activeId! : tabs[0]!.id }
+    }
+    const previous = JSON.parse(localStorage.getItem(PREVIOUS_STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY) ?? '[]') as LocationTab[]
+    const tabs = validTabs(previous)
+    if (tabs.length) return { tabs, activeId: tabs[0]!.id }
   } catch { /* reset malformed persisted state */ }
-  return [{ id: crypto.randomUUID(), title: '저장소', root: null }]
+  const tab = { id: crypto.randomUUID(), title: '저장소', root: null }
+  return { tabs: [tab], activeId: tab.id }
 }
+function validTabs(value: unknown): LocationTab[] { return Array.isArray(value) ? value.filter((tab): tab is LocationTab => Boolean(tab) && typeof tab.id === 'string' && typeof tab.title === 'string' && (tab.root === null || typeof tab.root === 'string')) : [] }
 function fallbackRoots(): string[] { return navigator.userAgent.includes('Windows') ? ['C:\\', 'D:\\'] : ['/'] }
 function basename(path: string): string { return path.replace(/[\\/]+$/, '').split(/[\\/]/).at(-1) || path }

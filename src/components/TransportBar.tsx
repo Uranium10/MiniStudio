@@ -1,11 +1,12 @@
 // Fixed transport controls driven by the audio-engine clock.
-import { Activity, ChevronUp, Circle, Gauge, ListMusic, Pause, Play, Repeat2, SkipBack, Square, Waves } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { Activity, ChevronUp, Circle, Gauge, ListMusic, Pause, Play, Repeat2, SkipBack, Square, Waves, X } from 'lucide-react'
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { useEngine } from '../hooks/useEngine'
 import { toBarsBeats, type StreamStatus } from '../engine'
 import { seekTo, stopPlayback, togglePlayback } from '../store/commands'
 import { useProjectStore } from '../store/projectStore'
 import { EditableNumber } from './controls'
+import { FloatingPanel } from './Menu'
 
 export function TransportBar() {
   const playheadSec = useProjectStore((state) => state.playheadSec)
@@ -35,18 +36,63 @@ export function TransportBar() {
         <button className={loopEnabled ? 'loop-active' : ''} title="루프 (L) · 룰러 아래 루프 바를 끌어 구간을 조정합니다" onClick={toggleLoop}><Repeat2 size={17} /></button>
       </div>
       <div className="transport-settings">
-        <label><Gauge size={14} /><span><small>TEMPO</small><input type="number" min="20" max="300" step="0.1" value={bpm} onChange={(event) => setBpm(Number(event.target.value))} /></span></label>
-        <label><ListMusic size={14} /><span><small>SIGNATURE</small><span className="signature-input">
-          <input type="number" min="1" max="32" value={signature.numerator} aria-label="박자 분자" onChange={(event) => setTimeSignature({ ...signature, numerator: Number(event.target.value) })} />
-          <i>/</i>
-          <select value={signature.denominator} aria-label="박자 분모" onChange={(event) => setTimeSignature({ ...signature, denominator: Number(event.target.value) })}>{[1, 2, 4, 8, 16].map((value) => <option key={value} value={value}>{value}</option>)}</select>
-        </span></span></label>
+        <div className="tempo-setting"><Gauge size={14} /><span><small>TEMPO</small><TempoControl value={bpm} onChange={setBpm} /></span></div>
+        <SignatureControl value={signature} onChange={setTimeSignature} />
         <div><Waves size={14} /><span><small>SAMPLE RATE</small><strong>{sampleRate / 1000} kHz</strong></span></div>
         {recordingEnabled && <label><span><small>OVERDUB</small><select value={overdubMode} onChange={(event) => useProjectStore.setState({ overdubMode: event.target.value as 'merge' | 'new' })}><option value="merge">Merge</option><option value="new">New clip</option></select></span></label>}
       </div>
       <StreamReadout />
     </footer>
   )
+}
+
+function SignatureControl({ value, onChange }: { value: { numerator: number; denominator: number }; onChange(value: { numerator: number; denominator: number }): void }) {
+  const [open, setOpen] = useState(false)
+  const trigger = useRef<HTMLButtonElement>(null)
+  const anchor = () => trigger.current
+  const preset = (numerator: number) => onChange({ numerator, denominator: 4 })
+  return <div className="signature-setting"><ListMusic size={14} /><button ref={trigger} className="signature-compact" title="박자표 설정" onClick={() => setOpen((current) => !current)}><small>SIGNATURE</small><strong>{value.numerator}/{value.denominator}</strong></button><div className="signature-quick"><button className={value.numerator === 3 && value.denominator === 4 ? 'active' : ''} onClick={() => preset(3)}>3/4</button><button className={value.numerator === 4 && value.denominator === 4 ? 'active' : ''} onClick={() => preset(4)}>4/4</button></div>
+    {open && <FloatingPanel getAnchorElement={anchor} onClose={() => setOpen(false)} className="signature-popup"><header><div><small>TIME SIGNATURE</small><strong>박자표 설정</strong></div><button title="닫기" onClick={() => setOpen(false)}><X size={14} /></button></header><div className="signature-large"><label><span>박자 수</span><input autoFocus type="number" min="1" max="32" value={value.numerator} onChange={(event) => onChange({ ...value, numerator: Number(event.target.value) })} /></label><i>/</i><label><span>음표 단위</span><select value={value.denominator} onChange={(event) => onChange({ ...value, denominator: Number(event.target.value) })}>{[1, 2, 4, 8, 16].map((item) => <option key={item} value={item}>{item}</option>)}</select></label></div><div className="signature-beat-length"><span>비트 길이</span><strong>1/{value.denominator}</strong><i>•</i></div><footer><button onClick={() => preset(3)}>3/4 WALTZ</button><button onClick={() => preset(4)}>4/4 COMMON</button></footer></FloatingPanel>}
+  </div>
+}
+
+function TempoControl({ value, onChange }: { value: number; onChange(value: number): void }) {
+  const [editingPart, setEditingPart] = useState<'integer' | 'fraction' | null>(null)
+  const [draft, setDraft] = useState('')
+  const drag = useRef<{ pointerId: number; y: number; value: number; fine: boolean } | null>(null)
+  const hundredths = Math.round(value * 100)
+  const integer = Math.floor(hundredths / 100)
+  const fraction = String(hundredths % 100).padStart(2, '0')
+  const commit = (part: 'integer' | 'fraction') => {
+    const parsed = Number(draft)
+    if (Number.isFinite(parsed)) onChange(part === 'integer' ? Math.round(parsed) + Number(fraction) / 100 : integer + Math.max(0, Math.min(99, Math.round(parsed))) / 100)
+    setEditingPart(null)
+  }
+  const beginEdit = (part: 'integer' | 'fraction') => { setDraft(part === 'integer' ? String(integer) : fraction); setEditingPart(part) }
+  const begin = (event: ReactPointerEvent<HTMLButtonElement>, part: 'integer' | 'fraction') => {
+    if (event.button !== 0) return
+    event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
+    drag.current = { pointerId: event.pointerId, y: event.clientY, value, fine: part === 'fraction' || event.shiftKey }
+    const move = (pointer: PointerEvent) => {
+      const current = drag.current
+      if (!current || current.pointerId !== pointer.pointerId) return
+      const fine = part === 'fraction' || pointer.shiftKey
+      if (fine !== current.fine) { current.fine = fine; current.y = pointer.clientY; current.value = useProjectStore.getState().project.transport.bpm }
+      const pixelsPerStep = fine ? 2 : 4
+      const step = fine ? .01 : 1
+      onChange(current.value + Math.round((current.y - pointer.clientY) / pixelsPerStep) * step)
+    }
+    const finish = () => { drag.current = null; event.currentTarget.removeEventListener('pointermove', move); event.currentTarget.removeEventListener('pointerup', finish); event.currentTarget.removeEventListener('pointercancel', finish) }
+    event.currentTarget.addEventListener('pointermove', move)
+    event.currentTarget.addEventListener('pointerup', finish)
+    event.currentTarget.addEventListener('pointercancel', finish)
+  }
+  const editor = (part: 'integer' | 'fraction') => <input className={`tempo-editor ${part}`} autoFocus type="number" min={part === 'integer' ? 20 : 0} max={part === 'integer' ? 300 : 99} step="1" value={draft} aria-label={part === 'integer' ? 'BPM 정수 입력' : 'BPM 소수 입력'} onChange={(event) => setDraft(event.target.value)} onBlur={() => commit(part)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); else if (event.key === 'Escape') setEditingPart(null) }} />
+  return <output className="tempo-control" title="위아래 드래그 · Shift 미세 조절 · 더블클릭 직접 입력">
+    {editingPart === 'integer' ? editor('integer') : <button aria-label="BPM 정수" onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); beginEdit('integer') }} onPointerDown={(event) => begin(event, 'integer')}>{integer}</button>}
+    <i>.</i>
+    {editingPart === 'fraction' ? editor('fraction') : <button aria-label="BPM 소수" onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); beginEdit('fraction') }} onPointerDown={(event) => begin(event, 'fraction')}>{fraction}</button>}
+  </output>
 }
 
 /**

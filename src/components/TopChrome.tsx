@@ -15,6 +15,7 @@ import { useProjectStore } from '../store/projectStore'
 import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { MenuPanel, type MenuItem } from './Menu'
 import { TrackAddDialog } from './TrackAddDialog'
+import { EditableNumber } from './controls'
 
 const OPEN_TRACK_ADD_DIALOG_EVENT = 'ministudio:open-track-add-dialog'
 
@@ -30,7 +31,7 @@ export function MenuBar() {
 
   return (
     <div className="menu-bar">
-      <div className="brand"><span className="brand-mark">M</span><strong>MiniDAW</strong></div>
+      <div className="brand"><span className="brand-mark">M</span><strong>MiniStudio</strong></div>
       <nav aria-label="Application menu">
         {menus.map((menu) => (
           <div className="menu-root" key={menu.title}>
@@ -147,7 +148,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
         item('좌측 인스펙터 접기 / 펴기', store.toggleInspector, { keys: 'F4', checked: store.inspectorVisible }),
         item('미디어 브라우저 접기 / 펴기', store.toggleBrowser, { keys: 'F5', checked: store.browserVisible }),
         item('에디터 최대화', store.toggleEditorMaximized, { checked: store.editorMaximized }),
-        item('플레이헤드 따라가기', store.toggleFollowPlayhead, { keys: 'Shift+F', checked: store.followPlayhead }),
+        item('오토 스크롤', store.toggleFollowPlayhead, { keys: 'Shift+F', checked: store.followPlayhead }),
         separator,
         item('가로 확대', () => store.setZoom(store.pixelsPerSecond * 1.25), { keys: '+' }),
         item('가로 축소', () => store.setZoom(store.pixelsPerSecond / 1.25), { keys: '-' }),
@@ -159,7 +160,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
       items: [
         item('키보드 단축키…', () => store.setShortcutsOpen(true), { keys: 'F1' }),
         separator,
-        { kind: 'label', label: 'MiniDAW · Rust 네이티브 엔진' },
+        { kind: 'label', label: 'MiniStudio · Rust 네이티브 엔진' },
         item('VST3 / CLAP 호스팅 상태', () => store.showToast(engine.capabilities().supportsExternalPlugins ? 'VST3 / CLAP 호스팅이 활성화되어 있습니다' : '외부 플러그인 호스팅을 사용할 수 없습니다')),
       ],
     },
@@ -184,9 +185,17 @@ export function ToolBar() {
   const [trackAddOpen, setTrackAddOpen] = useState(false)
   const toolState = useToolStore()
   const effective = getEffectiveTool(toolState)
-  const snap = useProjectStore((state) => state.snapEnabled)
-  const gridTicks = useProjectStore((state) => state.gridTicks)
-  const setGridTicks = useProjectStore((state) => state.setGridTicks)
+  const editFocus = useProjectStore((state) => state.editFocus)
+  const arrangementSnap = useProjectStore((state) => state.snapEnabled)
+  const pianoSnap = useProjectStore((state) => state.pianoSnapEnabled)
+  const arrangementGrid = useProjectStore((state) => state.gridTicks)
+  const pianoGrid = useProjectStore((state) => state.pianoGridTicks)
+  const arrangementSwing = useProjectStore((state) => state.arrangementSwing)
+  const pianoSwing = useProjectStore((state) => state.pianoSwing)
+  const pianoContext = editFocus === 'pianoRoll'
+  const snap = pianoContext ? pianoSnap : arrangementSnap
+  const gridTicks = pianoContext ? pianoGrid : arrangementGrid
+  const swing = pianoContext ? pianoSwing : arrangementSwing
   const follow = useProjectStore((state) => state.followPlayhead)
   const toggleFollow = useProjectStore((state) => state.toggleFollowPlayhead)
   const zoom = useProjectStore((state) => state.pixelsPerSecond)
@@ -221,13 +230,14 @@ export function ToolBar() {
         ))}
       </div>
       <div className="toolbar-group snap-tools">
-        <button className={`toggle-button ${snap ? 'active' : ''}`} title="그리드 스냅" onClick={store.toggleSnap}><Magnet size={15} />스냅</button>
-        <label className="grid-select" title="아레인지와 피아노롤이 함께 쓰는 그리드">
-          <select aria-label="그리드 단위" value={gridTicks} onChange={(event) => setGridTicks(Number(event.target.value))}>
+        <button className={`toggle-button ${snap ? 'active' : ''}`} title={`${pianoContext ? '피아노롤' : '어레인지'} 그리드 스냅`} onClick={pianoContext ? store.togglePianoSnap : store.toggleSnap}><Magnet size={15} />{pianoContext ? 'P' : 'A'} 스냅</button>
+        <label className="grid-select" title={`${pianoContext ? '피아노롤' : '어레인지'} 퀀타이즈 단위`}>
+          <select aria-label="그리드 단위" value={gridTicks} onChange={(event) => (pianoContext ? store.setPianoGridTicks : store.setGridTicks)(Number(event.target.value))}>
             {GRID_OPTIONS.map((grid) => <option key={grid.label} value={grid.ticks}>{grid.label}</option>)}
           </select>
         </label>
-        <button className={`toggle-button ${follow ? 'active' : ''}`} title="재생 중 플레이헤드 따라가기 (Shift+F)" onClick={toggleFollow}><Crosshair size={14} />따라가기</button>
+        <label className="swing-control" title="스윙 수치는 더블클릭하여 직접 입력할 수 있습니다"><span>SWING</span><input aria-label="스윙" type="range" min="0" max="100" step="1" value={swing} onChange={(event) => (pianoContext ? store.setPianoSwing : store.setArrangementSwing)(Number(event.target.value))} /><EditableNumber value={swing} min={0} max={100} step={1} onChange={pianoContext ? store.setPianoSwing : store.setArrangementSwing} format={(value) => `${Math.round(value)}%`} /></label>
+        <button className={`toggle-button ${follow ? 'active' : ''}`} title="재생 중 플레이헤드를 오토 스크롤합니다 (Shift+F)" onClick={toggleFollow}><Crosshair size={14} />오토 스크롤</button>
       </div>
       <div className="toolbar-spacer" />
       <button className="audio-settings-button" onClick={() => store.setAudioSettingsOpen(true)} title="오디오 설정"><Settings size={14} />오디오 설정</button>

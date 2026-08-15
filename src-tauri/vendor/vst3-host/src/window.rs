@@ -17,15 +17,211 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 #[cfg(target_os = "windows")]
 use winapi::{
     shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM},
-    shared::windef::{HWND, RECT},
+    shared::windef::{HDC, HWND, POINT, RECT},
     um::libloaderapi::GetModuleHandleW,
+    um::wingdi::{
+        CreatePen, CreateSolidBrush, DeleteObject, GetStockObject, LineTo, MoveToEx, SelectObject,
+        SetBkMode, SetTextColor, DEFAULT_GUI_FONT, PS_SOLID, TRANSPARENT,
+    },
     um::winuser::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassExW,
-        SetWindowPos, ShowWindow, UpdateWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DPICHANGED, WNDCLASSEXW,
-        WS_OVERLAPPEDWINDOW,
+        BeginPaint, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawTextW, EndPaint, FillRect,
+        GetClientRect, GetCursorPos, GetDpiForWindow, GetWindowLongPtrW, GetWindowTextLengthW,
+        GetWindowTextW, InvalidateRect, LoadCursorW, MoveWindow, RegisterClassExW, ScreenToClient,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateWindow, CS_DROPSHADOW, CS_HREDRAW,
+        CS_VREDRAW, CW_USEDEFAULT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_ARROW, PAINTSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CHILD,
+        WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_VISIBLE,
     },
 };
+
+#[cfg(target_os = "windows")]
+const HOST_CHROME_HEIGHT_DIP: i32 = 38;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_BUTTON_WIDTH_DIP: i32 = 42;
+
+#[cfg(target_os = "windows")]
+fn scale_dip(value: i32, dpi: u32) -> i32 {
+    ((i64::from(value) * i64::from(dpi.max(96)) + 48) / 96) as i32
+}
+
+#[cfg(target_os = "windows")]
+fn host_chrome_height(hwnd: HWND) -> i32 {
+    scale_dip(HOST_CHROME_HEIGHT_DIP, unsafe { GetDpiForWindow(hwnd) })
+}
+
+#[cfg(target_os = "windows")]
+fn host_chrome_button_width(hwnd: HWND) -> i32 {
+    scale_dip(HOST_CHROME_BUTTON_WIDTH_DIP, unsafe {
+        GetDpiForWindow(hwnd)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn color(r: u8, g: u8, b: u8) -> u32 {
+    u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostChromeButton {
+    Minimize,
+    Close,
+}
+
+#[cfg(target_os = "windows")]
+fn host_chrome_button_at(hwnd: HWND, x: i32, y: i32) -> Option<HostChromeButton> {
+    let mut client: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetClientRect(hwnd, &mut client) } == 0 || y < 0 || y >= host_chrome_height(hwnd) {
+        return None;
+    }
+    let width = host_chrome_button_width(hwnd);
+    if x >= client.right - width {
+        Some(HostChromeButton::Close)
+    } else if x >= client.right - width * 2 {
+        Some(HostChromeButton::Minimize)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
+    ((lparam as i16) as i32, ((lparam >> 16) as i16) as i32)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn fill_rect(hdc: HDC, rect: &RECT, fill: u32) {
+    let brush = CreateSolidBrush(fill);
+    FillRect(hdc, rect, brush);
+    DeleteObject(brush.cast());
+}
+
+/// Paint the host-owned toolbar. It is intentionally GDI-only: no WebView,
+/// compositor or second UI thread is introduced into the plug-in process.
+#[cfg(target_os = "windows")]
+unsafe fn paint_host_chrome(hwnd: HWND) {
+    let mut paint: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut paint);
+    if hdc.is_null() {
+        return;
+    }
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut client);
+    let chrome_height = host_chrome_height(hwnd).min(client.bottom.max(0));
+    let button_width = host_chrome_button_width(hwnd);
+    fill_rect(hdc, &client, color(12, 20, 27));
+    let toolbar = RECT {
+        left: 0,
+        top: 0,
+        right: client.right,
+        bottom: chrome_height,
+    };
+    fill_rect(hdc, &toolbar, color(17, 29, 39));
+    let accent = RECT {
+        left: 0,
+        top: chrome_height.saturating_sub(scale_dip(1, GetDpiForWindow(hwnd))),
+        right: client.right,
+        bottom: chrome_height,
+    };
+    fill_rect(hdc, &accent, color(63, 113, 137));
+
+    let mut cursor = POINT { x: -1, y: -1 };
+    let hovered = if GetCursorPos(&mut cursor) != 0 && ScreenToClient(hwnd, &mut cursor) != 0 {
+        host_chrome_button_at(hwnd, cursor.x, cursor.y)
+    } else {
+        None
+    };
+    let minimize_rect = RECT {
+        left: client.right - button_width * 2,
+        top: 0,
+        right: client.right - button_width,
+        bottom: chrome_height,
+    };
+    let close_rect = RECT {
+        left: client.right - button_width,
+        top: 0,
+        right: client.right,
+        bottom: chrome_height,
+    };
+    if hovered == Some(HostChromeButton::Minimize) {
+        fill_rect(hdc, &minimize_rect, color(27, 52, 65));
+    }
+    fill_rect(
+        hdc,
+        &close_rect,
+        if hovered == Some(HostChromeButton::Close) {
+            color(151, 52, 63)
+        } else {
+            color(31, 44, 54)
+        },
+    );
+
+    let dpi = GetDpiForWindow(hwnd);
+    let icon_half = scale_dip(5, dpi);
+    let pen = CreatePen(
+        PS_SOLID as i32,
+        scale_dip(1, dpi).max(1),
+        color(211, 229, 237),
+    );
+    let previous_pen = SelectObject(hdc, pen.cast());
+    let min_x = (minimize_rect.left + minimize_rect.right) / 2;
+    let center_y = chrome_height / 2;
+    MoveToEx(
+        hdc,
+        min_x - icon_half,
+        center_y + scale_dip(3, dpi),
+        std::ptr::null_mut(),
+    );
+    LineTo(hdc, min_x + icon_half + 1, center_y + scale_dip(3, dpi));
+    let close_x = (close_rect.left + close_rect.right) / 2;
+    MoveToEx(
+        hdc,
+        close_x - icon_half,
+        center_y - icon_half,
+        std::ptr::null_mut(),
+    );
+    LineTo(hdc, close_x + icon_half + 1, center_y + icon_half + 1);
+    MoveToEx(
+        hdc,
+        close_x + icon_half,
+        center_y - icon_half,
+        std::ptr::null_mut(),
+    );
+    LineTo(hdc, close_x - icon_half - 1, center_y + icon_half + 1);
+    SelectObject(hdc, previous_pen);
+    DeleteObject(pen.cast());
+
+    let title_length = GetWindowTextLengthW(hwnd).max(0) as usize;
+    let mut title = vec![0_u16; title_length.saturating_add(1)];
+    let read = GetWindowTextW(
+        hwnd,
+        title.as_mut_ptr(),
+        title.len().min(i32::MAX as usize) as i32,
+    );
+    let mut title_rect = RECT {
+        left: scale_dip(13, dpi),
+        top: 0,
+        right: (client.right - button_width * 2 - scale_dip(8, dpi)).max(0),
+        bottom: chrome_height,
+    };
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(hdc, color(216, 231, 240));
+    let font = GetStockObject(DEFAULT_GUI_FONT as i32);
+    let previous_font = SelectObject(hdc, font);
+    if read > 0 {
+        DrawTextW(
+            hdc,
+            title.as_ptr(),
+            read,
+            &mut title_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+    SelectObject(hdc, previous_font);
+    EndPaint(hwnd, &paint);
+}
 
 #[cfg(any(test, target_os = "windows"))]
 fn dpi_scale_factor(dpi: u32) -> Option<f32> {
@@ -78,6 +274,74 @@ unsafe extern "system" fn plugin_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_NCHITTEST {
+        let (x, y) = point_from_lparam(lparam);
+        let mut point = POINT { x, y };
+        if ScreenToClient(hwnd, &mut point) != 0
+            && point.y >= 0
+            && point.y < host_chrome_height(hwnd)
+        {
+            return if host_chrome_button_at(hwnd, point.x, point.y).is_some() {
+                HTCLIENT as LRESULT
+            } else {
+                HTCAPTION as LRESULT
+            };
+        }
+        return HTCLIENT as LRESULT;
+    }
+    if msg == WM_LBUTTONDOWN {
+        let (x, y) = point_from_lparam(lparam);
+        if host_chrome_button_at(hwnd, x, y).is_some() {
+            return 0;
+        }
+    }
+    if msg == WM_LBUTTONUP {
+        let (x, y) = point_from_lparam(lparam);
+        match host_chrome_button_at(hwnd, x, y) {
+            Some(HostChromeButton::Minimize) => {
+                ShowWindow(hwnd, SW_MINIMIZE);
+                return 0;
+            }
+            Some(HostChromeButton::Close) => {
+                if let Ok(mut requests) = close_requests().lock() {
+                    requests.insert(hwnd as usize);
+                }
+                return 0;
+            }
+            None => {}
+        }
+    }
+    if msg == WM_MOUSEMOVE {
+        // The toolbar is tiny and repaints independently of the plug-in child.
+        // Invalidating here gives the custom buttons native-rate hover feedback.
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+        return 0;
+    }
+    if msg == WM_SIZE {
+        let container = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HWND;
+        if !container.is_null() {
+            let mut client: RECT = std::mem::zeroed();
+            if GetClientRect(hwnd, &mut client) != 0 {
+                let top = host_chrome_height(hwnd);
+                MoveWindow(
+                    container,
+                    0,
+                    top,
+                    client.right.max(1),
+                    (client.bottom - top).max(1),
+                    1,
+                );
+            }
+        }
+        return 0;
+    }
+    if msg == WM_PAINT {
+        paint_host_chrome(hwnd);
+        return 0;
+    }
+    if msg == WM_ERASEBKGND {
+        return 1;
+    }
     if msg == WM_CLOSE {
         if let Ok(mut requests) = close_requests().lock() {
             requests.insert(hwnd as usize);
@@ -129,6 +393,10 @@ pub struct PluginWindow {
     container_view: Option<Retained<NSView>>,
     #[cfg(target_os = "windows")]
     native_window: Option<HWND>,
+    /// Same-process child HWND handed to `IPlugView::attached`. Keeping the
+    /// editor below a host-owned toolbar avoids painting into vendor pixels.
+    #[cfg(target_os = "windows")]
+    editor_container: Option<HWND>,
     #[cfg(target_os = "linux")]
     native_window: Option<XcbWindowState>,
     #[cfg(target_os = "android")]
@@ -147,6 +415,8 @@ impl PluginWindow {
                 target_os = "android"
             ))]
             native_window: None,
+            #[cfg(target_os = "windows")]
+            editor_container: None,
             #[cfg(target_os = "macos")]
             container_view: None,
         }
@@ -267,7 +537,7 @@ impl PluginWindow {
                 let class_name = "VST3PluginWindow\0".encode_utf16().collect::<Vec<u16>>();
                 let mut wc: WNDCLASSEXW = mem::zeroed();
                 wc.cbSize = mem::size_of::<WNDCLASSEXW>() as UINT;
-                wc.style = CS_HREDRAW | CS_VREDRAW;
+                wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
                 wc.lpfnWndProc = Some(plugin_window_proc);
                 wc.hInstance = GetModuleHandleW(ptr::null());
                 wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
@@ -277,36 +547,18 @@ impl PluginWindow {
                 RegisterClassExW(&wc);
 
                 // Create window
-                let window_title = format!("{} - VST3\0", plugin_info.name);
+                let window_title = format!("MiniStudio  ·  {}  ·  VST3\0", plugin_info.name);
                 let window_name = window_title.encode_utf16().collect::<Vec<u16>>();
 
-                // Calculate window size including borders
-                let mut rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: width,
-                    bottom: height,
-                };
-
-                winapi::um::winuser::AdjustWindowRectEx(
-                    &mut rect,
-                    WS_OVERLAPPEDWINDOW,
-                    0, // No menu
-                    0, // No extended style
-                );
-
-                let window_width = rect.right - rect.left;
-                let window_height = rect.bottom - rect.top;
-
                 let hwnd = CreateWindowExW(
-                    0,
+                    WS_EX_APPWINDOW,
                     class_name.as_ptr(),
                     window_name.as_ptr(),
-                    WS_OVERLAPPEDWINDOW,
+                    WS_POPUP | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
                     CW_USEDEFAULT,
                     CW_USEDEFAULT,
-                    window_width,
-                    window_height,
+                    width,
+                    height + HOST_CHROME_HEIGHT_DIP,
                     ptr::null_mut(),
                     ptr::null_mut(),
                     GetModuleHandleW(ptr::null()),
@@ -317,13 +569,46 @@ impl PluginWindow {
                     return Err(Error::Other("Failed to create native window".to_string()));
                 }
 
+                let dpi = GetDpiForWindow(hwnd);
+                let chrome_height = scale_dip(HOST_CHROME_HEIGHT_DIP, dpi);
+                SetWindowPos(
+                    hwnd,
+                    ptr::null_mut(),
+                    0,
+                    0,
+                    width,
+                    height + chrome_height,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let static_class = "STATIC\0".encode_utf16().collect::<Vec<u16>>();
+                let container = CreateWindowExW(
+                    0,
+                    static_class.as_ptr(),
+                    ptr::null(),
+                    WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+                    0,
+                    chrome_height,
+                    width,
+                    height,
+                    hwnd,
+                    ptr::null_mut(),
+                    GetModuleHandleW(ptr::null()),
+                    ptr::null_mut(),
+                );
+                if container.is_null() {
+                    DestroyWindow(hwnd);
+                    return Err(Error::Other(
+                        "Failed to create native editor container".to_string(),
+                    ));
+                }
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, container as isize);
+
                 // Try to open plugin editor.
-                // SAFETY: `hwnd` was just created above and null-checked; it is destroyed only
-                // after the editor is detached (in `close()`, or the error arm below).
+                // SAFETY: `container` is a same-process, same-thread child of the host window.
+                // It remains alive until after the editor is detached in `close()`.
                 let window_handle =
-                    crate::plugin::WindowHandle::from_hwnd(hwnd as *mut std::ffi::c_void);
+                    crate::plugin::WindowHandle::from_hwnd(container as *mut std::ffi::c_void);
                 let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
-                let dpi = winapi::um::winuser::GetDpiForWindow(hwnd);
                 if let Some(scale_factor) = dpi_scale_factor(dpi) {
                     if let Err(error) = plugin.set_editor_scale_factor(scale_factor) {
                         drop(plugin);
@@ -337,6 +622,7 @@ impl PluginWindow {
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
                         self.native_window = Some(hwnd);
+                        self.editor_container = Some(container);
                     }
                     Err(e) => {
                         drop(plugin);
@@ -516,23 +802,14 @@ impl PluginWindow {
             let Some(hwnd) = self.native_window else {
                 return;
             };
-            // The plugin sizes its *client* area; grow the frame by the window's chrome, the
-            // same way `open()` sizes the window to the editor in the first place.
-            let mut rect = RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
             unsafe {
-                winapi::um::winuser::AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
                 SetWindowPos(
                     hwnd,
                     std::ptr::null_mut(),
                     0,
                     0,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
+                    width,
+                    height + host_chrome_height(hwnd),
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
@@ -580,6 +857,7 @@ impl PluginWindow {
 
         #[cfg(target_os = "windows")]
         {
+            self.editor_container = None;
             if let Some(hwnd) = self.native_window.take() {
                 if let Ok(mut requests) = close_requests().lock() {
                     requests.remove(&(hwnd as usize));

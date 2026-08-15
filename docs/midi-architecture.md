@@ -1,4 +1,4 @@
-# MiniDAW MIDI architecture
+﻿# MiniStudio MIDI architecture
 
 ## Time and project model
 

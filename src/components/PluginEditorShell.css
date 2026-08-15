@@ -1,0 +1,23 @@
+:root { color-scheme: dark; }
+html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #0c141b; }
+.plugin-editor-shell { width: 100%; height: 100%; background: #0c141b; color: #d8e7f0; font: 11px/1.2 Inter, "Segoe UI", sans-serif; }
+.plugin-shell-toolbar { box-sizing: border-box; height: 52px; display: flex; align-items: center; gap: 9px; padding: 7px 10px; background: linear-gradient(180deg, #1a2935, #111d27); border-bottom: 1px solid #3f7189; box-shadow: 0 2px 10px #0008; position: relative; z-index: 10; }
+.plugin-shell-toolbar button { min-width: 30px; height: 28px; border: 1px solid #314958; border-radius: 3px; background: #15232e; color: #91a9b7; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 7px; font: 600 9px/1 Inter, "Segoe UI", sans-serif; cursor: pointer; }
+.plugin-shell-toolbar button:hover:not(:disabled) { color: #e8f8ff; border-color: #54cfee; background: #1b3441; }
+.plugin-shell-toolbar button:disabled { opacity: .38; cursor: default; }
+.plugin-shell-power { color: #617885 !important; }
+.plugin-shell-power.active { color: #63ddf5 !important; border-color: #3787a0 !important; box-shadow: inset 0 0 9px #2ac9ef22; }
+.plugin-shell-pin.active { color: #f2c85b !important; border-color: #9a7b2f !important; background: #312a18 !important; }
+.plugin-shell-identity { min-width: 135px; max-width: 300px; display: grid; gap: 3px; }
+.plugin-shell-identity strong { color: #f1f8fb; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-shell-identity span { color: #708b9b; font-size: 8px; letter-spacing: .07em; text-transform: uppercase; }
+.plugin-shell-actions { margin-left: auto; display: flex; align-items: center; gap: 4px; }
+.plugin-shell-automation { display: grid; grid-template-columns: repeat(2, 9px); gap: 2px; margin-left: 4px; padding: 3px 5px; border-left: 1px solid #2b414e; }
+.plugin-shell-automation button { width: 9px; min-width: 9px; height: 9px; padding: 0; border: 0; border-radius: 1px; opacity: .48; }
+.plugin-shell-automation button.active { opacity: 1; outline: 1px solid #e5f6ff; outline-offset: 1px; }
+.plugin-shell-automation .off { background: #8a949b; }.plugin-shell-automation .write { background: #f05258; }.plugin-shell-automation .read { background: #4cc98a; }.plugin-shell-automation .latch { background: #e9bd4b; }
+.plugin-shell-native-surface { height: calc(100% - 52px); display: grid; place-items: center; color: #526976; background: radial-gradient(circle at 50% 35%, #142531, #0a1117 65%); }
+.plugin-shell-native-surface div { display: grid; justify-items: center; gap: 12px; }.plugin-shell-native-surface span { width: 26px; height: 26px; border: 2px solid #273f4c; border-top-color: #55cde9; border-radius: 50%; animation: plugin-shell-spin .8s linear infinite; }
+.plugin-shell-native-surface.ready div { color: #68a8ba; }.plugin-shell-native-surface.failed div { max-width: 520px; color: #ef8b8f; text-align: center; }.plugin-shell-native-surface.failed small { color: #9eb0ba; overflow-wrap: anywhere; }
+@keyframes plugin-shell-spin { to { transform: rotate(360deg); } }
+@media (max-width: 650px) { .plugin-shell-toolbar button span, .plugin-shell-identity span { display: none; } .plugin-shell-identity { min-width: 80px; } }

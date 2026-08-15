@@ -459,6 +459,13 @@ pub enum HostCommand {
     CreateGui,
     /// Close plugin GUI
     CloseGui,
+    /// Attach the preallocated shared-memory realtime audio/event transport.
+    AttachRealtime {
+        /// Names of the mapping and synchronization objects created by the host.
+        descriptor: crate::realtime_ipc::RealtimeDescriptor,
+    },
+    /// Stop the helper audio worker and detach its shared-memory transport.
+    DetachRealtime,
     /// Start the plugin's audio processing.
     StartProcessing,
     /// Stop the plugin's audio processing.
@@ -1070,6 +1077,9 @@ pub struct PluginHostProcess {
     /// fresh one in its place when a load kills it. Resolved once by [`Self::new`], so a
     /// respawn cannot pick a different binary than the original search did.
     helper_path: std::path::PathBuf,
+    /// Fixed private-mode arguments used when the signed host executable
+    /// re-execs itself instead of shipping a separately located helper.
+    helper_args: Vec<std::ffi::OsString>,
 }
 
 /// How many times a `LoadPlugin` that killed the helper is replayed against a freshly spawned
@@ -1187,7 +1197,7 @@ impl PluginHostProcess {
                     p.display()
                 ));
             }
-            return Self::spawn(p, timeout);
+            return Self::spawn(p, Vec::new(), timeout);
         }
 
         // Get the path to our helper executable
@@ -1259,12 +1269,35 @@ impl PluginHostProcess {
         let helper_path = helper_path
             .ok_or_else(|| format!("Helper executable not found. Searched in {:?} and parent directories. Make sure to build with --bins flag.", exe_dir))?;
 
-        Self::spawn(helper_path, timeout)
+        Self::spawn(helper_path, Vec::new(), timeout)
+    }
+
+    /// Spawn a signed application executable in its private helper mode. This
+    /// avoids absolute sidecar paths and guarantees that the child comes from
+    /// the same installation and version as the host.
+    pub fn new_self_hosted(
+        executable: std::path::PathBuf,
+        helper_arg: std::ffi::OsString,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        if !executable.exists() {
+            return Err(format!(
+                "Self-hosted helper executable does not exist: {}",
+                executable.display()
+            ));
+        }
+        Self::spawn(executable, vec![helper_arg], timeout)
     }
 
     /// Spawn the helper at `helper_path` and wire up the response reader thread.
-    fn spawn(helper_path: std::path::PathBuf, timeout: Duration) -> Result<Self, String> {
-        let mut child = Command::new(&helper_path)
+    fn spawn(
+        helper_path: std::path::PathBuf,
+        helper_args: Vec<std::ffi::OsString>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let mut command = Command::new(&helper_path);
+        command.args(&helper_args);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1329,6 +1362,7 @@ impl PluginHostProcess {
             slow_timeout: DEFAULT_SLOW_COMMAND_TIMEOUT.max(timeout),
             dead: false,
             helper_path,
+            helper_args,
         })
     }
 
@@ -1340,7 +1374,11 @@ impl PluginHostProcess {
         let unparsed_lines = self.unparsed_lines;
         let discarded = self.discarded_by_reader.load(Ordering::Relaxed);
 
-        *self = Self::spawn(self.helper_path.clone(), self.timeout)?;
+        *self = Self::spawn(
+            self.helper_path.clone(),
+            self.helper_args.clone(),
+            self.timeout,
+        )?;
 
         self.slow_timeout = slow_timeout;
         self.unparsed_lines = unparsed_lines;
@@ -2595,7 +2633,8 @@ mod wire_tests {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut proc =
-            PluginHostProcess::spawn(fake.clone(), Duration::from_millis(200)).expect("spawn");
+            PluginHostProcess::spawn(fake.clone(), Vec::new(), Duration::from_millis(200))
+                .expect("spawn");
         let started = Instant::now();
         let res = proc.send_command(HostCommand::Shutdown);
         let elapsed = started.elapsed();
@@ -2706,8 +2745,9 @@ mod wire_tests {
     #[test]
     fn a_load_that_kills_the_helper_is_replayed_against_a_fresh_one() {
         let fake = FlakyLoadHelper::new("recovers", 1);
-        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
-            .expect("spawn flaky helper");
+        let mut proc =
+            PluginHostProcess::spawn(fake.script.clone(), Vec::new(), Duration::from_secs(5))
+                .expect("spawn flaky helper");
         let first_pid = proc.helper_pid().expect("helper pid");
 
         let response = proc
@@ -2729,8 +2769,9 @@ mod wire_tests {
     #[test]
     fn a_load_that_always_crashes_gives_up_after_one_retry() {
         let fake = FlakyLoadHelper::new("always", 99);
-        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
-            .expect("spawn flaky helper");
+        let mut proc =
+            PluginHostProcess::spawn(fake.script.clone(), Vec::new(), Duration::from_secs(5))
+                .expect("spawn flaky helper");
 
         let error = proc
             .send_command(FlakyLoadHelper::load_command())
@@ -2753,8 +2794,9 @@ mod wire_tests {
     #[test]
     fn a_crash_on_any_other_command_is_reported_not_retried() {
         let fake = FlakyLoadHelper::new("other", 0);
-        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
-            .expect("spawn flaky helper");
+        let mut proc =
+            PluginHostProcess::spawn(fake.script.clone(), Vec::new(), Duration::from_secs(5))
+                .expect("spawn flaky helper");
         let pid = proc.helper_pid().expect("helper pid");
 
         assert!(

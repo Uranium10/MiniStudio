@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { getEffectiveTool, nextSubTool, useToolStore } from './toolStore'
 
 describe('smart tool state', () => {
-  beforeEach(() => useToolStore.setState({ activeTool: 'arrow', subTool: 'none', isModifierHeld: false, latchedTool: null }))
+  beforeEach(() => useToolStore.setState({ activeTool: 'arrow', pianoTool: 'arrow', subTool: 'none', isModifierHeld: false, latchedTool: null }))
 
   it('cycles the exact sub-tool order', () => {
     expect(nextSubTool('none')).toBe('range')
@@ -28,6 +28,15 @@ describe('smart tool state', () => {
     const state = { activeTool: 'arrow' as const, subTool: 'split' as const, isModifierHeld: true, latchedTool: null }
     expect(getEffectiveTool(state)).toBe('split')
     expect(getEffectiveTool({ ...state, isModifierHeld: false })).toBe('arrow')
+  })
+
+  it('keeps piano-roll number tools independent from the arrangement palette', () => {
+    const store = useToolStore.getState()
+    store.chooseTool('split')
+    store.pressPianoNumber(5)
+    expect(useToolStore.getState()).toMatchObject({ activeTool: 'split', pianoTool: 'paint' })
+    useToolStore.getState().pressPianoNumber(7)
+    expect(useToolStore.getState()).toMatchObject({ activeTool: 'split', pianoTool: 'listen' })
   })
 
   it('latches a gesture across modifier changes', () => {

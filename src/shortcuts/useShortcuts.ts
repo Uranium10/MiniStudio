@@ -30,10 +30,14 @@ export function useShortcuts(): void {
       if (store.shortcutsOpen && event.key === 'Escape') { event.preventDefault(); store.setShortcutsOpen(false); return }
 
       if (/^[1-7]$/.test(event.key) && !event.ctrlKey && !event.metaKey) {
-        const wasArrow = tool.activeTool === 'arrow'
-        const next = event.key === '1' && wasArrow ? nextSubTool(tool.subTool) : null
-        tool.pressNumber(Number(event.key))
-        if (next) store.showToast(`서브 도구: ${toolLabel(next)}`)
+        if (store.editFocus === 'pianoRoll' && store.pianoRollOpen) {
+          tool.pressPianoNumber(Number(event.key))
+        } else {
+          const wasArrow = tool.activeTool === 'arrow'
+          const next = event.key === '1' && wasArrow ? nextSubTool(tool.subTool) : null
+          tool.pressNumber(Number(event.key))
+          if (next) store.showToast(`서브 도구: ${toolLabel(next)}`)
+        }
         event.preventDefault()
         return
       }
@@ -63,7 +67,7 @@ export function useShortcuts(): void {
         case 'trackIn': store.resizeAllTracks(8); break
         case 'trackOut': store.resizeAllTracks(-8); break
         case 'fit': store.setZoom(22); break
-        case 'follow': store.toggleFollowPlayhead(); store.showToast(store.followPlayhead ? '플레이헤드 따라가기 해제' : '플레이헤드 따라가기'); break
+        case 'follow': store.toggleFollowPlayhead(); store.showToast(store.followPlayhead ? '오토 스크롤 해제' : '오토 스크롤'); break
         case 'panel': store.toggleLowerPanel(); break
         case 'tab': store.setLowerTab(store.lowerTab === 'mixer' ? 'effects' : 'mixer'); break
         case 'save': void saveProjectFile(engine); break

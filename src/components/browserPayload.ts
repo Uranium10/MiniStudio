@@ -8,7 +8,7 @@ export type BrowserDragPayload =
 
 export type BrowserDragState = { type: 'move' | 'drop' | 'cancel'; payload: BrowserDragPayload; x: number; y: number }
 
-const DRAG_EVENT = 'minidaw-browser-drag'
+const DRAG_EVENT = 'ministudio-browser-drag'
 /** Pointer must travel this far before a press becomes a drag, so a plain click/double-click
  * on a browser item is never swallowed into a zero-distance drag-and-drop gesture. */
 const DRAG_THRESHOLD = 4

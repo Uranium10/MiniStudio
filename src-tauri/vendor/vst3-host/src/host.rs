@@ -5,8 +5,11 @@ use crate::{
     error::{Error, Result},
     plugin::{Plugin, PluginInfo, PluginInternal},
 };
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// Ceiling on the output channel count this host will size meters and buffers from.
 ///
@@ -36,6 +39,8 @@ pub struct Vst3Host {
     pub(crate) scan_default_paths: bool,
     /// Explicit path to the isolation helper binary (overrides the heuristic search).
     pub(crate) helper_path: Option<PathBuf>,
+    /// Private-mode argument when the signed application executable is the helper.
+    pub(crate) helper_arg: Option<OsString>,
     /// How long to wait for an isolated helper response before declaring a timeout.
     pub(crate) response_timeout: std::time::Duration,
     /// Whether an isolated plugin auto-respawns + retries on a crash/hang (control plane only).
@@ -47,6 +52,25 @@ pub struct Vst3Host {
 }
 
 impl Vst3Host {
+    #[cfg(feature = "process-isolation")]
+    fn spawn_helper(
+        &self,
+    ) -> std::result::Result<crate::process_isolation::PluginHostProcess, String> {
+        match (&self.helper_path, &self.helper_arg) {
+            (Some(path), Some(arg)) => {
+                crate::process_isolation::PluginHostProcess::new_self_hosted(
+                    path.clone(),
+                    arg.clone(),
+                    self.response_timeout,
+                )
+            }
+            _ => crate::process_isolation::PluginHostProcess::new(
+                self.helper_path.clone(),
+                self.response_timeout,
+            ),
+        }
+    }
+
     /// Create a new VST3 host with default settings.
     ///
     /// Discovery scans the standard system VST3 directories (consistent with
@@ -254,17 +278,16 @@ impl Vst3Host {
     /// Requires the `process-isolation` feature.
     #[cfg(feature = "process-isolation")]
     pub fn probe_plugin<P: AsRef<Path>>(&self, path: P) -> ProbeResult {
-        use crate::process_isolation::{HostCommand, HostResponse, PluginHostProcess};
+        use crate::process_isolation::{HostCommand, HostResponse};
 
         let path = path.as_ref();
         if !path.exists() {
             return ProbeResult::Failed("plugin path does not exist".to_string());
         }
-        let mut process =
-            match PluginHostProcess::new(self.helper_path.clone(), self.response_timeout) {
-                Ok(p) => p,
-                Err(e) => return ProbeResult::Failed(format!("helper unavailable: {e}")),
-            };
+        let mut process = match self.spawn_helper() {
+            Ok(p) => p,
+            Err(e) => return ProbeResult::Failed(format!("helper unavailable: {e}")),
+        };
         match process.send_command(HostCommand::LoadPlugin {
             path: path.display().to_string(),
             sample_rate: self.config.sample_rate,
@@ -331,12 +354,12 @@ impl Vst3Host {
 
     /// Load a plugin in an isolated process
     fn load_plugin_isolated(&mut self, path: &Path, class_id: Option<&str>) -> Result<Plugin> {
-        use crate::process_isolation::{HostCommand, HostResponse, PluginHostProcess};
+        use crate::process_isolation::{HostCommand, HostResponse};
 
         // Create and start the isolated plugin process
-        let mut process =
-            PluginHostProcess::new(self.helper_path.clone(), self.response_timeout)
-                .map_err(|e| Error::Other(format!("Failed to create isolated process: {}", e)))?;
+        let mut process = self
+            .spawn_helper()
+            .map_err(|e| Error::Other(format!("Failed to create isolated process: {}", e)))?;
 
         // Load the plugin in the isolated process
         let response = process
@@ -394,6 +417,35 @@ impl Vst3Host {
             }
         };
 
+        #[cfg(target_os = "windows")]
+        let realtime = {
+            let client = crate::realtime_ipc::RealtimeClient::create(self.config.sample_rate)
+                .map_err(|error| {
+                    Error::Other(format!("Failed to create realtime transport: {error}"))
+                })?;
+            match process
+                .send_command(HostCommand::AttachRealtime {
+                    descriptor: client.descriptor(),
+                })
+                .map_err(|error| {
+                    Error::Other(format!("Failed to attach realtime transport: {error}"))
+                })? {
+                HostResponse::Success { .. } => Some(client),
+                HostResponse::Error { message } => {
+                    return Err(Error::Other(format!(
+                        "Failed to attach realtime transport: {message}"
+                    )))
+                }
+                _ => {
+                    return Err(Error::Other(
+                        "Unexpected response while attaching realtime transport".to_string(),
+                    ))
+                }
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let realtime = None;
+
         // Create the isolated plugin implementation
         let plugin_impl = crate::internal::isolated_plugin_impl::IsolatedPluginImpl::new(
             process,
@@ -404,7 +456,9 @@ impl Vst3Host {
             self.config.time_sig_numerator,
             self.config.time_sig_denominator,
             output_channels,
+            realtime,
             self.helper_path.clone(),
+            self.helper_arg.clone(),
             self.response_timeout,
             self.auto_recover_plugins,
             self.auto_recover_max_retries,
@@ -439,6 +493,7 @@ impl Default for Vst3Host {
             use_process_isolation: false,
             scan_default_paths: true,
             helper_path: None,
+            helper_arg: None,
             response_timeout: crate::process_isolation::DEFAULT_RESPONSE_TIMEOUT,
             auto_recover_plugins: false,
             auto_recover_max_retries: 1,
@@ -458,6 +513,7 @@ pub struct Vst3HostBuilder {
     use_process_isolation: bool,
     scan_default_paths: bool,
     helper_path: Option<PathBuf>,
+    helper_arg: Option<OsString>,
     response_timeout: Option<std::time::Duration>,
     auto_recover_plugins: bool,
     auto_recover_max_retries: Option<u32>,
@@ -542,6 +598,19 @@ impl Vst3HostBuilder {
     /// the same. Useful when the helper ships in a non-standard location.
     pub fn helper_path<P: Into<PathBuf>>(mut self, path: P) -> Self {
         self.helper_path = Some(path.into());
+        self.helper_arg = None;
+        self
+    }
+
+    /// Re-execute the signed application binary in a private helper mode instead of relying on
+    /// a separately installed sidecar. The argument must be handled before normal GUI startup.
+    pub fn self_hosted_helper<P, S>(mut self, executable: P, helper_arg: S) -> Self
+    where
+        P: Into<PathBuf>,
+        S: Into<OsString>,
+    {
+        self.helper_path = Some(executable.into());
+        self.helper_arg = Some(helper_arg.into());
         self
     }
 
@@ -616,6 +685,7 @@ impl Vst3HostBuilder {
             use_process_isolation: self.use_process_isolation,
             scan_default_paths: self.scan_default_paths,
             helper_path: self.helper_path,
+            helper_arg: self.helper_arg,
             response_timeout: self
                 .response_timeout
                 .unwrap_or(crate::process_isolation::DEFAULT_RESPONSE_TIMEOUT),

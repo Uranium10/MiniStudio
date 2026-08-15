@@ -180,6 +180,7 @@ fn every_builtin_effect_has_an_audited_latency_contract() {
         "builtin:vocoder",
         "builtin:lfo-tremolo",
         "builtin:upward-compressor",
+        "builtin:transient-shaper",
     ];
     for kind in zero_latency {
         let effect = create_builtin_effect(kind, &HashMap::new(), false, 48_000.0).expect(kind);
@@ -209,6 +210,53 @@ fn every_builtin_effect_has_an_audited_latency_contract() {
         roboter.latency_samples() > 0,
         "pitch analysis must report its lookahead"
     );
+}
+
+#[test]
+fn transient_shaper_is_neutral_at_default_and_preserves_stereo_link() {
+    let mut effect = TransientShaper::new();
+    effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    let mut buffer = AudioBuffer::new();
+    buffer.channels[0][0] = 0.5;
+    buffer.channels[1][0] = -0.25;
+    effect.process(&[], &mut buffer, 1);
+    assert_eq!(buffer.channels[0][0], 0.5);
+    assert_eq!(buffer.channels[1][0], -0.25);
+
+    effect.set_param("attack", 1.0);
+    for frame in 0..MAX_BLOCK_SIZE {
+        let sample = if frame % 240 == 0 { 0.8 } else { 0.03 };
+        buffer.channels[0][frame] = sample;
+        buffer.channels[1][frame] = sample * 0.5;
+    }
+    effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    assert!(buffer
+        .channels
+        .iter()
+        .flatten()
+        .all(|sample| sample.is_finite()));
+    for frame in 0..MAX_BLOCK_SIZE {
+        assert!((buffer.channels[1][frame] * 2.0 - buffer.channels[0][frame]).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn transient_shaper_clip_bounds_large_boosts() {
+    let mut effect = TransientShaper::new();
+    effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    effect.set_param("attack", 1.0);
+    effect.set_param("sustain", 1.0);
+    effect.set_param("thresholdDb", -72.0);
+    effect.set_param("clip", 1.0);
+    let mut buffer = AudioBuffer::new();
+    buffer.channels[0][..MAX_BLOCK_SIZE].fill(4.0);
+    buffer.channels[1][..MAX_BLOCK_SIZE].fill(-4.0);
+    effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    assert!(buffer
+        .channels
+        .iter()
+        .flatten()
+        .all(|sample| sample.is_finite() && sample.abs() <= 1.000_001));
 }
 #[test]
 fn disperser_allpass_section_has_unity_magnitude() {
@@ -820,5 +868,311 @@ fn colorizer_held_phase_is_stable_and_realtime_buffers_do_not_grow() {
                 effect.channels[channel].held.capacity(),
             )
         )
+    }
+}
+
+fn vowel_formants(sample_rate: f32) -> [Biquad; 2] {
+    let mut bands = [Biquad::new(), Biquad::new()];
+    bands[0].configure(FilterKind::Bell, 700.0, 18.0, 4.0, sample_rate);
+    bands[1].configure(FilterKind::Bell, 2200.0, 18.0, 4.0, sample_rate);
+    bands
+}
+
+/// A buzzy sawtooth carved by two Bell peaks stands in for a vowel with formants at 700 Hz
+/// and 2200 Hz - simple enough for a 20th-order LPC to resolve cleanly in tests.
+fn synthesize_vowel_block(
+    phase: &mut f32,
+    fundamental: f32,
+    sample_rate: f32,
+    formants: &mut [Biquad; 2],
+    frames: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; frames];
+    for sample in &mut out {
+        *phase = (*phase + fundamental / sample_rate).fract();
+        let mut value = (*phase * 2.0 - 1.0) * 0.2;
+        for band in formants.iter_mut() {
+            value = band.process(0, value);
+        }
+        *sample = value;
+    }
+    out
+}
+
+#[test]
+fn formant_shifter_stays_finite_and_bounded_under_shift() {
+    let sample_rate = 48_000.0;
+    let mut shifter = FormantShifter::new();
+    shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    shifter.set_param("mode", 1.0); // Mono
+    shifter.set_param("pitchSemitones", -7.0);
+    shifter.set_param("formantSemitones", 5.0);
+    shifter.set_param("formantLink", 0.0);
+    shifter.set_param("mix", 1.0);
+    shifter.set_param("outputDb", 0.0);
+    let mut phase = 0.0_f32;
+    for _block in 0..40 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            phase = (phase + 130.0 / sample_rate).fract();
+            let sample = (phase * 2.0 - 1.0) * 0.3;
+            buffer.channels[0][frame] = sample;
+            buffer.channels[1][frame] = sample;
+        }
+        shifter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        for sample in buffer
+            .channels
+            .iter()
+            .flat_map(|channel| &channel[..MAX_BLOCK_SIZE])
+        {
+            assert!(sample.is_finite());
+            assert!(sample.abs() < 4.0, "unexpectedly large sample {sample}")
+        }
+    }
+}
+
+#[test]
+fn formant_shifter_correction_pulls_envelope_toward_original_formants() {
+    let sample_rate = 48_000.0;
+    let total_frames = MAX_BLOCK_SIZE * 6;
+
+    let mut dry_phase = 0.0_f32;
+    let mut dry_formants = vowel_formants(sample_rate);
+    let dry = synthesize_vowel_block(
+        &mut dry_phase,
+        110.0,
+        sample_rate,
+        &mut dry_formants,
+        total_frames,
+    );
+
+    let run = |link: f32| -> Vec<f32> {
+        let mut shifter = FormantShifter::new();
+        shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        shifter.set_param("mode", 1.0); // Mono, deterministic regardless of Auto's YIN vote
+        shifter.set_param("pitchSemitones", 12.0);
+        shifter.set_param("formantSemitones", 0.0);
+        shifter.set_param("formantLink", link);
+        shifter.set_param("mix", 1.0);
+        let mut output = Vec::with_capacity(total_frames);
+        let mut cursor = 0;
+        while cursor < total_frames {
+            let block_frames = MAX_BLOCK_SIZE.min(total_frames - cursor);
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..block_frames {
+                let sample = dry[cursor + frame];
+                buffer.channels[0][frame] = sample;
+                buffer.channels[1][frame] = sample;
+            }
+            shifter.process(&[], &mut buffer, block_frames);
+            for frame in 0..block_frames {
+                assert!(buffer.channels[0][frame].is_finite());
+                output.push(buffer.channels[0][frame]);
+            }
+            cursor += block_frames;
+        }
+        output
+    };
+
+    let uncorrected = run(1.0); // linked: formants follow pitch, no correction
+    let corrected = run(0.0); // unlinked: independent formant, correction active
+
+    let target_freqs = [700.0_f32, 2200.0];
+    let windowed_envelope = |signal: &[f32]| -> [f32; 2] {
+        let mut frame = [0.0_f32; FORMANT_ANALYSIS_FRAME];
+        let start = signal.len() - FORMANT_ANALYSIS_FRAME;
+        for (index, slot) in frame.iter_mut().enumerate() {
+            let window =
+                0.5 - 0.5 * (2.0 * PI * index as f32 / (FORMANT_ANALYSIS_FRAME - 1) as f32).cos();
+            *slot = signal[start + index] * window;
+        }
+        let lpc = levinson_durbin(&autocorrelate(&frame));
+        std::array::from_fn(|k| lpc_envelope_db(&lpc, target_freqs[k], sample_rate))
+    };
+
+    let dry_env = windowed_envelope(&dry);
+    let uncorrected_env = windowed_envelope(&uncorrected);
+    let corrected_env = windowed_envelope(&corrected);
+    // Absolute per-band distance to the dry target, summed - not the difference *between* the
+    // two bands. A correction that pulls each band closer individually, even unevenly, should
+    // pass; a "shape" (band0 - band1) metric can get worse from uneven-but-real improvement.
+    let total_deviation = |env: [f32; 2]| (env[0] - dry_env[0]).abs() + (env[1] - dry_env[1]).abs();
+    let uncorrected_error = total_deviation(uncorrected_env);
+    let corrected_error = total_deviation(corrected_env);
+
+    assert!(
+        corrected_error < uncorrected_error * 0.6,
+        "correction did not meaningfully pull formants back: corrected={corrected_error:.2}dB \
+         uncorrected={uncorrected_error:.2}dB"
+    );
+}
+
+#[test]
+fn formant_shifter_settles_near_unity_correction_when_pitch_is_unchanged() {
+    let sample_rate = 48_000.0;
+    let total_frames = MAX_BLOCK_SIZE * 6;
+    let mut shifter = FormantShifter::new();
+    shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    shifter.set_param("mode", 1.0); // Mono
+    shifter.set_param("pitchSemitones", 0.0);
+    shifter.set_param("formantSemitones", 0.0);
+    shifter.set_param("formantLink", 0.0);
+    shifter.set_param("mix", 1.0);
+
+    let mut phase = 0.0_f32;
+    let mut formants = vowel_formants(sample_rate);
+    let dry = synthesize_vowel_block(&mut phase, 110.0, sample_rate, &mut formants, total_frames);
+    let mut cursor = 0;
+    while cursor < total_frames {
+        let block_frames = MAX_BLOCK_SIZE.min(total_frames - cursor);
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..block_frames {
+            let sample = dry[cursor + frame];
+            buffer.channels[0][frame] = sample;
+            buffer.channels[1][frame] = sample;
+        }
+        shifter.process(&[], &mut buffer, block_frames);
+        cursor += block_frames;
+    }
+    for &gain in &shifter.current_band_db {
+        assert!(
+            gain.abs() < 2.0,
+            "unexpected correction with no pitch shift: {gain:.2}dB"
+        )
+    }
+}
+
+#[test]
+fn formant_shifter_poly_shifts_a_pure_tone_to_the_expected_frequency() {
+    let sample_rate = 48_000.0;
+    let mut shifter = FormantShifter::new();
+    shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    shifter.set_param("mode", 2.0); // Poly, forced regardless of what Auto would pick
+    shifter.set_param("pitchSemitones", 12.0);
+    shifter.set_param("formantLink", 1.0);
+    shifter.set_param("mix", 1.0);
+
+    let input_freq = 220.0_f32;
+    let total_frames = MAX_BLOCK_SIZE * 12;
+    let mut phase = 0.0_f32;
+    let mut output = Vec::with_capacity(total_frames);
+    let mut cursor = 0;
+    while cursor < total_frames {
+        let block_frames = MAX_BLOCK_SIZE.min(total_frames - cursor);
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..block_frames {
+            phase = (phase + input_freq / sample_rate).fract();
+            let sample = (2.0 * PI * phase).sin() * 0.3;
+            buffer.channels[0][frame] = sample;
+            buffer.channels[1][frame] = sample;
+        }
+        shifter.process(&[], &mut buffer, block_frames);
+        for frame in 0..block_frames {
+            assert!(buffer.channels[0][frame].is_finite());
+            output.push(buffer.channels[0][frame]);
+        }
+        cursor += block_frames;
+    }
+    let tail: [f32; ROBOTER_YIN_FRAME] =
+        std::array::from_fn(|index| output[output.len() - ROBOTER_YIN_FRAME + index]);
+    let estimate = yin_pitch(&tail, sample_rate);
+    assert!(
+        estimate.voiced,
+        "expected the shifted tone to still read as voiced (confidence={})",
+        estimate.confidence
+    );
+    let expected = input_freq * 2.0; // +12 semitones
+    let error_cents = 1200.0 * (estimate.frequency / expected).log2();
+    assert!(
+        error_cents.abs() < 50.0,
+        "poly shift landed at {}Hz, expected ~{expected}Hz ({error_cents:.1} cents off)",
+        estimate.frequency
+    );
+}
+
+#[test]
+fn formant_shifter_auto_picks_mono_for_a_clean_tone_and_poly_for_noise() {
+    let sample_rate = 48_000.0;
+
+    let mut tone_shifter = FormantShifter::new();
+    tone_shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    tone_shifter.set_param("pitchSemitones", 3.0);
+    let mut phase = 0.0_f32;
+    for _block in 0..8 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            phase = (phase + 220.0 / sample_rate).fract();
+            let sample = (2.0 * PI * phase).sin() * 0.3;
+            buffer.channels[0][frame] = sample;
+            buffer.channels[1][frame] = sample;
+        }
+        tone_shifter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    }
+    assert!(
+        matches!(tone_shifter.auto_engine, FormantMode::Mono),
+        "expected Auto to settle on Mono for a clean tone"
+    );
+
+    let mut noise_shifter = FormantShifter::new();
+    noise_shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    noise_shifter.set_param("pitchSemitones", 3.0);
+    let mut seed = 12_345_u32;
+    for _block in 0..8 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let sample = ((seed >> 8) as f32 / (1_u32 << 24) as f32 * 2.0 - 1.0) * 0.3;
+            buffer.channels[0][frame] = sample;
+            buffer.channels[1][frame] = sample;
+        }
+        noise_shifter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    }
+    assert!(
+        matches!(noise_shifter.auto_engine, FormantMode::Poly),
+        "expected Auto to settle on Poly for noise"
+    );
+}
+
+#[test]
+fn formant_shifter_reports_latency_by_mode() {
+    let mut mono = FormantShifter::new();
+    mono.set_param("mode", 1.0);
+    assert_eq!(mono.latency_samples(), 0);
+
+    let mut poly = FormantShifter::new();
+    poly.set_param("mode", 2.0);
+    assert_eq!(poly.latency_samples(), FORMANT_DECLARED_LATENCY);
+
+    let auto = FormantShifter::new();
+    assert_eq!(auto.latency_samples(), FORMANT_DECLARED_LATENCY);
+}
+
+#[test]
+fn formant_shifter_passes_through_unchanged_at_unity_pitch_in_mono_mode() {
+    let sample_rate = 48_000.0;
+    let mut shifter = FormantShifter::new();
+    shifter.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    shifter.set_param("mode", 1.0); // Mono: unity means zero declared latency, so this should be bit-exact.
+    shifter.set_param("pitchSemitones", 0.0);
+    shifter.set_param("mix", 1.0);
+    let mut buffer = AudioBuffer::new();
+    let mut phase = 0.0_f32;
+    for frame in 0..MAX_BLOCK_SIZE {
+        phase = (phase + 220.0 / sample_rate).fract();
+        let sample = (2.0 * PI * phase).sin() * 0.3;
+        buffer.channels[0][frame] = sample;
+        buffer.channels[1][frame] = sample;
+    }
+    let dry: Vec<f32> = buffer.channels[0][..MAX_BLOCK_SIZE].to_vec();
+    shifter.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    for (index, (&input, &output)) in dry
+        .iter()
+        .zip(buffer.channels[0][..MAX_BLOCK_SIZE].iter())
+        .enumerate()
+    {
+        assert!(
+            (input - output).abs() < 1e-5,
+            "sample {index} was altered at unity: {input} -> {output}"
+        );
     }
 }

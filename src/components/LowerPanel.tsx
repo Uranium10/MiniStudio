@@ -1,13 +1,15 @@
 // Resizable Ableton-inspired mixer, device rack, and phase-two plug-in pane.
-import { ChevronDown, CirclePower, Copy, GripVertical, Layers3, Minus, Piano, Plus, Power, Trash2, X } from 'lucide-react'
+import { ChevronDown, CirclePower, Copy, FolderOpen, GripVertical, Layers3, Minus, Piano, Plus, Power, Save, Trash2, X } from 'lucide-react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Bus, EffectInstance, EffectType, ExternalPluginRef, PluginDescriptor, Track } from '../engine'
 import { describeEngineError, effectiveMasterGainDb, MUTE_GAIN_DB } from '../engine'
 import { COLORIZER_NAME } from '../effects/builtinEffects'
 import { useEngine } from '../hooks/useEngine'
-import { hydratePlugin, scanPluginsOnce } from '../plugins/scan'
+import { hydratePlugin, hydratePluginRef, scanPluginsOnce } from '../plugins/scan'
+import { openPluginEditorWhenReady } from '../plugins/editor'
+import { openDevicePreset, saveDevicePreset } from '../io/projectFiles'
 import { automationOptionsForTrack, useProjectStore, type LowerTab, type RackTarget } from '../store/projectStore'
-import { EditableNumber, Knob, LevelMeter, ParameterAutomationProvider, subscribeAnalyzerFrame, subscribeMeterFrame } from './controls'
+import { AutomationButton, EditableNumber, Knob, LevelMeter, ParameterAutomationProvider, subscribeAnalyzerFrame, subscribeMeterFrame } from './controls'
 import { subscribeBrowserDrag } from './browserPayload'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { beginPointerReorder } from './pointerReorder'
@@ -226,7 +228,19 @@ function DeviceRack() {
   ] : []
   return (
     <div className="device-rack" onClick={() => setMenu(null)}>
-      <div className={`rack-track ${target.kind === 'master' ? 'master-rack-target' : ''}`}><span style={{ background: color }} /><strong>{name}</strong><small>{target.kind === 'master' ? 'Master insert chain' : target.kind === 'bus' ? 'Return bus effects' : 'Audio effects'}</small></div>
+      <div className={`rack-track ${target.kind === 'master' ? 'master-rack-target' : ''}`}>
+        <span style={{ background: color }} />
+        <strong>{name}</strong>
+        <small>{target.kind === 'master' ? 'Master insert chain' : target.kind === 'bus' ? 'Return bus effects' : 'Audio effects'}</small>
+        {targetTrack && <div className="rack-track-sends">
+          <b>SENDS</b>
+          {targetTrack.sends.length ? targetTrack.sends.map((send) => {
+            const busName = buses.find((bus) => bus.id === send.targetBusId)?.name ?? 'Unassigned'
+            const level = Math.max(0, Math.min(100, (send.gainDb + 60) / 66 * 100))
+            return <div key={send.id} title={`${busName} · ${send.gainDb <= -59.9 ? '−∞' : `${send.gainDb.toFixed(1)} dB`}`}><span>{busName}</span><i><em style={{ width: `${level}%` }} /></i><small>{send.gainDb <= -59.9 ? '−∞' : send.gainDb.toFixed(1)}</small></div>
+          }) : <em className="rack-no-sends">No sends</em>}
+        </div>}
+      </div>
       <div ref={chainRef} className={`device-chain ${chainDropActive ? 'rack-drop-active' : ''}`} onWheel={(event) => { if (!event.deltaX && !event.deltaY) return; event.preventDefault(); event.currentTarget.scrollLeft += Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX }}>
         {targetTrack?.kind === 'instrument' && targetTrack.instrument && <InstrumentCard track={targetTrack} />}
         {effects.map((effect, index) => <DeviceCard key={effect.id} effect={effect} target={target} index={index} onReorder={(from, to) => reorder(target, from, to)} onContextMenu={(event) => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY, effect }) }} />)}
@@ -239,13 +253,12 @@ function DeviceRack() {
 
 function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effect: EffectInstance; target: RackTarget; index: number; onReorder(from: number, to: number): void; onContextMenu(event: React.MouseEvent): void }) {
   const [collapsed, setCollapsed] = useState(false)
+  const [bypassMenu, setBypassMenu] = useState<{ x: number; y: number } | null>(null)
   const update = useProjectStore((state) => state.updateTargetEffect)
   const toggle = useProjectStore((state) => state.toggleTargetEffect)
   const remove = useProjectStore((state) => state.removeTargetEffect)
   const showToast = useProjectStore((state) => state.showToast)
-  const addAutomationLane = useProjectStore((state) => state.addAutomationLane)
   const focused = useProjectStore((state) => state.focusedEffectId === effect.id)
-  const [bypassMenu, setBypassMenu] = useState<{ x: number; y: number } | null>(null)
   const engine = useEngine()
   const setParam = (param: string, value: number) => { update(target, effect.id, { [param]: value }); engine.setEffectParam(effect.id, param, value) }
   const toggleEffect = () => {
@@ -253,32 +266,41 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
     toggle(target, effect.id)
     engine.setEffectBypass(effect.id, bypassed)
   }
-  const addAutomation = useCallback((parameterId: string | undefined, label: string, value: number) => {
-    if (target.kind !== 'track') { showToast('오토메이션 레인은 트랙 이펙트에서 추가할 수 있습니다.'); return }
+  const automationItems = useCallback((parameterId: string | undefined, label: string, value: number): MenuItem[] => {
+    if (target.kind !== 'track') return [{ kind: 'item', label: '오토메이션은 트랙 인서트에서만 지원됩니다.', disabled: true, run: () => showToast('오토메이션 레인은 트랙 이펙트에서 추가할 수 있습니다.') }]
     const track = useProjectStore.getState().project.tracks.find((candidate) => candidate.id === target.id)
-    if (!track) return
-    const options = automationOptionsForTrack(track).filter((option) => option.targetKind === 'effect' && option.targetId === effect.id)
-    const normalizedLabel = normalizeParameterLabel(label)
-    const candidates = parameterId
-      ? options.filter((option) => option.parameterId === parameterId)
-      : options.filter((option) => parameterLabelsMatch(normalizedLabel, normalizeParameterLabel(option.label)))
-    const option = candidates.length <= 1 ? candidates[0] : candidates.reduce((closest, candidate) => Math.abs(candidate.defaultValue - value) < Math.abs(closest.defaultValue - value) ? candidate : closest)
-    if (!option) { showToast(`${label} 파라미터를 오토메이션 목록에서 찾지 못했습니다.`); return }
-    addAutomationLane(track.id, option)
-    showToast(`${label} 오토메이션을 추가했습니다.`)
-  }, [addAutomationLane, effect.id, showToast, target])
+    return track ? parameterAutomationMenu(track, 'effect', effect.id, parameterId, label, value) : []
+  }, [effect.id, showToast, target])
   const openEditor = () => {
     if (!effect.plugin) return
     void engine.openPluginEditor('effect', effect.id).catch((error) => showToast(`${effect.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`))
+  }
+  const savePreset = () => {
+    void (async () => {
+      const state = effect.plugin ? await engine.savePluginState('effect', effect.id) : undefined
+      const path = await saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: deviceName(effect.type, effect.plugin), deviceType: effect.type, pluginUid: effect.plugin?.uid, params: { ...effect.params }, state })
+      if (path) showToast(`${deviceName(effect.type, effect.plugin)} 프리셋을 저장했습니다.`)
+    })().catch((error) => showToast(`프리셋 저장 실패: ${String(error)}`))
+  }
+  const loadPreset = () => {
+    void (async () => {
+      const preset = await openDevicePreset()
+      if (!preset) return
+      if (preset.deviceType !== effect.type || (effect.plugin && preset.pluginUid !== effect.plugin.uid)) throw new Error('현재 디바이스와 다른 종류의 프리셋입니다.')
+      if (effect.plugin && preset.state) await engine.loadPluginState('effect', effect.id, preset.state)
+      update(target, effect.id, preset.params)
+      for (const [parameter, value] of Object.entries(preset.params)) engine.setEffectParam(effect.id, parameter, value)
+      showToast(`${deviceName(effect.type, effect.plugin)} 프리셋을 불러왔습니다.`)
+    })().catch((error) => showToast(`프리셋 불러오기 실패: ${String(error)}`))
   }
   const hasSidechain = effect.type === 'builtin:compressor' || (effect.type === 'builtin:vocoder' && Math.round(effect.params.source ?? 3) === 0) || effect.plugin?.supportsSidechain || (effect.plugin?.audioInputBuses ?? 0) > 1
   if (collapsed) return <div className={`device-collapsed ${effect.bypassed ? 'bypassed' : ''}`} data-effect-index={index}><button className="collapsed-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={12} /></button><button className="collapsed-open" onClick={() => setCollapsed(false)} title="펼치기"><span>{deviceName(effect.type, effect.plugin)}</span></button></div>
   return (
     // Only the grip starts reordering. Window-level pointer tracking keeps the
     // gesture alive outside this card and avoids Tauri's native file-drag path.
-    <ParameterAutomationProvider add={addAutomation}>
+    <ParameterAutomationProvider items={automationItems}>
     <article className={`device-card ${effect.type === 'builtin:multiband-compressor' ? 'multiband-card' : ''} ${effect.type === 'builtin:eq8' ? 'eq8-card' : ''} ${effect.type === 'builtin:mastering-limiter' ? 'limiter-card' : ''} ${effect.type === 'builtin:vocoder' ? 'vocoder-card' : ''} ${effect.type === 'builtin:clipper' ? 'clipper-card' : ''} ${effect.type === 'builtin:upward-compressor' ? 'upward-card' : ''} ${effect.type === 'builtin:roboter' ? 'roboter-card' : ''} ${effect.type === 'builtin:resonator' ? 'colorizer-card' : ''} ${effect.bypassed ? 'bypassed' : ''} ${focused ? 'effect-focused' : ''}`} data-effect-index={index} data-effect-id={effect.id} tabIndex={-1} onContextMenu={onContextMenu}>
-      <header className="device-card-header"><div className="device-header-main"><span className="device-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={13} /></span><button className={effect.bypassed ? '' : 'powered'} title={effect.bypassed ? '전원 켜기' : '전원 끄기'} onClick={toggleEffect}><CirclePower size={13} /></button><strong title={effect.plugin ? '더블클릭하여 플러그인 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (effect.plugin) openEditor() }}>{deviceName(effect.type, effect.plugin)}</strong><span>{effect.plugin?.format.toUpperCase() ?? effect.type.replace('builtin:', '').toUpperCase()}</span><div className="device-header-actions"><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button><button className="device-close" onClick={() => remove(target, effect.id)} title="이펙트 제거"><X size={13} /></button></div></div><div className="device-header-sub"><button className={`device-bypass ${effect.bypassed ? 'active' : ''}`} onClick={toggleEffect} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setBypassMenu({ x: event.clientX, y: event.clientY }) }}>BYPASS {effect.bypassed ? 'ON' : 'OFF'}</button>{hasSidechain && <SidechainControl effect={effect} target={target} />}{effect.plugin && effect.plugin.hasEditor !== false && <button className="device-editor-button" title="플러그인 창 열기" onClick={openEditor}><Piano size={12} /><span>OPEN</span></button>}</div></header>
+      <header className="device-card-header"><div className="device-header-main"><span className="device-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={13} /></span><button className={effect.bypassed ? '' : 'powered'} title={effect.bypassed ? '전원 켜기' : '전원 끄기'} onClick={toggleEffect}><CirclePower size={13} /></button><strong title={effect.plugin ? '더블클릭하여 플러그인 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (effect.plugin) openEditor() }}>{deviceName(effect.type, effect.plugin)}</strong><span>{effect.plugin?.format.toUpperCase() ?? effect.type.replace('builtin:', '').toUpperCase()}</span><div className="device-header-actions"><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button><button className="device-close" onClick={() => remove(target, effect.id)} title="이펙트 제거"><X size={13} /></button></div></div><div className="device-header-sub"><button className={`device-bypass ${effect.bypassed ? 'active' : ''}`} onClick={toggleEffect} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setBypassMenu({ x: event.clientX, y: event.clientY }) }}>BYPASS {effect.bypassed ? 'ON' : 'OFF'}</button><button className="device-preset-button" title="프리셋 저장" onClick={savePreset}><Save size={11} /><span>SAVE</span></button><button className="device-preset-button" title="프리셋 불러오기" onClick={loadPreset}><FolderOpen size={11} /><span>LOAD</span></button>{effect.plugin && target.kind === 'track' && <DeviceAutomationModes trackId={target.id} targetKind="effect" targetId={effect.id} />}{hasSidechain && <SidechainControl effect={effect} target={target} />}{effect.plugin && effect.plugin.hasEditor !== false && <button className="device-editor-button" title="플러그인 창 열기" onClick={openEditor}><Piano size={12} /><span>EDIT</span></button>}</div></header>
       <div className="device-body">
         {(effect.type === 'builtin:eq' || effect.type === 'builtin:eq8') && <EqPanel effectId={effect.id} params={effect.params} bypassed={effect.bypassed} bandCount={effect.type === 'builtin:eq8' ? 8 : 4} setParam={setParam} />}
         {effect.type === 'builtin:compressor' && <><div className="parameter-row"><Knob value={effect.params.threshold ?? -18} min={-60} max={0} step={0.1} defaultValue={-18} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={effect.params.ratio ?? 3} min={1} max={20} step={0.1} defaultValue={3} label="RATIO" format={(v) => `${v.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={(effect.params.attack ?? .01) * 1000} min={1} max={500} step={1} defaultValue={10} label="ATTACK" format={msFormat} onChange={(value) => setParam('attack', value / 1000)} /><Knob value={(effect.params.release ?? .2) * 1000} min={10} max={1000} step={1} defaultValue={200} label="RELEASE" format={msFormat} onChange={(value) => setParam('release', value / 1000)} /></div><div className="parameter-row"><Knob value={effect.params.knee ?? 12} min={0} max={24} step={0.5} defaultValue={12} label="KNEE" format={dbFormat} onChange={(value) => setParam('knee', value)} /><Knob value={effect.params.makeupDb ?? 0} min={-12} max={24} step={0.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam('makeupDb', value)} /></div></>}
@@ -291,14 +313,16 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
         {effect.type === 'builtin:lfo-tremolo' && <TremoloPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:clipper' && <ClipperPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:upward-compressor' && <UpwardCompressorPanel params={effect.params} setParam={setParam} />}
+        {effect.type === 'builtin:transient-shaper' && <TransientShaperPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:roboter' && <RoboterPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:resonator' && <ColorizerPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
+        {effect.type === 'builtin:formant-shifter' && <FormantShifterPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:delay' && <><div className="delay-display"><i /><i /><i /><i /><i /></div><div className="parameter-row"><Knob value={effect.params.time ?? .25} min={.01} max={2} step={.01} defaultValue={.25} label="TIME" format={(v) => `${v.toFixed(2)} s`} onChange={(value) => setParam('time', value)} /><Knob value={effect.params.feedback ?? .3} min={0} max={.95} step={.01} defaultValue={.3} label="FEEDBACK" format={percentFormat} onChange={(value) => setParam('feedback', value)} /><Knob value={effect.params.damping ?? .35} min={.01} max={1} step={.01} defaultValue={.35} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div><ToggleRow label="PING PONG" on={(effect.params.pingPong ?? 0) >= 0.5} onToggle={(on) => setParam('pingPong', on ? 1 : 0)} /></>}
         {effect.type === 'builtin:reverb' && <><div className="reverb-display"><span /><span /><span /><span /></div><div className="parameter-row"><Knob value={effect.params.decaySec ?? 2.4} min={.1} max={20} step={.1} defaultValue={2.4} label="DECAY" format={(v) => `${v.toFixed(1)} s`} onChange={(value) => setParam('decaySec', value)} /><Knob value={effect.params.damping ?? .4} min={0} max={1} step={.01} defaultValue={.4} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.width ?? .8} min={0} max={1} step={.01} defaultValue={.8} label="WIDTH" format={percentFormat} onChange={(value) => setParam('width', value)} /><Knob value={effect.params.diffusion ?? .7} min={0} max={.92} step={.01} defaultValue={.7} label="DIFFUSE" format={percentFormat} onChange={(value) => setParam('diffusion', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="DRY / WET" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div></>}
         {effect.type === 'builtin:waveshaper' && <><ShaperDisplay params={effect.params} bypassed={effect.bypassed} onCurve={(curve) => setParam('curve', curve)} /><div className="parameter-row shaper-controls"><Knob value={effect.params.driveDb ?? 6} min={0} max={36} step={.1} defaultValue={6} label="DRIVE" format={dbFormat} onChange={(value) => setParam('driveDb', value)} /><Knob value={effect.params.mix ?? 1} min={0} max={1} step={.01} defaultValue={1} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div><div className="shaper-quality">4× OVERSAMPLING <span>·</span> DC FILTER</div></>}
         {effect.plugin && <ExternalPluginParameters plugin={effect.plugin} values={effect.params} setParam={setParam} />}
       </div>
-      {bypassMenu && <MenuPanel items={[{ kind: 'item', label: '바이패스 오토메이션 추가', run: () => addAutomation('__bypass', '바이패스', effect.bypassed ? 1 : 0) }]} anchor={bypassMenu} onClose={() => setBypassMenu(null)} className="parameter-context-menu" />}
+      {bypassMenu && <MenuPanel items={automationItems('__bypass', '바이패스', effect.bypassed ? 1 : 0)} anchor={bypassMenu} onClose={() => setBypassMenu(null)} className="parameter-context-menu" />}
     </article>
     </ParameterAutomationProvider>
   )
@@ -316,11 +340,44 @@ function ExternalPluginParameters({ plugin, values, setParam }: { plugin: Extern
 }
 
 function PluginParameterGrid({ parameters, values, setParam }: { parameters: NonNullable<ExternalPluginRef['parameters']>; values: Record<string, number>; setParam(id: string, value: number): void }) {
-  return <div className="external-parameter-grid macro-grid">{parameters.map((parameter) => { const min = Number.isFinite(parameter.min) ? parameter.min : 0; const max = Number.isFinite(parameter.max) && parameter.max > min ? parameter.max : 1; const value = values[parameter.id] ?? parameter.defaultValue; const step = Math.max(.0001, (max - min) / 1000); return <label key={parameter.id} title={`${parameter.module} · ${parameter.id}`}><span>{parameter.name}</span><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => setParam(parameter.id, Number(event.target.value))} /><EditableNumber value={value} min={min} max={max} step={step} onChange={(next) => setParam(parameter.id, next)} format={(next) => next.toFixed(Math.abs(next) < 10 ? 3 : 1)} /></label> })}</div>
+  return <div className="external-parameter-grid macro-grid">{parameters.map((parameter) => {
+    const min = Number.isFinite(parameter.min) ? parameter.min : 0
+    const max = Number.isFinite(parameter.max) && parameter.max > min ? parameter.max : 1
+    const value = values[parameter.id] ?? parameter.defaultValue
+    const step = Math.max(.0001, (max - min) / 1000)
+    const binary = min === 0 && max === 1 && /(?:on|off|enable|bypass|mute|solo|sync)$/i.test(parameter.name.trim())
+    return binary
+      ? <AutomationButton key={parameter.id} parameterId={`param:${parameter.id}`} label={parameter.name} value={value} className={`external-param-toggle ${value >= .5 ? 'active' : ''}`} title={`${parameter.module} · ${parameter.id}`} onClick={() => setParam(parameter.id, value >= .5 ? 0 : 1)}><i /><span>{parameter.name}</span></AutomationButton>
+      : <Knob key={parameter.id} parameterId={`param:${parameter.id}`} value={value} min={min} max={max} step={step} defaultValue={parameter.defaultValue} label={parameter.name} format={(next) => next.toFixed(Math.abs(next) < 10 ? 3 : 1)} onChange={(next) => setParam(parameter.id, next)} />
+  })}</div>
 }
 
 function PluginIdentitySurface({ plugin }: { plugin: ExternalPluginRef }) {
   return <div className="plugin-identity-surface"><div className="plugin-identity-mark"><i /><i /><i /><i /><span>{plugin.format.toUpperCase()}</span></div><strong>{plugin.name}</strong><small>{plugin.vendor || 'EXTERNAL DEVICE'}</small></div>
+}
+
+function TransientShaperPanel({ params, setParam }: { params: Record<string, number>; setParam(param: string, value: number): void }) {
+  const attack = params.attack ?? 0
+  const sustain = params.sustain ?? 0
+  const threshold = params.thresholdDb ?? -36
+  const speed = params.speed ?? .5
+  const updatePad = (event: React.PointerEvent<HTMLDivElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect()
+    setParam('thresholdDb', Math.max(-72, Math.min(0, -72 + (event.clientX - bounds.left) / Math.max(1, bounds.width) * 72)))
+    setParam('speed', Math.max(0, Math.min(1, 1 - (event.clientY - bounds.top) / Math.max(1, bounds.height))))
+  }
+  const down = (event: React.PointerEvent<HTMLDivElement>) => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); updatePad(event) }
+  const up = (event: React.PointerEvent<HTMLDivElement>) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
+  const path = `M 4 58 C 24 58, 33 ${58 - attack * 22}, 48 ${58 - attack * 30} C 60 ${58 + attack * 7}, 76 ${58 - sustain * 16}, 112 ${58 - sustain * 16}`
+  return <div className="transient-panel">
+    <div className="transient-display"><svg viewBox="0 0 116 76" preserveAspectRatio="none"><line x1="4" y1="58" x2="112" y2="58" /><path d={path} /></svg><span>ENVELOPE CONTOUR</span></div>
+    <div className="transient-main-controls">
+      <Knob parameterId="attack" value={attack} min={-1} max={1} step={.01} defaultValue={0} label="ATTACK" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('attack', value)} />
+      <Knob parameterId="sustain" value={sustain} min={-1} max={1} step={.01} defaultValue={0} label="SUSTAIN" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('sustain', value)} />
+    </div>
+    <div className="transient-pad-wrap"><b>DETECTOR</b><div className="transient-pad" role="application" aria-label="Threshold and speed XY control" onPointerDown={down} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updatePad(event) }} onPointerUp={up} onPointerCancel={up}><i style={{ left: `${(threshold + 72) / 72 * 100}%`, top: `${(1 - speed) * 100}%` }} /></div><div><span>THRESH {threshold.toFixed(1)} dB</span><span>SPEED {Math.round(speed * 100)}%</span></div></div>
+    <AutomationButton parameterId="clip" label="Clip" value={params.clip ?? 0} className={`transient-clip ${(params.clip ?? 0) >= .5 ? 'active' : ''}`} onClick={() => setParam('clip', (params.clip ?? 0) >= .5 ? 0 : 1)}><CirclePower size={13} /> CLIP</AutomationButton>
+  </div>
 }
 
 const LIMITER_MODES = [
@@ -404,6 +461,42 @@ function UpwardCompressorPanel({ params, setParam }: { params: Record<string, nu
   return <div className="upward-panel">
     <div className="upward-graph"><svg viewBox="0 0 286 104" preserveAspectRatio="none"><defs><linearGradient id="upwardArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#6de6c0" stopOpacity=".42" /><stop offset="1" stopColor="#328c7d" stopOpacity=".03" /></linearGradient></defs><path className="unity" d="M0 94 L286 10" /><path className="area" d={`M0 94 L${points.replaceAll(' ', ' L')} L286 94 Z`} /><polyline points={points} /><line className="threshold" x1={thresholdX} x2={thresholdX} y1="7" y2="97" /><circle cx={thresholdX} cy={94 - (threshold + 72) / 72 * 84} r="3.5" /></svg><span>UPWARD RANGE</span><b>{dbFormat(range)}</b><small>{dbFormat(threshold)} THRESHOLD</small></div>
     <div className="upward-controls parameter-row"><Knob value={threshold} min={-72} max={-6} step={.1} defaultValue={-32} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={ratio} min={1} max={20} step={.1} defaultValue={3} label="RATIO" format={(value) => `${value.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={params.attackMs ?? 35} min={.1} max={500} step={.1} scale="log" defaultValue={35} label="ATTACK" format={msFormat} onChange={(value) => setParam('attackMs', value)} /><Knob value={params.releaseMs ?? 240} min={5} max={2000} step={1} scale="log" defaultValue={240} label="RELEASE" format={msFormat} onChange={(value) => setParam('releaseMs', value)} /><Knob value={range} min={0} max={36} step={.1} defaultValue={12} label="RANGE" format={dbFormat} onChange={(value) => setParam('rangeDb', value)} /><Knob value={params.stereoLink ?? 1} min={0} max={1} step={.01} defaultValue={1} label="LINK" format={percentFormat} onChange={(value) => setParam('stereoLink', value)} /><Knob value={params.mix ?? 1} min={0} max={1} step={.01} defaultValue={1} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /><Knob value={params.outputDb ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="OUTPUT" format={dbFormat} onChange={(value) => setParam('outputDb', value)} /></div>
+  </div>
+}
+
+const semitoneFormat = (value: number) => `${value > 0 ? '+' : ''}${value.toFixed(1)} st`
+
+const FORMANT_MODE_LABELS = ['AUTO', 'MONO · PSOLA-STYLE', 'POLY · PHASE VOCODER']
+
+function FormantShifterPanel({ params, setParam }: { params: Record<string, number>; setParam(param: string, value: number): void }) {
+  const pitch = params.pitchSemitones ?? 0
+  const link = (params.formantLink ?? 1) >= 0.5
+  const formant = link ? pitch : (params.formantSemitones ?? 0)
+  const mode = Math.round(params.mode ?? 0)
+  return <div className="formant-panel">
+    <div className="formant-graph"><svg viewBox="0 0 286 104" preserveAspectRatio="none">
+      <line className="unity" x1="143" x2="143" y1="6" y2="98" />
+      <line className="unity" y1="52" x1="0" y2="52" x2="286" />
+      <circle className="formant-dry" cx="143" cy="52" r="4" />
+      <line className="formant-vector" x1="143" y1="52" x2={143 + pitch * 4.6} y2={52 - formant * 3.6} />
+      <circle className="formant-dot" cx={143 + pitch * 4.6} cy={52 - formant * 3.6} r="5" />
+    </svg><span>{FORMANT_MODE_LABELS[mode]}</span><b>{semitoneFormat(pitch)}</b><small>{link ? 'FORMANT LINKED TO PITCH' : `${semitoneFormat(formant)} FORMANT`}</small></div>
+    <div className="formant-controls">
+      <div className="formant-mode-row">
+        <select value={mode} title="AUTO: 주기성을 감지해 단선율엔 가벼운 Mono, 화음·믹스엔 Poly를 자동 선택" onChange={(event) => setParam('mode', Number(event.target.value))}>
+          <option value={0}>AUTO</option>
+          <option value={1}>MONO</option>
+          <option value={2}>POLY</option>
+        </select>
+        <ToggleRow label="LINK" on={link} onToggle={(value) => setParam('formantLink', value ? 1 : 0)} />
+      </div>
+      <div className="parameter-row">
+        <Knob value={pitch} min={-24} max={24} step={.1} defaultValue={0} label="PITCH" format={semitoneFormat} onChange={(value) => setParam('pitchSemitones', value)} />
+        <div className={link ? 'formant-knob-linked' : ''}><Knob value={formant} min={-24} max={24} step={.1} defaultValue={0} label="FORMANT" format={semitoneFormat} onChange={(value) => setParam('formantSemitones', value)} /></div>
+        <Knob value={params.mix ?? 1} min={0} max={1} step={.01} defaultValue={1} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} />
+        <Knob value={params.outputDb ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="OUTPUT" format={dbFormat} onChange={(value) => setParam('outputDb', value)} />
+      </div>
+    </div>
   </div>
 }
 
@@ -666,7 +759,6 @@ function InstrumentCard({ track }: { track: Track }) {
   const toggleBypass = useProjectStore((state) => state.toggleInstrumentBypass)
   const setPlugin = useProjectStore((state) => state.setTrackInstrumentPlugin)
   const replaceInstrument = useProjectStore((state) => state.replaceTrackInstrument)
-  const addAutomationLane = useProjectStore((state) => state.addAutomationLane)
   const engine = useEngine()
   const [voices, setVoices] = useState(0)
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -683,11 +775,15 @@ function InstrumentCard({ track }: { track: Track }) {
     const inside = state.type !== 'cancel' && !!cardRef.current?.contains(document.elementFromPoint(state.x, state.y))
     setDropActive(inside)
     if (state.type === 'drop' && inside) {
-      replaceInstrument(track.id, state.payload.plugin)
-      useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id })
-      useProjectStore.getState().showToast(`${state.payload.plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
+      const plugin = state.payload.plugin
+      void (plugin ? hydratePluginRef(engine, plugin, true) : Promise.resolve(undefined)).then((detailed) => {
+        replaceInstrument(track.id, detailed)
+        useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id })
+        useProjectStore.getState().showToast(`${detailed?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
+        if (detailed && detailed.hasEditor !== false) openPluginEditorWhenReady(engine, 'instrument', track.id, (error) => useProjectStore.getState().showToast(`${detailed.name} 편집기를 열 수 없습니다: ${String(error)}`))
+      }).catch((error) => useProjectStore.getState().showToast(`${plugin?.name ?? '악기'} 파라미터를 불러오지 못했습니다: ${String(error)}`))
     }
-  }), [replaceInstrument, track.id])
+  }), [engine, replaceInstrument, track.id])
   useEffect(() => {
     if (!pickerOpen || plugins.length || loading) return
     let cancelled = false
@@ -696,28 +792,35 @@ function InstrumentCard({ track }: { track: Track }) {
     return () => { cancelled = true }
   }, [engine, loading, pickerOpen, plugins.length])
   const setParam = (id: string, value: number) => { update(track.id, { [id]: value }); engine.setInstrumentParam(track.id, id, value) }
-  const addAutomation = useCallback((parameterId: string | undefined, label: string, value: number) => {
-    const options = automationOptionsForTrack(useProjectStore.getState().project.tracks.find((candidate) => candidate.id === track.id) ?? track)
-      .filter((option) => option.targetKind === 'instrument' && option.targetId === track.id)
-    const normalizedLabel = normalizeParameterLabel(label)
-    const candidates = parameterId
-      ? options.filter((option) => option.parameterId === parameterId)
-      : options.filter((option) => parameterLabelsMatch(normalizedLabel, normalizeParameterLabel(option.label)))
-    const option = candidates.length <= 1 ? candidates[0] : candidates.reduce((closest, candidate) => Math.abs(candidate.defaultValue - value) < Math.abs(closest.defaultValue - value) ? candidate : closest)
-    if (!option) { useProjectStore.getState().showToast(`${label} 파라미터를 오토메이션 목록에서 찾지 못했습니다.`); return }
-    addAutomationLane(track.id, option)
-    useProjectStore.getState().showToast(`${label} 오토메이션을 추가했습니다.`)
-  }, [addAutomationLane, track])
+  const automationItems = useCallback((parameterId: string | undefined, label: string, value: number) => parameterAutomationMenu(useProjectStore.getState().project.tracks.find((candidate) => candidate.id === track.id) ?? track, 'instrument', track.id, parameterId, label, value), [track])
   const openEditor = () => {
     if (!instrument.plugin) return
     void engine.openPluginEditor('instrument', track.id).catch((error) => useProjectStore.getState().showToast(`${instrument.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`))
   }
+  const savePreset = () => {
+    void (async () => {
+      const state = instrument.plugin ? await engine.savePluginState('instrument', track.id) : undefined
+      const path = await saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: instrument.plugin?.name ?? 'DefaultSynth', deviceType: instrument.type, pluginUid: instrument.plugin?.uid, params: { ...instrument.params }, state })
+      if (path) useProjectStore.getState().showToast(`${instrument.plugin?.name ?? 'DefaultSynth'} 프리셋을 저장했습니다.`)
+    })().catch((error) => useProjectStore.getState().showToast(`프리셋 저장 실패: ${String(error)}`))
+  }
+  const loadPreset = () => {
+    void (async () => {
+      const preset = await openDevicePreset()
+      if (!preset) return
+      if (preset.deviceType !== instrument.type || (instrument.plugin && preset.pluginUid !== instrument.plugin.uid)) throw new Error('현재 악기와 다른 종류의 프리셋입니다.')
+      if (instrument.plugin && preset.state) await engine.loadPluginState('instrument', track.id, preset.state)
+      update(track.id, preset.params)
+      for (const [parameter, value] of Object.entries(preset.params)) engine.setInstrumentParam(track.id, parameter, value)
+      useProjectStore.getState().showToast(`${instrument.plugin?.name ?? 'DefaultSynth'} 프리셋을 불러왔습니다.`)
+    })().catch((error) => useProjectStore.getState().showToast(`프리셋 불러오기 실패: ${String(error)}`))
+  }
   if (collapsed) return <div className={`device-collapsed ${instrument.bypassed ? 'bypassed' : ''}`}><button className="collapsed-open" onClick={() => setCollapsed(false)} title="악기 펼치기"><span>{instrument.plugin?.name ?? 'Test Tone'}</span></button></div>
-  return <ParameterAutomationProvider add={addAutomation}><article
+  return <ParameterAutomationProvider items={automationItems}><article
     ref={cardRef}
     className={`device-card instrument-card ${instrument.bypassed ? 'bypassed' : ''} ${dropActive ? 'instrument-drop-active' : ''}`}
   >
-    <header className="device-card-header"><div className="device-header-main"><span className="device-grip">♪</span><button className={instrument.bypassed ? '' : 'powered'} title={instrument.bypassed ? '인스트루먼트 켜기' : '인스트루먼트 끄기'} onClick={() => toggleBypass(track.id)}><CirclePower size={13} /></button><strong title={instrument.plugin ? '더블클릭하여 악기 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (instrument.plugin) openEditor() }}>{instrument.plugin?.name ?? 'Test Tone'}</strong><span>{instrument.plugin?.format.toUpperCase() ?? `${voices} / ${Math.round(instrument.params.polyphony ?? 16)} voices`}</span><div className="device-header-actions"><button ref={pickerRef} onClick={() => setPickerOpen((open) => !open)} title="인스트루먼트 선택">▾</button><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button>{instrument.plugin && <button className="device-close" title="악기 제거" onClick={() => replaceInstrument(track.id)}><X size={13} /></button>}</div></div><div className="device-header-sub"><button className={`device-bypass ${instrument.bypassed ? 'active' : ''}`} onClick={() => toggleBypass(track.id)}>BYPASS {instrument.bypassed ? 'ON' : 'OFF'}</button>{instrument.plugin && instrument.plugin.hasEditor !== false && <button className="device-editor-button" title="악기 창 열기" onClick={openEditor}><Piano size={12} /><span>OPEN</span></button>}</div></header>
+    <header className="device-card-header"><div className="device-header-main"><span className="device-grip">♪</span><button className={instrument.bypassed ? '' : 'powered'} title={instrument.bypassed ? '인스트루먼트 켜기' : '인스트루먼트 끄기'} onClick={() => toggleBypass(track.id)}><CirclePower size={13} /></button><strong title={instrument.plugin ? '더블클릭하여 악기 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (instrument.plugin) openEditor() }}>{instrument.plugin?.name ?? 'Test Tone'}</strong><span>{instrument.plugin?.format.toUpperCase() ?? `${voices} / ${Math.round(instrument.params.polyphony ?? 16)} voices`}</span><div className="device-header-actions"><button ref={pickerRef} onClick={() => setPickerOpen((open) => !open)} title="인스트루먼트 선택">▾</button><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button>{instrument.plugin && <button className="device-close" title="악기 제거" onClick={() => replaceInstrument(track.id)}><X size={13} /></button>}</div></div><div className="device-header-sub"><button className={`device-bypass ${instrument.bypassed ? 'active' : ''}`} onClick={() => toggleBypass(track.id)}>BYPASS {instrument.bypassed ? 'ON' : 'OFF'}</button><button className="device-preset-button" title="프리셋 저장" onClick={savePreset}><Save size={11} /><span>SAVE</span></button><button className="device-preset-button" title="프리셋 불러오기" onClick={loadPreset}><FolderOpen size={11} /><span>LOAD</span></button>{instrument.plugin && <DeviceAutomationModes trackId={track.id} targetKind="instrument" targetId={track.id} />}{instrument.plugin && instrument.plugin.hasEditor !== false && <button className="device-editor-button" title="악기 창 열기" onClick={openEditor}><Piano size={12} /><span>EDIT</span></button>}</div></header>
     <div className="device-body">
       {instrument.plugin && <ExternalInstrumentEditor track={track} setParam={setParam} />}
       {!instrument.plugin && <>
@@ -735,7 +838,7 @@ function InstrumentCard({ track }: { track: Track }) {
       </div>
       </>}
     </div>
-    {pickerOpen && <FloatingPanel getAnchorElement={getPickerAnchor} onClose={() => setPickerOpen(false)} className="device-picker"><strong>VST3 / CLAP INSTRUMENTS</strong>{loading && <small>플러그인을 검색하는 중…</small>}{plugins.map((plugin) => <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} onClick={() => { void hydratePlugin(engine, plugin); setPlugin(track.id, pluginRef(plugin)); setPickerOpen(false) }}><span>{plugin.name}</span><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category}</small></button>)}{!loading && plugins.length === 0 && <small>설치된 인스트루먼트를 찾지 못했습니다.</small>}</FloatingPanel>}
+    {pickerOpen && <FloatingPanel getAnchorElement={getPickerAnchor} onClose={() => setPickerOpen(false)} className="device-picker"><strong>VST3 / CLAP INSTRUMENTS</strong>{loading && <small>플러그인을 검색하는 중…</small>}{plugins.map((plugin) => <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} onClick={() => { void hydratePlugin(engine, plugin).then((detailed) => { const ref = pluginRef(detailed); setPlugin(track.id, ref); openPluginEditorWhenReady(engine, 'instrument', track.id, (error) => useProjectStore.getState().showToast(`${ref.name} 편집기를 열 수 없습니다: ${String(error)}`)) }); setPickerOpen(false) }}><span>{plugin.name}</span><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category}</small></button>)}{!loading && plugins.length === 0 && <small>설치된 인스트루먼트를 찾지 못했습니다.</small>}</FloatingPanel>}
   </article></ParameterAutomationProvider>
 }
 
@@ -751,7 +854,8 @@ function ExternalInstrumentEditor({ track, setParam }: { track: Track; setParam(
 }
 
 function macroParameters(parameters: NonNullable<ExternalPluginRef['parameters']>) {
-  return parameters.filter((parameter) => `${parameter.module} ${parameter.name}`.toLocaleLowerCase().includes('macro')).slice(0, 32)
+  const preferred = /\b(macro|quick control|perform|performance|assign|remote)\b/i
+  return parameters.filter((parameter) => preferred.test(`${parameter.module} ${parameter.name}`)).slice(0, 32)
 }
 
 function rackParameters(parameters: NonNullable<ExternalPluginRef['parameters']>) {
@@ -1221,8 +1325,12 @@ function AddDevice({ onAdd }: { onAdd(type: EffectType, plugin?: ExternalPluginR
   const normalized = query.trim().toLocaleLowerCase()
   const filtered = entries.filter((entry) => !normalized || `${entry.name} ${entry.detail} ${entry.category}`.toLocaleLowerCase().includes(normalized))
   const groups = EFFECT_CATEGORY_ORDER.map((category) => ({ category, items: filtered.filter((entry) => entry.category === category) })).filter((group) => group.items.length)
-  const choose = (entry: PickerEffect) => { onAdd(entry.type, entry.plugin); setOpen(false); setQuery('') }
-  return <div className="add-device"><button ref={buttonRef} aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(!open)}><Plus size={18} /><span>이펙트 추가</span></button>{open && <FloatingPanel getAnchorElement={getAnchorElement} onClose={() => { setOpen(false); setQuery('') }} className="device-picker grouped-device-picker"><label className="device-picker-search"><span>⌕</span><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="이펙트 검색" /></label>{normalized ? <div className="device-picker-results">{filtered.map((entry) => <button key={entry.key} onClick={() => choose(entry)}><span>{entry.name}</span><small>{entry.category} · {entry.detail}</small></button>)}{filtered.length === 0 && <small className="device-picker-empty">검색 결과가 없습니다.</small>}</div> : <div className="device-picker-groups">{groups.map((group) => <div className="device-picker-group" key={group.category}><button className="device-picker-group-label"><span>{group.category}</span><small>{group.items.length}</small><b>›</b></button><div className="device-picker-submenu"><strong>{group.category.toUpperCase()}</strong>{group.items.map((entry) => <button key={entry.key} onClick={() => choose(entry)}><span>{entry.name}</span><small>{entry.detail}</small></button>)}</div></div>)}</div>}{loading && <small className="device-picker-note">플러그인을 안전하게 검색하는 중…</small>}{error && <small className="plugin-scan-error">검색 실패: {error}</small>}</FloatingPanel>}</div>
+  const choose = (entry: PickerEffect) => {
+    setOpen(false); setQuery('')
+    if (!entry.plugin) { onAdd(entry.type); return }
+    void hydratePluginRef(engine, entry.plugin, false).then((plugin) => onAdd(entry.type, plugin)).catch((reason) => useProjectStore.getState().showToast(`${entry.name} 파라미터를 불러오지 못했습니다: ${String(reason)}`))
+  }
+  return <div className="add-device"><button ref={buttonRef} aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(!open)}><Plus size={18} /><span>이펙트 추가</span></button>{open && <FloatingPanel getAnchorElement={getAnchorElement} onClose={() => { setOpen(false); setQuery('') }} className="device-picker grouped-device-picker"><label className="device-picker-search"><span>⌕</span><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="이펙트 검색" /></label>{normalized ? <div className="device-picker-results">{filtered.map((entry) => <button key={entry.key} onClick={() => choose(entry)}><span>{entry.name}</span><small>{entry.category} · {entry.detail}</small></button>)}{filtered.length === 0 && <small className="device-picker-empty">검색 결과가 없습니다.</small>}</div> : <div className="device-picker-groups">{groups.map((group) => <div className="device-picker-group" data-category={group.category} key={group.category}><button className="device-picker-group-label"><span>{group.category}</span><small>{group.items.length}</small><b>›</b></button><div className="device-picker-submenu"><strong>{group.category.toUpperCase()}</strong>{group.items.map((entry) => <button key={entry.key} onClick={() => choose(entry)}><span>{entry.name}</span><small>{entry.detail}</small></button>)}</div></div>)}</div>}{loading && <small className="device-picker-note">플러그인을 안전하게 검색하는 중…</small>}{error && <small className="plugin-scan-error">검색 실패: {error}</small>}</FloatingPanel>}</div>
 }
 
 function pluginEffectCategory(plugin: PluginDescriptor): string {
@@ -1248,6 +1356,46 @@ function normalizeParameterLabel(label: string): string {
     .replace('drywet', 'mix')
 }
 
+function parameterAutomationMenu(track: Track, targetKind: 'effect' | 'instrument', targetId: string, parameterId: string | undefined, label: string, value: number): MenuItem[] {
+  const normalizeId = (id: string) => id.replace(/^param:/, '')
+  const options = automationOptionsForTrack(track).filter((option) => option.targetKind === targetKind && option.targetId === targetId)
+  const normalizedLabel = normalizeParameterLabel(label)
+  const candidates = parameterId
+    ? options.filter((option) => normalizeId(option.parameterId) === normalizeId(parameterId))
+    : options.filter((option) => parameterLabelsMatch(normalizedLabel, normalizeParameterLabel(option.label)))
+  const option = candidates.length <= 1 ? candidates[0] : candidates.reduce((closest, candidate) => Math.abs(candidate.defaultValue - value) < Math.abs(closest.defaultValue - value) ? candidate : closest)
+  if (!option) return [{ kind: 'item', label: `${label} 파라미터를 찾지 못했습니다.`, disabled: true, run: () => undefined }]
+  const lane = (track.automationLanes ?? []).find((candidate) => candidate.targetKind === targetKind && candidate.targetId === targetId && normalizeId(candidate.parameterId) === normalizeId(option.parameterId))
+  const store = useProjectStore.getState()
+  if (!lane) return [{ kind: 'item', label: `${label} 오토메이션 추가`, run: () => { store.addAutomationLane(track.id, option); store.setTrackAutomationOpen(track.id, true); store.showToast(`${label} 오토메이션을 추가했습니다.`) } }]
+  return [
+    { kind: 'item', label: `${label} 오토메이션 제거`, danger: true, run: () => { store.removeAutomationLane(track.id, lane.id); store.showToast(`${label} 오토메이션을 제거했습니다.`) } },
+    { kind: 'item', label: '트랙에서 보기', run: () => focusAutomationLane(track.id, lane.id) },
+  ]
+}
+
+function focusAutomationLane(trackId: string, laneId: string): void {
+  const store = useProjectStore.getState()
+  store.selectTrack(trackId)
+  store.setTrackAutomationOpen(trackId, true)
+  store.setEditFocus('arrangement')
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const lane = [...document.querySelectorAll<HTMLElement>('[data-automation-lane-id]')].find((element) => element.dataset.automationLaneId === laneId)
+    if (!lane) return
+    lane.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+    lane.classList.add('automation-lane-focus')
+    window.setTimeout(() => lane.classList.remove('automation-lane-focus'), 1400)
+  }))
+}
+
+function DeviceAutomationModes({ trackId, targetKind, targetId }: { trackId: string; targetKind: 'effect' | 'instrument'; targetId: string }) {
+  const allLanes = useProjectStore((state) => state.project.tracks.find((track) => track.id === trackId)?.automationLanes)
+  const lanes = useMemo(() => (allLanes ?? []).filter((lane) => lane.targetKind === targetKind && lane.targetId === targetId), [allLanes, targetId, targetKind])
+  const setMode = useProjectStore((state) => state.setAutomationLaneMode)
+  const active = lanes.length ? lanes[0]?.mode ?? 'read' : 'off'
+  return <div className="device-automation-modes" role="group" aria-label="플러그인 오토메이션 모드" title={lanes.length ? `${lanes.length}개 오토메이션 레인` : '연결된 오토메이션 레인 없음'}>{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${active === mode ? 'active' : ''}`} disabled={!lanes.length} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => lanes.forEach((lane) => setMode(trackId, lane.id, mode))} />)}</div>
+}
+
 function parameterLabelsMatch(control: string, option: string): boolean {
   return control === option || option.startsWith(control) || control.startsWith(option) || option.includes(control)
 }
@@ -1261,12 +1409,13 @@ const CURVE_OPTIONS = ['SOFT CLIP', 'HARD CLIP', 'SINE']
 const EFFECT_CATEGORY_ORDER = ['EQ & Filter', 'Dynamics', 'Color & Drive', 'Modulation', 'Pitch & Vocal', 'Time & Space', 'Utility & Other']
 const EFFECT_CATALOG: EffectCatalogEntry[] = [
   { type: 'builtin:eq', description: '4-band parametric EQ', category: 'EQ & Filter' }, { type: 'builtin:eq8', description: '8-band parametric EQ', category: 'EQ & Filter' },
-  { type: 'builtin:compressor', description: 'Downward dynamics processor', category: 'Dynamics' }, { type: 'builtin:upward-compressor', description: 'Detail recovery below threshold', category: 'Dynamics' }, { type: 'builtin:multiband-compressor', description: '3-band dynamics · LR4 crossover', category: 'Dynamics' }, { type: 'builtin:mastering-limiter', description: 'True Peak · LUFS · four characters', category: 'Dynamics' }, { type: 'builtin:clipper', description: '4× oversampled peak clipping', category: 'Dynamics' },
+  { type: 'builtin:compressor', description: 'Downward dynamics processor', category: 'Dynamics' }, { type: 'builtin:upward-compressor', description: 'Detail recovery below threshold', category: 'Dynamics' }, { type: 'builtin:transient-shaper', description: 'Attack · sustain envelope contouring', category: 'Dynamics' }, { type: 'builtin:multiband-compressor', description: '3-band dynamics · LR4 crossover', category: 'Dynamics' }, { type: 'builtin:mastering-limiter', description: 'True Peak · LUFS · four characters', category: 'Dynamics' }, { type: 'builtin:clipper', description: '4× oversampled peak clipping', category: 'Dynamics' },
   { type: 'builtin:distortion', description: '3-band Tube · Tape · Saturation · Exciter', category: 'Color & Drive' }, { type: 'builtin:waveshaper', description: '3-mode · 4× oversampled shaper', category: 'Color & Drive' }, { type: 'builtin:disperser', description: 'Cascaded all-pass phase dispersion', category: 'Color & Drive' },
   { type: 'builtin:lfo-tremolo', description: 'Volume · pan LFO modulation', category: 'Modulation' }, { type: 'builtin:vocoder', description: '24-band carrier / modulator vocoder', category: 'Modulation' },
   { type: 'builtin:roboter', description: 'Auto-key pitch correction · 5-voice harmonizer', category: 'Pitch & Vocal' },
   { type: 'builtin:resonator', description: 'Harmonic STFT resonator · scale mask', category: 'Pitch & Vocal' },
+  { type: 'builtin:formant-shifter', description: 'PSOLA mono / phase-vocoder poly, auto-selected', category: 'Pitch & Vocal' },
   { type: 'builtin:delay', description: 'Stereo echo', category: 'Time & Space' }, { type: 'builtin:reverb', description: 'FDN room reverb', category: 'Time & Space' },
   { type: 'builtin:utility', description: 'Stereo utility · bass mono', category: 'Utility & Other' },
 ]
-function deviceName(type: string, plugin?: ExternalPluginRef): string { return plugin?.name ?? ({ 'builtin:eq': '4band-EQ', 'builtin:eq8': '8band-EQ', 'builtin:utility': 'Utility', 'builtin:compressor': 'Compressor', 'builtin:upward-compressor': 'Upward Compressor', 'builtin:multiband-compressor': 'Multiband Compressor', 'builtin:clipper': 'Clipper', 'builtin:distortion': 'Distortion', 'builtin:disperser': 'Disperser', 'builtin:roboter': 'Roboter', 'builtin:resonator': COLORIZER_NAME, 'builtin:mastering-limiter': 'Mastering Limiter', 'builtin:vocoder': 'Vocoder', 'builtin:lfo-tremolo': 'LFO Tremolo', 'builtin:delay': 'Echo Space', 'builtin:reverb': 'Room Reverb', 'builtin:waveshaper': 'Drive Shaper' } as Record<string, string>)[type] ?? 'External Plug-in' }
+function deviceName(type: string, plugin?: ExternalPluginRef): string { return plugin?.name ?? ({ 'builtin:eq': '4band-EQ', 'builtin:eq8': '8band-EQ', 'builtin:utility': 'Utility', 'builtin:compressor': 'Compressor', 'builtin:upward-compressor': 'Upward Compressor', 'builtin:transient-shaper': 'Transient Shaper', 'builtin:multiband-compressor': 'Multiband Compressor', 'builtin:clipper': 'Clipper', 'builtin:distortion': 'Distortion', 'builtin:disperser': 'Disperser', 'builtin:roboter': 'Roboter', 'builtin:resonator': COLORIZER_NAME, 'builtin:formant-shifter': 'Formant Shifter', 'builtin:mastering-limiter': 'Mastering Limiter', 'builtin:vocoder': 'Vocoder', 'builtin:lfo-tremolo': 'LFO Tremolo', 'builtin:delay': 'Echo Space', 'builtin:reverb': 'Room Reverb', 'builtin:waveshaper': 'Drive Shaper' } as Record<string, string>)[type] ?? 'External Plug-in' }

@@ -1,16 +1,20 @@
 // Canvas-based arrangement view with Studio One-style track lanes and tool gestures.
-import { ChevronDown, GripVertical, Headphones, Layers3, MoreHorizontal, Piano, Plus, Radio } from 'lucide-react'
+import { ChevronDown, GripVertical, Headphones, Layers3, MoreHorizontal, Piano, Plus, Radio, X } from 'lucide-react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { describeEngineError, gridLabel, secondsPerBar, secondsPerBeat, type AutomationLane, type Clip, type MidiClip, type TimeSignature, type Track } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { seekTo } from '../store/commands'
-import { automationOptionsForTrack, clipSourceStep, snapSeconds, useProjectStore, type ClipGainPointRef } from '../store/projectStore'
+import { automationOptionsForTrack, clipSourceStep, snapSeconds, snapTimeWithSwing, useProjectStore, type ClipGainPointRef } from '../store/projectStore'
 import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
-import { SignalBar } from './controls'
+import { EditableNumber, SignalBar } from './controls'
+import { hexToHsp, hspToHex, type HspColor } from './colorMath'
 import { adaptiveGridStepSec, buildRulerTicks } from './rulerMath'
 import { beginPointerReorder } from './pointerReorder'
 import { subscribeBrowserDrag } from './browserPayload'
+import { openPluginEditorWhenReady } from '../plugins/editor'
+import { hydratePluginRef } from '../plugins/scan'
 import { CLIP_GAIN_CURVE_MID_DB, clipFadeAt, createForwardClipGainSampler, dbToLinearFast, prepareClipGainNodes, sampleClipGainDb, type ClipGainNode } from './clipEnvelopeMath'
 
 const HEADER_WIDTH = 188
@@ -26,6 +30,8 @@ type Gesture = {
   startY?: number
   currentX: number
   clipId?: string
+  sourceClipId?: string
+  copied?: boolean
   original?: Clip | MidiClip
   midi?: boolean
   pointId?: string
@@ -43,6 +49,9 @@ export function Timeline() {
   const trackHeight = useProjectStore((state) => state.trackHeight)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
+  const arrangementSwing = useProjectStore((state) => state.arrangementSwing)
+  const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const signature = useProjectStore((state) => state.project.transport.timeSignature)
   const focused = useProjectStore((state) => state.editFocus === 'arrangement')
   const setEditFocus = useProjectStore((state) => state.setEditFocus)
   const selectTrack = useProjectStore((state) => state.selectTrack)
@@ -51,7 +60,10 @@ export function Timeline() {
   const [instrumentDropPreview, setInstrumentDropPreview] = useState<InstrumentDropPreview | null>(null)
   const [arrangementMenu, setArrangementMenu] = useState<{ x: number; y: number } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const maxEnd = Math.max(180, ...tracks.flatMap((track) => [...track.clips, ...track.midiClips].map((clip) => clip.startSec + clip.durationSec + 12)))
+  const barSec = secondsPerBar(bpm, signature)
+  const contentEnd = Math.max(0, ...tracks.flatMap((track) => [...track.clips, ...track.midiClips].map((clip) => clip.startSec + clip.durationSec)))
+  const expandedEnd = Math.ceil((contentEnd + barSec * 4) / (barSec * 4)) * barSec * 4
+  const maxEnd = Math.max(barSec * 172, expandedEnd)
   const timelineWidth = Math.ceil(maxEnd * pixelsPerSecond)
 
   useFollowPlayhead(scrollRef)
@@ -66,7 +78,7 @@ export function Timeline() {
       const target = document.elementFromPoint(detail.x, detail.y)
       if (!target?.closest('.arrangement')) { setAudioDropPreview(null); return }
       const name = detail.paths[0]!.split(/[\\/]/).at(-1) ?? 'Audio'
-      const placement = resolveAudioDrop({ clientX: detail.x, clientY: detail.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, useProjectStore.getState().project.transport.bpm, name)
+      const placement = resolveAudioDrop({ clientX: detail.x, clientY: detail.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, useProjectStore.getState().project.transport.bpm, arrangementSwing, name)
       setBrowserDragOver(true)
       setAudioDropPreview(placement)
       if (detail.type !== 'drop') return
@@ -74,9 +86,9 @@ export function Timeline() {
       setAudioDropPreview(null)
       detail.paths.forEach((path, index) => { void engine.loadAudioFile(path).then((asset) => useProjectStore.getState().insertAudioAsset(asset, placement.startSec, index === 0 ? placement.targetTrackId : undefined, placement.insertIndex === undefined ? undefined : placement.insertIndex + index)).catch((error) => useProjectStore.getState().showToast(`외부 오디오를 읽을 수 없습니다: ${String(error)}`)) })
     }
-    window.addEventListener('minidaw-native-audio-drag', handleNativeDrag)
-    return () => window.removeEventListener('minidaw-native-audio-drag', handleNativeDrag)
-  }, [engine, gridTicks, pixelsPerSecond, tracks])
+    window.addEventListener('ministudio-native-audio-drag', handleNativeDrag)
+    return () => window.removeEventListener('ministudio-native-audio-drag', handleNativeDrag)
+  }, [arrangementSwing, engine, gridTicks, pixelsPerSecond, tracks])
 
   useEffect(() => subscribeBrowserDrag((state) => {
     const hit = document.elementFromPoint(state.x, state.y)
@@ -87,7 +99,7 @@ export function Timeline() {
 
     if (state.payload.kind === 'media') {
       const media = state.payload
-      const placement = resolveAudioDrop({ clientX: state.x, clientY: state.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, media.name)
+      const placement = resolveAudioDrop({ clientX: state.x, clientY: state.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, arrangementSwing, media.name)
       setInstrumentDropPreview(null)
       setAudioDropPreview(placement)
       setBrowserDragOver(true)
@@ -108,16 +120,20 @@ export function Timeline() {
       setBrowserDragOver(false)
       setInstrumentDropPreview(null)
       if (placement.invalid) { store.showToast('오디오 트랙에는 악기를 넣을 수 없습니다. 트랙 사이 또는 인스트루먼트 트랙에 놓아주세요.'); return }
-      if (placement.targetTrackId) {
-        store.replaceTrackInstrument(placement.targetTrackId, instrument.plugin)
-        store.selectTrack(placement.targetTrackId)
-        store.setRackTarget({ kind: 'track', id: placement.targetTrackId })
-        store.showToast(`${instrument.plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
-        return
-      }
-      const trackId = store.addInstrumentTrack(instrument.plugin, placement.insertIndex)
-      store.setRackTarget({ kind: 'track', id: trackId })
-      store.showToast(`${instrument.plugin?.name ?? 'DefaultSynth'} 트랙을 추가했습니다.`)
+      void (instrument.plugin ? hydratePluginRef(engine, instrument.plugin, true) : Promise.resolve(undefined)).then((plugin) => {
+        if (placement.targetTrackId) {
+          store.replaceTrackInstrument(placement.targetTrackId, plugin)
+          store.selectTrack(placement.targetTrackId)
+          store.setRackTarget({ kind: 'track', id: placement.targetTrackId })
+          store.showToast(`${plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
+          if (plugin && plugin.hasEditor !== false) openPluginEditorWhenReady(engine, 'instrument', placement.targetTrackId, (error) => store.showToast(`${plugin.name} 편집기를 열 수 없습니다: ${String(error)}`))
+          return
+        }
+        const trackId = store.addInstrumentTrack(plugin, placement.insertIndex)
+        store.setRackTarget({ kind: 'track', id: trackId })
+        store.showToast(`${plugin?.name ?? 'DefaultSynth'} 트랙을 추가했습니다.`)
+        if (plugin && plugin.hasEditor !== false) openPluginEditorWhenReady(engine, 'instrument', trackId, (error) => store.showToast(`${plugin.name} 편집기를 열 수 없습니다: ${String(error)}`))
+      }).catch((error) => store.showToast(`${instrument.plugin?.name ?? '악기'} 파라미터를 불러오지 못했습니다: ${String(error)}`))
       return
     }
 
@@ -130,9 +146,11 @@ export function Timeline() {
     const targetId = target.closest<HTMLElement>('[data-track-id]')?.dataset.trackId ?? store.selectedTrackId
     if (!targetId) { store.showToast('이펙트를 놓을 트랙을 먼저 선택하세요.'); return }
     store.selectTrack(targetId)
-    store.addEffect(targetId, effect.type, effect.plugin)
-    store.setRackTarget({ kind: 'track', id: targetId })
-  }), [engine, gridTicks, pixelsPerSecond, tracks])
+    void (effect.plugin ? hydratePluginRef(engine, effect.plugin, false) : Promise.resolve(undefined)).then((plugin) => {
+      store.addEffect(targetId, effect.type, plugin)
+      store.setRackTarget({ kind: 'track', id: targetId })
+    }).catch((error) => store.showToast(`${effect.plugin?.name ?? '이펙트'} 파라미터를 불러오지 못했습니다: ${String(error)}`))
+  }), [arrangementSwing, engine, gridTicks, pixelsPerSecond, tracks])
 
   return (
     <section
@@ -164,7 +182,7 @@ export function Timeline() {
             {track.automationOpen && <AutomationSection track={track} width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />}
           </div>})}
           {audioDropPreview && <><div className="audio-drop-preview" style={{ left: audioDropPreview.left, top: audioDropPreview.top, width: 128, height: audioDropPreview.height }}><span>{audioDropPreview.name}</span></div>{audioDropPreview.lineTop !== undefined && <div className="audio-drop-insert-line" style={{ top: audioDropPreview.lineTop }} />}</>}
-          {instrumentDropPreview && <><div className={`instrument-drop-preview ${instrumentDropPreview.invalid ? 'invalid' : ''} ${instrumentDropPreview.targetTrackId ? 'replace' : ''}`} style={{ left: HEADER_WIDTH, top: instrumentDropPreview.top, width: Math.max(120, Math.min(260, timelineWidth)), height: instrumentDropPreview.height }}><Piano size={13} /><span>{instrumentDropPreview.invalid ? '오디오 트랙에는 삽입할 수 없음' : instrumentDropPreview.targetTrackId ? `${instrumentDropPreview.name}로 악기 교체` : `${instrumentDropPreview.name} 트랙 추가`}</span></div>{instrumentDropPreview.lineTop !== undefined && <div className="instrument-drop-insert-line" style={{ top: instrumentDropPreview.lineTop }} />}</>}
+          {instrumentDropPreview && <><div className={`instrument-drop-preview ${instrumentDropPreview.invalid ? 'invalid' : ''} ${instrumentDropPreview.targetTrackId ? 'replace' : ''}`} style={{ left: HEADER_WIDTH, top: instrumentDropPreview.top, width: timelineWidth, height: instrumentDropPreview.height }}><Piano size={13} /><span>{instrumentDropPreview.invalid ? '오디오 트랙에는 삽입할 수 없음' : instrumentDropPreview.targetTrackId ? `${instrumentDropPreview.name}로 악기 교체` : `${instrumentDropPreview.name} 트랙 추가`}</span></div>{instrumentDropPreview.lineTop !== undefined && <div className="instrument-drop-insert-line" style={{ top: instrumentDropPreview.lineTop }} />}</>}
           <Playhead pixelsPerSecond={pixelsPerSecond} />
         </div>
       </div>
@@ -172,12 +190,11 @@ export function Timeline() {
   )
 }
 
-function resolveAudioDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientX' | 'clientY' | 'shiftKey' | 'target'>, tracks: Track[], scroll: HTMLDivElement | null, pixelsPerSecond: number, gridTicks: number, bpm: number, name = 'Audio'): AudioDropPreview {
+function resolveAudioDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientX' | 'clientY' | 'shiftKey' | 'target'>, tracks: Track[], scroll: HTMLDivElement | null, pixelsPerSecond: number, gridTicks: number, bpm: number, swing: number, name = 'Audio'): AudioDropPreview {
   const content = scroll?.querySelector<HTMLElement>('.timeline-content')
   const contentRect = content?.getBoundingClientRect()
   const rawSec = Math.max(0, ((event.clientX - (contentRect?.left ?? 0)) - HEADER_WIDTH) / pixelsPerSecond)
-  const step = snapSeconds(gridTicks, bpm)
-  const startSec = event.shiftKey ? rawSec : Math.round(rawSec / step) * step
+  const startSec = event.shiftKey ? rawSec : snapTimeWithSwing(rawSec, gridTicks, bpm, swing)
   const left = HEADER_WIDTH + startSec * pixelsPerSecond
   const element = event.target instanceof Element ? event.target : null
   const stack = element?.closest<HTMLElement>('.track-stack')
@@ -205,8 +222,8 @@ function resolveInstrumentDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientY
     const index = tracks.findIndex((track) => track.id === stack.dataset.trackId)
     if (index >= 0) {
       const edge = Math.min(11, rect.height * .2)
-      if (event.clientY <= rect.top + edge) return { name, insertIndex: index, lineTop: rect.top - contentRect.top }
-      if (event.clientY >= rect.bottom - edge) return { name, insertIndex: index + 1, lineTop: rect.bottom - contentRect.top }
+      if (event.clientY <= rect.top + edge) return { name, insertIndex: index, top: rect.top - contentRect.top, height: Math.max(46, rect.height), lineTop: rect.top - contentRect.top }
+      if (event.clientY >= rect.bottom - edge) return { name, insertIndex: index + 1, top: rect.bottom - contentRect.top, height: Math.max(46, rect.height), lineTop: rect.bottom - contentRect.top }
       const track = tracks[index]!
       return { name, targetTrackId: track.kind === 'instrument' ? track.id : undefined, top: rect.top - contentRect.top, height: rect.height, invalid: track.kind !== 'instrument' }
     }
@@ -214,8 +231,10 @@ function resolveInstrumentDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientY
   const stacks = [...(content?.querySelectorAll<HTMLElement>('.track-stack') ?? [])]
   const first = stacks[0]?.getBoundingClientRect()
   const last = stacks.at(-1)?.getBoundingClientRect()
-  if (contentRect && first && event.clientY < first.top) return { name, insertIndex: 0, lineTop: first.top - contentRect.top }
-  return { name, insertIndex: tracks.length, lineTop: contentRect && last ? last.bottom - contentRect.top : 48 }
+  const defaultHeight = Math.max(46, useProjectStore.getState().trackHeight)
+  if (contentRect && first && event.clientY < first.top) return { name, insertIndex: 0, top: first.top - contentRect.top, height: defaultHeight, lineTop: first.top - contentRect.top }
+  const top = contentRect && last ? last.bottom - contentRect.top : 48
+  return { name, insertIndex: tracks.length, top, height: defaultHeight, lineTop: top }
 }
 
 /** One scroll listener for the arrangement; vertical-only motion does no canvas work. */
@@ -300,7 +319,8 @@ function LoopStrip({ width, pixelsPerSecond }: { width: number; pixelsPerSecond:
   const bpm = useProjectStore((state) => state.project.transport.bpm)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
   const gridTicks = useProjectStore((state) => state.gridTicks)
-  const snap = (sec: number, bypass = false) => snapEnabled && !bypass ? Math.round(sec / snapSeconds(gridTicks, bpm)) * snapSeconds(gridTicks, bpm) : sec
+  const swing = useProjectStore((state) => state.arrangementSwing)
+  const snap = (sec: number, bypass = false) => snapEnabled && !bypass ? snapTimeWithSwing(sec, gridTicks, bpm, swing) : sec
 
   const begin = (event: ReactPointerEvent<HTMLElement>, mode: 'start' | 'end' | 'move' | 'draw') => {
     event.preventDefault()
@@ -361,12 +381,13 @@ function Ruler({ width, pixelsPerSecond }: { width: number; pixelsPerSecond: num
   const bpm = useProjectStore((state) => state.project.transport.bpm)
   const signature = useProjectStore((state) => state.project.transport.timeSignature)
   const gridTicks = useProjectStore((state) => state.gridTicks)
+  const swing = useProjectStore((state) => state.arrangementSwing)
   const loop = useProjectStore((state) => state.project.transport.loop)
   const ticks = useMemo(() => buildRulerTicks(width, pixelsPerSecond, bpm, signature), [width, pixelsPerSecond, bpm, signature])
   const point = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rawSec = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left) / pixelsPerSecond)
     const step = snapSeconds(gridTicks, bpm)
-    const sec = Math.round(rawSec / step) * step
+    const sec = snapTimeWithSwing(rawSec, gridTicks, bpm, swing)
     if (event.ctrlKey || event.metaKey || useToolStore.getState().isModifierHeld) { event.preventDefault(); event.stopPropagation(); useProjectStore.getState().setLoopRange(sec, Math.max(loop.endSec, sec + step)); return }
     if (event.altKey) { event.preventDefault(); useProjectStore.getState().setLoopRange(Math.min(loop.startSec, Math.max(0, sec - step)), sec); return }
     seekTo(engine, rawSec)
@@ -388,6 +409,8 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
   const selectedTrackIds = useProjectStore((state) => state.selectedTrackIds)
   const selectTrack = useProjectStore((state) => state.selectTrack)
   const updateTrack = useProjectStore((state) => state.updateTrack)
+  const [colorOpen, setColorOpen] = useState(false)
+  const colorButton = useRef<HTMLButtonElement>(null)
   const reorder = useProjectStore((state) => state.reorderTrack)
   const trackCount = useProjectStore((state) => state.project.tracks.length)
   const setAutomationOpen = useProjectStore((state) => state.setTrackAutomationOpen)
@@ -429,7 +452,8 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
       onClick={(event) => selectTrack(track.id, event.shiftKey)}
       onContextMenu={(event) => { event.preventDefault(); if (!selected) selectTrack(track.id); setMenu({ x: event.clientX, y: event.clientY }) }}
     >
-      <div className="track-color" />
+      <button ref={colorButton} className="track-color" title="트랙 색상 변경" aria-label={`${track.name} 트랙 색상 변경`} onClick={(event) => { event.stopPropagation(); setColorOpen((open) => !open) }} />
+      {colorOpen && <FloatingPanel getAnchorElement={() => colorButton.current} onClose={() => setColorOpen(false)} className="track-color-picker"><TrackColorPicker color={track.color} index={index} onChange={(color) => updateTrack(track.id, { color })} /></FloatingPanel>}
       <span className="drag-handle" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '.track-header[data-track-index]', indexAttribute: 'data-track-index', axis: 'vertical', scrollSelector: '.timeline-scroll', onCommit: reorder })} title="드래그하여 트랙 순서 변경"><GripVertical size={13} /></span>
       <div className="track-header-main">
         <div className="track-number">{String(index + 1).padStart(2, '0')}</div>
@@ -439,6 +463,7 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
       </div>
       <div className="track-header-controls">
         <button className={`automation-toggle ${track.automationOpen ? 'active' : ''}`} title="오토메이션 레인 토글" onClick={(event) => { event.stopPropagation(); const store = useProjectStore.getState(); if (!track.automationOpen && !(track.automationLanes?.length)) { const volume = automationOptionsForTrack(track).find((option) => option.parameterId === 'volumeDb'); if (volume) store.addAutomationLane(track.id, volume) } setAutomationOpen(track.id, !track.automationOpen) }}><ChevronDown size={10} /></button>
+        <input className="track-volume-slider" type="range" min="-60" max="12" step="0.1" value={track.volumeDb} aria-label={`${track.name} 볼륨`} title={`볼륨 ${track.volumeDb.toFixed(1)} dB`} style={{ '--track-volume': `${Math.max(0, Math.min(100, (track.volumeDb + 60) / 72 * 100))}%` } as React.CSSProperties} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); updateTrack(track.id, { volumeDb: 0 }); engine.setTrackVolume(track.id, 0) }} onChange={(event) => { const volumeDb = Number(event.target.value); updateTrack(track.id, { volumeDb }); engine.setTrackVolume(track.id, volumeDb) }} />
         {track.kind === 'instrument' && <button className="instrument-button" title={`${track.instrument?.type ?? 'VST / Instrument'} 악기 창 열기`} onClick={(event) => { event.stopPropagation(); selectTrack(track.id); const store = useProjectStore.getState(); store.setRackTarget({ kind: 'track', id: track.id }); if (track.instrument?.plugin && track.instrument.plugin.hasEditor !== false) void engine.openPluginEditor('instrument', track.id).catch((error) => store.showToast(`${track.instrument!.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`)) }}><Piano size={11} /></button>}
         <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
         <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
@@ -450,6 +475,29 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
 }
 
 const TrackHeader = memo(TrackHeaderView)
+
+function TrackColorPicker({ color, index, onChange }: { color: string; index: number; onChange(color: string): void }) {
+  const [value, setValue] = useState<HspColor>(() => hexToHsp(color))
+  useEffect(() => setValue(hexToHsp(color)), [color])
+  const update = (key: keyof HspColor, nextValue: number) => {
+    const next = { ...value, [key]: nextValue }
+    setValue(next)
+    onChange(hspToHex(next))
+  }
+  const saturationStart = hspToHex({ h: value.h, s: 0, p: value.p })
+  const saturationEnd = hspToHex({ h: value.h, s: 100, p: value.p })
+  const midpoint = hspToHex({ h: value.h, s: value.s, p: 50 })
+  return <>
+    <header><strong>TRACK COLOR · HSP</strong><span>{String(index + 1).padStart(2, '0')}</span></header>
+    <div className="hsp-preview" style={{ '--preview-color': color } as React.CSSProperties}><i /><div><strong>{color.toUpperCase()}</strong><small>PERCEPTUAL COLOR</small></div></div>
+    <div className="hsp-controls">
+      <label><span>HUE</span><input className="hue" type="range" min="0" max="359" step="1" value={value.h} onChange={(event) => update('h', Number(event.target.value))} /><EditableNumber value={value.h} min={0} max={359} step={1} onChange={(next) => update('h', next)} format={(next) => `${Math.round(next)}°`} /></label>
+      <label><span>SAT</span><input type="range" min="0" max="100" step="1" value={value.s} style={{ background: `linear-gradient(90deg,${saturationStart},${saturationEnd})` }} onChange={(event) => update('s', Number(event.target.value))} /><EditableNumber value={value.s} min={0} max={100} step={1} onChange={(next) => update('s', next)} format={(next) => `${Math.round(next)}%`} /></label>
+      <label><span>P-BRT</span><input type="range" min="0" max="100" step="1" value={value.p} style={{ background: `linear-gradient(90deg,#000,${midpoint},#fff)` }} onChange={(event) => update('p', Number(event.target.value))} /><EditableNumber value={value.p} min={0} max={100} step={1} onChange={(next) => update('p', next)} format={(next) => `${Math.round(next)}%`} /></label>
+    </div>
+    <footer><span>H</span> hue <span>S</span> saturation <span>P</span> perceived brightness</footer>
+  </>
+}
 
 function TrackResizeHandle({ track, height }: { track: Track; height: number }) {
   const setHeight = useProjectStore((state) => state.setTrackViewHeight)
@@ -476,6 +524,9 @@ const AUTOMATION_HEIGHT = 54
 
 function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; width: number; pixelsPerSecond: number }) {
   const lanes = useMemo(() => track.automationLanes ?? [], [track.automationLanes])
+  const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const gridTicks = useProjectStore((state) => state.gridTicks)
   const addLane = useProjectStore((state) => state.addAutomationLane)
   const removeLane = useProjectStore((state) => state.removeAutomationLane)
   const replaceLane = useProjectStore((state) => state.replaceAutomationLane)
@@ -493,15 +544,16 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
     groups.set(option.category, items)
     return groups
   }, new Map<string, typeof options>()), [options])
+  const emptyGridStyle = { width, '--automation-grid-step': `${Math.max(1, adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond)}px`, '--automation-bar-step': `${Math.max(1, secondsPerBar(bpm, signature) * pixelsPerSecond)}px` } as React.CSSProperties
   return <div className="automation-section">
-    {!lanes.length && <div className="automation-row automation-empty-row" style={{ height: AUTOMATION_HEIGHT }}><div className="automation-lane-header"><span className="automation-color" style={{ background: track.color }} /><div><small>AUTOMATION</small><strong>레인을 추가하세요</strong></div><button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button></div><div className="automation-empty-canvas" style={{ width }} /></div>}
-    {lanes.map((lane, index) => { const laneHeight = lane.height ?? AUTOMATION_HEIGHT; return <div className="automation-row" key={lane.id} style={{ height: laneHeight }}>
+    {!lanes.length && <div className="automation-row automation-empty-row" style={{ height: AUTOMATION_HEIGHT }}><div className="automation-lane-header"><span className="automation-color" style={{ background: track.color }} /><div><small>AUTOMATION</small><strong>레인을 추가하세요</strong></div><button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button></div><div className="automation-empty-canvas" style={emptyGridStyle} /></div>}
+    {lanes.map((lane, index) => { const laneHeight = lane.height ?? AUTOMATION_HEIGHT; return <div className="automation-row" data-automation-lane-id={lane.id} key={lane.id} style={{ height: laneHeight }}>
       <div className="automation-lane-header">
         <span className="automation-color" style={{ background: track.color }} />
-        <label className="automation-lane-title" title="클릭하여 자동화 파라미터 변경"><small>{lane.category}</small><select value={`${lane.targetKind}:${lane.targetId}:${lane.parameterId}`} onChange={(event) => { const option = allOptions.find((candidate) => `${candidate.targetKind}:${candidate.targetId}:${candidate.parameterId}` === event.target.value); if (option) replaceLane(track.id, lane.id, option) }}>{allOptions.map((option) => <option key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} value={`${option.targetKind}:${option.targetId}:${option.parameterId}`}>{option.category} · {option.label}</option>)}</select></label>
+        <label className="automation-lane-title" title="클릭하여 자동화 파라미터 변경"><ChevronDown size={9} /><small>{lane.category}</small><select value={`${lane.targetKind}:${lane.targetId}:${lane.parameterId}`} onChange={(event) => { const option = allOptions.find((candidate) => `${candidate.targetKind}:${candidate.targetId}:${candidate.parameterId}` === event.target.value); if (option) replaceLane(track.id, lane.id, option) }}>{allOptions.map((option) => <option key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} value={`${option.targetKind}:${option.targetId}:${option.parameterId}`}>{option.category} · {option.label}</option>)}</select></label>
         {index === 0 && <button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button>}
         <div className="automation-mode-grid" role="group" aria-label="오토메이션 모드">{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${(lane.mode ?? 'read') === mode ? 'active' : ''}`} title={{ off: '끄기', write: '쓰기', read: '읽기', latch: '래치' }[mode]} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => setLaneMode(track.id, lane.id, mode)} />)}</div>
-        <button className="automation-remove" title="오토메이션 레인 제거" onClick={() => removeLane(track.id, lane.id)}><span>×</span></button>
+        <button className="automation-remove" title="오토메이션 레인 제거" aria-label="오토메이션 레인 제거" onClick={() => removeLane(track.id, lane.id)}><X size={10} /></button>
       </div>
       <AutomationCurve trackId={track.id} lane={lane} width={width} height={laneHeight} pixelsPerSecond={pixelsPerSecond} />
       <AutomationResizeHandle trackId={track.id} laneId={lane.id} height={laneHeight} />
@@ -537,6 +589,9 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
   const upsert = useProjectStore((state) => state.upsertAutomationPoint)
   const setCurve = useProjectStore((state) => state.setAutomationCurve)
   const selectedPoints = useProjectStore((state) => state.selectedAutomationPoints)
+  const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const gridTicks = useProjectStore((state) => state.gridTicks)
   const svgRef = useRef<SVGSVGElement>(null)
   const dragging = useRef<{ kind: 'point'; id: string; pointerId: number } | { kind: 'curve'; id: string; pointerId: number; linearY: number } | null>(null)
   const hoverTimer = useRef<number>(0)
@@ -550,8 +605,7 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     const y = Math.max(5, Math.min(height - 5, clientY - bounds.top))
     const rawTime = x / pixelsPerSecond
     const state = useProjectStore.getState()
-    const step = state.snapEnabled && !bypassSnap ? snapSeconds(state.gridTicks, state.project.transport.bpm) : 0
-    const timeSec = step ? Math.round(rawTime / step) * step : rawTime
+    const timeSec = state.snapEnabled && !bypassSnap ? snapTimeWithSwing(rawTime, state.gridTicks, state.project.transport.bpm, state.arrangementSwing) : rawTime
     const value = lane.max - (y - 5) / (height - 10) * (lane.max - lane.min)
     return { timeSec, value }
   }, [height, lane.defaultValue, lane.max, lane.min, pixelsPerSecond])
@@ -594,6 +648,9 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     }, 160)
   }
   const selected = new Set(selectedPoints.filter((point) => point.trackId === trackId && point.laneId === lane.id).map((point) => point.pointId))
+  const gridPx = adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond
+  const barPx = secondsPerBar(bpm, signature) * pixelsPerSecond
+  const gridStyle = { '--automation-grid-step': `${Math.max(1, gridPx)}px`, '--automation-bar-step': `${Math.max(1, barPx)}px` } as React.CSSProperties
   const menuPoint = pointMenu ? lane.points.find((point) => point.id === pointMenu.pointId) : undefined
   const pointMenuItems: MenuItem[] = menuPoint ? [
     { kind: 'label', label: lane.label },
@@ -602,7 +659,7 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     { kind: 'separator' },
     { kind: 'item', label: '포인트 삭제', keys: 'Delete', danger: true, run: () => useProjectStore.getState().deleteSelectedAutomationPoints() },
   ] : []
-  return <><svg ref={svgRef} className="automation-curve" width={width} height={height} onDoubleClick={(event) => { if ((event.target as Element).closest('circle')) return; const id = upsert(trackId, lane.id, pointAt(event.clientX, event.clientY, event.shiftKey)); if (id) useProjectStore.getState().selectAutomationPoint({ trackId, laneId: lane.id, pointId: id }) }} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} onPointerLeave={() => { window.clearTimeout(hoverTimer.current) }}>
+  return <><svg ref={svgRef} className="automation-curve" width={width} height={height} style={gridStyle} onDoubleClick={(event) => { if ((event.target as Element).closest('circle')) return; const id = upsert(trackId, lane.id, pointAt(event.clientX, event.clientY, event.shiftKey)); if (id) useProjectStore.getState().selectAutomationPoint({ trackId, laneId: lane.id, pointId: id }) }} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} onPointerLeave={() => { window.clearTimeout(hoverTimer.current) }}>
     <path d={path} />
     {segments.map((segment) => <path key={`hit:${segment.from.id}`} className="automation-segment-hit" d={segment.path} onPointerEnter={() => beginSegmentHover(segment.from.id)} onPointerLeave={() => endSegmentHover(segment.from.id)} />)}
     {segments.map((segment) => <g key={`curve:${segment.from.id}`}>
@@ -622,14 +679,19 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const [cursor, setCursor] = useState('default')
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; sec: number; hit: ReturnType<typeof hitTestTrack>; envelope?: ClipEnvelopeHit } | null>(null)
   const [clipProperties, setClipProperties] = useState<{ x: number; y: number; clipId: string } | null>(null)
+  const trackClipIds = useMemo(() => new Set([...track.clips, ...track.midiClips].map((clip) => clip.id)), [track.clips, track.midiClips])
   const assets = useProjectStore((state) => state.project.assets)
-  const selectedClipIds = useProjectStore((state) => state.selectedClipIds)
-  const selectedClipGainPoint = useProjectStore((state) => state.selectedClipGainPoint)
+  const selectedClipIds = useProjectStore(useShallow((state) => state.selectedClipIds.filter((id) => trackClipIds.has(id))))
+  const selectedClipGainPoint = useProjectStore((state) => state.selectedClipGainPoint?.trackId === track.id ? state.selectedClipGainPoint : null)
   const pixelsPerSecond = useProjectStore((state) => state.pixelsPerSecond)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
   const gridTicks = useProjectStore((state) => state.gridTicks)
+  const swing = useProjectStore((state) => state.arrangementSwing)
   const bpm = useProjectStore((state) => state.project.transport.bpm)
   const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const loop = useProjectStore((state) => state.project.transport.loop)
+  const gridStepPx = useMemo(() => Math.max(1, adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond), [bpm, gridTicks, pixelsPerSecond])
+  const barStepPx = useMemo(() => Math.max(1, secondsPerBar(bpm, signature) * pixelsPerSecond), [bpm, pixelsPerSecond, signature])
   const engine = useEngine()
   const drawFrameRef = useRef(0)
   const latestDrawRef = useRef<() => void>(() => undefined)
@@ -666,8 +728,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const xToSec = (x: number) => x / pixelsPerSecond
   const snap = (sec: number, bypass = false) => {
     if (!snapEnabled || bypass) return sec
-    const step = snapSeconds(gridTicks, bpm)
-    return Math.round(sec / step) * step
+    return snapTimeWithSwing(sec, gridTicks, bpm, swing)
   }
   const pointX = (event: ReactPointerEvent<HTMLCanvasElement>) => event.clientX - event.currentTarget.getBoundingClientRect().left
   const setDropLane = (lane: HTMLElement | null, valid: boolean) => {
@@ -684,7 +745,10 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     const sec = xToSec(x)
     const hit = hitTestTrack(track, x, pixelsPerSecond)
     const envelope = hit && !hit.midi ? hitTestClipEnvelope(track, x, event.clientY - event.currentTarget.getBoundingClientRect().top, pixelsPerSecond, height, selectedClipIds) : null
-    const tool = useToolStore.getState().latchGesture()
+    let tool = useToolStore.getState().latchGesture()
+    // Paint only creates clips on empty lane space. Existing clips always keep
+    // their normal selection/trim affordances, matching established DAWs.
+    if (tool === 'paint' && hit) tool = 'arrow'
     event.currentTarget.setPointerCapture(event.pointerId)
     if (!store.selectedTrackIds.includes(track.id)) store.selectTrack(track.id)
 
@@ -738,11 +802,12 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     else if (!hit.midi && relativeY <= 14 && hit.edge === 'left') mode = 'fade-in'
     else if (!hit.midi && relativeY <= 14 && hit.edge === 'right') mode = 'fade-out'
     let targetClip = hit.clip
+    let copied = false
     if (event.altKey && mode === 'move') {
       const duplicateId = store.duplicateClip(track.id, hit.clip.id)
-      if (duplicateId) targetClip = { ...hit.clip, id: duplicateId }
+      if (duplicateId) { targetClip = { ...hit.clip, id: duplicateId }; copied = true }
     } else store.selectClip(hit.clip.id, event.ctrlKey || event.metaKey)
-    gestureRef.current = { tool, mode, startX: x, currentX: x, clipId: targetClip.id, original: { ...targetClip }, midi: hit.midi }
+    gestureRef.current = { tool, mode, startX: x, currentX: x, clipId: targetClip.id, sourceClipId: hit.clip.id, copied, original: { ...targetClip }, midi: hit.midi }
   }
 
   const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -753,15 +818,29 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
       const tool = getEffectiveTool(useToolStore.getState())
       const hit = hitTestTrack(track, x, pixelsPerSecond)
       const envelope = hit && !hit.midi ? hitTestClipEnvelope(track, x, event.clientY - event.currentTarget.getBoundingClientRect().top, pixelsPerSecond, height, selectedClipIds) : null
-      setCursor(envelope ? (envelope.kind.includes('curve') ? 'ns-resize' : 'move') : event.altKey && !hit?.midi && (hit?.edge === 'left' || hit?.edge === 'right') ? 'col-resize' : cursorFor(tool, hit?.edge))
+      const nextCursor = envelope ? (envelope.kind.includes('curve') ? 'ns-resize' : 'move') : event.altKey && !hit?.midi && (hit?.edge === 'left' || hit?.edge === 'right') ? 'col-resize' : cursorFor(tool === 'paint' && hit ? 'arrow' : tool, hit?.edge)
+      setCursor((current) => current === nextCursor ? current : nextCursor)
       return
     }
     gesture.currentX = x
     if (gesture.mode === 'range' || gesture.mode === 'paint') { setOverlay({ start: gesture.startX, end: x, kind: gesture.mode }); return }
     if (!gesture.original || !gesture.clipId) return
     const delta = (x - gesture.startX) / pixelsPerSecond
-    const original = gesture.original
+    let original = gesture.original
     if (gesture.mode === 'move') {
+      // Alt may be pressed after the drag has started. Restore the source to
+      // its origin once, duplicate it, then continue the same gesture with the
+      // duplicate so the transition is immediate and does not jump.
+      if (event.altKey && !gesture.copied && gesture.sourceClipId) {
+        store.updateClip(track.id, gesture.sourceClipId, { startSec: original.startSec })
+        const duplicateId = store.duplicateClip(track.id, gesture.sourceClipId)
+        if (duplicateId) {
+          gesture.clipId = duplicateId
+          gesture.copied = true
+          gesture.original = { ...original, id: duplicateId }
+          original = gesture.original
+        }
+      }
       store.updateClip(track.id, gesture.clipId, { startSec: Math.max(0, snap(original.startSec + delta, event.shiftKey)) })
       const lane = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('.track-lane') ?? null
       const target = store.project.tracks.find((candidate) => candidate.id === lane?.dataset.trackId)
@@ -790,8 +869,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     if (gesture.mode === 'gain-base' && !gesture.midi && 'gainDb' in original) store.updateClipGain(track.id, gesture.clipId, Math.max(-60, Math.min(0, original.gainDb - (event.clientY - event.currentTarget.getBoundingClientRect().top - (gesture.startY ?? 0)) * 60 / Math.max(1, height - 10))))
     if (gesture.mode === 'gain-point' && !gesture.midi && gesture.pointId && 'gainDb' in original) {
       const rawLocal = Math.max(0, Math.min(original.durationSec, xToSec(x) - original.startSec))
-      const step = snapSeconds(gridTicks, bpm)
-      const timeSec = snapEnabled && !event.shiftKey ? Math.round(rawLocal / step) * step : rawLocal
+      const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(rawLocal, gridTicks, bpm, swing) : rawLocal
       store.upsertClipGainPoint(track.id, gesture.clipId, { id: gesture.pointId, timeSec, valueDb: yToClipGainDb(original, timeSec, event.clientY - event.currentTarget.getBoundingClientRect().top, height) })
     }
     if (gesture.mode === 'gain-curve' && !gesture.midi && gesture.pointId) {
@@ -841,10 +919,18 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     const midi = [...track.midiClips].reverse().find((clip) => x >= clip.startSec * pixelsPerSecond && x <= (clip.startSec + clip.durationSec) * pixelsPerSecond)
     if (midi) { useProjectStore.getState().openMidiEditor(track.id, midi.id); return }
     const audio = hitTest(track.clips, x, pixelsPerSecond)?.clip
-    if (!audio || hitTestClipEnvelope(track, x, y, pixelsPerSecond, height, selectedClipIds)) return
+    if (!audio) {
+      const startSec = Math.max(0, snap(xToSec(x), event.shiftKey))
+      const durationSec = Math.max(.25, loop.endSec - loop.startSec || secondsPerBar(bpm, signature))
+      const store = useProjectStore.getState()
+      if (track.kind === 'instrument') store.addMidiClip(track.id, startSec, durationSec)
+      else store.addSilentClip(track.id, startSec, durationSec)
+      return
+    }
+    if (hitTestClipEnvelope(track, x, y, pixelsPerSecond, height, selectedClipIds)) return
     const localSec = Math.max(0, Math.min(audio.durationSec, x / pixelsPerSecond - audio.startSec))
     if (Math.abs(y - envelopeYAt(audio, localSec, height)) > 8) return
-    const step = snapSeconds(gridTicks, bpm); const timeSec = snapEnabled && !event.shiftKey ? Math.round(localSec / step) * step : localSec
+    const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(localSec, gridTicks, bpm, swing) : localSec
     const id = useProjectStore.getState().upsertClipGainPoint(track.id, audio.id, { timeSec, valueDb: sampleClipGainDb(prepareClipGainNodes(audio), localSec) })
     if (id) useProjectStore.getState().selectClipGainPoint({ trackId: track.id, clipId: audio.id, pointId: id })
   }
@@ -912,18 +998,33 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   ] : []
 
   return (
-    <div className="track-lane" data-track-id={track.id} style={{ width, height }}>
+    <div className="track-lane" data-track-id={track.id} style={{ width, height, '--arrangement-grid-step': `${gridStepPx}px`, '--arrangement-bar-step': `${barStepPx}px` } as React.CSSProperties}>
       <canvas ref={canvasRef} width={Math.min(width, MAX_CANVAS_WIDTH)} height={height} style={{ width, height, cursor }} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
-      <div className="arrangement-clip-layer" aria-hidden="true">
-        {track.clips.map((clip) => <span key={clip.id} className={`arrangement-clip-dom audio ${clip.muted ? 'muted' : ''} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': track.color } as React.CSSProperties}><b>{clip.name ?? assets[clip.assetId]?.name ?? 'Audio clip'}</b></span>)}
-        {track.midiClips.map((clip) => <span key={clip.id} className={`arrangement-clip-dom midi ${clip.muted ? 'muted' : ''} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': clip.color ?? track.color } as React.CSSProperties}><b>{clip.name}</b><i>{clip.notes.slice(0, 96).map((note) => <em key={note.id} style={{ left: `${note.startTicks / Math.max(1, clip.loopLengthTicks) * 100}%`, width: `${Math.max(.4, note.lengthTicks / Math.max(1, clip.loopLengthTicks) * 100)}%`, top: `${10 + (127 - note.pitch) / 127 * 70}%` }} />)}</i></span>)}
-      </div>
+      <ArrangementClipLayer track={track} selected={selectedClipIds} pixelsPerSecond={pixelsPerSecond} bpm={bpm} />
       {overlay && <div className={`gesture-overlay ${overlay.kind}`} style={{ left: Math.min(overlay.start, overlay.end), width: Math.abs(overlay.end - overlay.start) }} />}
       {track.armed && <span className="input-monitor"><Headphones size={10} /> IN</span>}
       {contextMenu && <MenuPanel items={contextItems} anchor={{ x: contextMenu.x, y: contextMenu.y }} onClose={() => setContextMenu(null)} />}
       {clipProperties && (() => { const clip = track.clips.find((item) => item.id === clipProperties.clipId); return clip ? <AudioClipProperties clip={clip} anchor={clipProperties} onClose={() => setClipProperties(null)} onChange={(patch) => useProjectStore.getState().updateClip(track.id, clip.id, patch)} /> : null })()}
     </div>
   )
+}
+
+/**
+ * A lightweight semantic clip layer. The canvas still owns waveforms,
+ * envelopes and hit-testing, but clip identity is no longer coupled to a
+ * single very wide GPU surface. If WebView rejects or evicts that surface,
+ * clips and the CSS grid remain visible instead of producing a blank lane.
+ */
+function ArrangementClipLayer({ track, selected, pixelsPerSecond, bpm }: { track: Track; selected: readonly string[]; pixelsPerSecond: number; bpm: number }) {
+  const selectedSet = useMemo(() => new Set(selected), [selected])
+  return <div className="arrangement-clip-layer" aria-hidden="true">
+    {track.clips.map((clip) => <div key={clip.id} className={`arrangement-clip-dom audio ${clip.muted ? 'muted' : ''} ${selectedSet.has(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': track.color } as React.CSSProperties}><b>{clip.name ?? 'Audio clip'}</b></div>)}
+    {track.midiClips.map((clip) => {
+      const pitches = clip.notes.map((note) => note.pitch)
+      const low = Math.min(36, ...pitches); const high = Math.max(84, ...pitches); const span = Math.max(1, high - low)
+      return <div key={clip.id} className={`arrangement-clip-dom midi ${clip.muted ? 'muted' : ''} ${selectedSet.has(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': clip.color ?? track.color } as React.CSSProperties}><b>♪ {clip.name}</b><i>{clip.notes.slice(0, 256).map((note) => <em key={note.id} style={{ left: note.startTicks / 960 * (60 / bpm) * pixelsPerSecond, width: Math.max(1, note.lengthTicks / 960 * (60 / bpm) * pixelsPerSecond), bottom: `${(note.pitch - low) / span * 100}%` }} />)}</i></div>
+    })}
+  </div>
 }
 
 function AudioClipProperties({ clip, anchor, onClose, onChange }: { clip: Clip; anchor: { x: number; y: number }; onClose(): void; onChange(patch: Partial<Pick<Clip, 'pitchSemitones' | 'fineCents' | 'playbackRate' | 'warpSourceBpm'>>): void }) {
@@ -972,22 +1073,23 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
   context.setTransform(pixelWidth / Math.max(1, width), 0, 0, pixelHeight / Math.max(1, height), 0, 0)
   const visibleStart = Math.max(0, (scroll?.scrollLeft ?? 0) - HEADER_WIDTH)
   const visibleEnd = Math.min(width, visibleStart + (scroll?.clientWidth ?? width) + 2)
+  const selectedSet = new Set(selected)
   context.clearRect(visibleStart, 0, visibleEnd - visibleStart, height)
-  context.fillStyle = '#171c23'
+  context.fillStyle = '#151d24'
   context.fillRect(visibleStart, 0, visibleEnd - visibleStart, height)
   // Grid lines follow the shared musical grid, with bar lines drawn brightest.
   const barWidth = secondsPerBar(bpm, signature) * pps
   const gridStep = adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pps) * pps
   for (let x = Math.floor(visibleStart / gridStep) * gridStep; x < visibleEnd; x += gridStep) {
     const onBar = barWidth > 0 && Math.abs(x / barWidth - Math.round(x / barWidth)) < 1e-6
-    context.fillStyle = onBar ? '#3a4552' : '#232b35'
-    context.fillRect(Math.round(x), 0, 1, height)
+    context.fillStyle = onBar ? '#65798a' : '#354652'
+    context.fillRect(Math.round(x), 0, onBar ? 2 : 1, height)
   }
   for (const clip of track.clips) {
     const x = clip.startSec * pps
     const clipWidth = Math.max(3, clip.durationSec * pps)
     if (x + clipWidth < visibleStart || x > visibleEnd) continue
-    const isSelected = selected.includes(clip.id)
+    const isSelected = selectedSet.has(clip.id)
     context.save()
     context.globalAlpha = clip.muted ? 0.38 : 1
     context.fillStyle = `${track.color}cc`
@@ -1000,7 +1102,7 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
     const gainNodes = prepareClipGainNodes(clip)
     const peaks = assets[clip.assetId]?.peaks
     if (peaks && peaks.length) {
-      context.strokeStyle = 'rgba(5, 15, 24, .66)'
+      context.strokeStyle = 'rgba(225, 246, 255, .74)'
       context.lineWidth = 1
       context.beginPath()
       const usableHeight = Math.max(10, height - 28)
@@ -1034,7 +1136,7 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
     context.beginPath(); context.roundRect(x + 1, 4, clipWidth - 2, height - 8, 3); context.fill(); context.stroke()
     context.fillStyle = '#07131acc'; context.font = '600 10px Inter, sans-serif'; context.fillText(`♪ ${clip.name}`, x + 7, 17, Math.max(0, clipWidth - 14))
     const pitches = clip.notes.map((note) => note.pitch); const low = Math.min(36, ...pitches); const high = Math.max(84, ...pitches); const span = Math.max(1, high - low)
-    context.fillStyle = '#07131aaa'
+    context.fillStyle = '#e7f8ffaa'
     for (const note of clip.notes) { const noteX = x + note.startTicks / 960 * (60 / bpm) * pps; const noteW = Math.max(2, note.lengthTicks / 960 * (60 / bpm) * pps); if (noteX > x + clipWidth) continue; const noteY = height - 8 - (note.pitch - low) / span * (height - 29); context.fillRect(noteX, noteY, Math.min(noteW, x + clipWidth - noteX), 2) }
     context.restore()
   }
@@ -1073,11 +1175,13 @@ function drawClipEnvelope(context: CanvasRenderingContext2D, clip: Clip, nodes: 
 }
 
 function hitTestClipEnvelope(track: Track, x: number, y: number, pps: number, height: number, selectedClipIds: readonly string[]): ClipEnvelopeHit | null {
-  for (const clip of [...track.clips].reverse()) {
+  for (let clipIndex = track.clips.length - 1; clipIndex >= 0; clipIndex -= 1) {
+    const clip = track.clips[clipIndex]!
     const left = clip.startSec * pps; const width = clip.durationSec * pps
     if (x < left || x > left + width) continue
     const nodes = prepareClipGainNodes(clip)
-    for (const point of [...(clip.gainPoints ?? [])].reverse()) if (Math.hypot(x - (left + point.timeSec * pps), y - envelopeYAt(clip, point.timeSec, height, nodes)) <= 8) return { kind: 'gain-point', clip, pointId: point.id }
+    const gainPoints = clip.gainPoints ?? []
+    for (let pointIndex = gainPoints.length - 1; pointIndex >= 0; pointIndex -= 1) { const point = gainPoints[pointIndex]!; if (Math.hypot(x - (left + point.timeSec * pps), y - envelopeYAt(clip, point.timeSec, height, nodes)) <= 8) return { kind: 'gain-point', clip, pointId: point.id } }
     for (let index = 1; index + 1 < nodes.length; index += 1) { const from = nodes[index]!; const to = nodes[index + 1]!; if (!from.id) continue; const local = (from.timeSec + to.timeSec) / 2; if (Math.hypot(x - (left + local * pps), y - envelopeYAt(clip, local, height, nodes)) <= 12) return { kind: 'gain-curve', clip, pointId: from.id } }
     const showBaseGain = selectedClipIds.includes(clip.id) || Math.abs(clip.gainDb) >= .01 || Boolean(clip.gainPoints?.length)
     if (showBaseGain && Math.hypot(x - (left + width / 2), y - envelopeYAt(clip, clip.durationSec / 2, height, nodes)) <= 8) return { kind: 'gain-base', clip }
@@ -1088,7 +1192,8 @@ function hitTestClipEnvelope(track: Track, x: number, y: number, pps: number, he
 }
 
 function hitTest(clips: readonly Clip[], x: number, pps: number): { clip: Clip; edge: 'left' | 'right' | 'body' } | null {
-  for (const clip of [...clips].reverse()) {
+  for (let index = clips.length - 1; index >= 0; index -= 1) {
+    const clip = clips[index]!
     const left = clip.startSec * pps
     const right = (clip.startSec + clip.durationSec) * pps
     if (x < left || x > right) continue
@@ -1105,7 +1210,8 @@ function hitTestTrack(track: Track, x: number, pps: number): { clip: Clip | Midi
 }
 
 function hitTestTimed<T extends { startSec: number; durationSec: number }>(clips: readonly T[], x: number, pps: number): { clip: T; edge: 'left' | 'right' | 'body' } | null {
-  for (const clip of [...clips].reverse()) {
+  for (let index = clips.length - 1; index >= 0; index -= 1) {
+    const clip = clips[index]!
     const left = clip.startSec * pps
     const right = (clip.startSec + clip.durationSec) * pps
     if (x < left || x > right) continue

@@ -1,6 +1,6 @@
-# Performance notes
+﻿# Performance notes
 
-MiniDAW keeps high-frequency UI state and realtime audio controls off the full
+MiniStudio keeps high-frequency UI state and realtime audio controls off the full
 project rebuild path.
 
 ## Frontend and state
@@ -39,14 +39,16 @@ project rebuild path.
 
 ## Native development profile
 
-`run.bat` uses Cargo's `dev-dsp` profile. The MiniDAW crate is compiled with
+`run.bat` uses Cargo's `dev-dsp` profile. The MiniStudio crate is compiled with
 `opt-level = 2`, while dependency crates stay at `opt-level = 0` to keep the
 large Tauri dependency graph cheaper to rebuild. The target cache lives in
-`C:\tmp\minidaw-msvc-target` to avoid Desktop indexer and antivirus file locks.
-The regular `dev` and `test` profiles disable Cargo incremental compilation and
-dependency debug symbols. This trades a little warm-check latency for a much
-smaller and more stable cache; the realtime `dev-dsp` profile was already
-non-incremental. The external target directory remains fully disposable.
+`C:\tmp\ministudio-msvc-target` to avoid Desktop indexer and antivirus file locks.
+The regular `dev` and `test` profiles retain Cargo incremental compilation and
+disable dependency debug symbols. The realtime `dev-dsp` profile is
+non-incremental because reusing per-CGU LLVM objects with `rust-lld` can produce
+stale anonymous-symbol references after an interrupted or invalidated build.
+The layered workspace and fast linker retain short warm rebuilds, and the
+external target directory remains fully disposable.
 
 The first build of a new profile is intentionally expensive. On the reference
 Windows machine used on 2026-08-12:
@@ -88,7 +90,7 @@ npm run build
 npm run lint
 npm test
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
-cargo build --manifest-path src-tauri/Cargo.toml --profile dev-dsp --bin minidaw
+cargo build --manifest-path src-tauri/Cargo.toml --profile dev-dsp --bin ministudio
 ```
 
 `src/store/projectStore.performance.test.ts` locks down waveform sharing,

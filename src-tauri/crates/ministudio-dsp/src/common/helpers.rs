@@ -123,7 +123,11 @@ fn fractional_read(line: &[f32], position: f32) -> f32 {
     } else if wrapped >= length as f32 {
         wrapped -= length as f32
     }
-    let base = wrapped.floor() as usize;
+    // `wrapped` can still round up to exactly `length` here: a small negative `position` plus a
+    // large `length` loses precision once the true sum's distance from `length` is smaller than
+    // an f32 ULP at that magnitude (e.g. `12016.0 + -0.0001` rounds to `12016.0`, not
+    // `12015.9999`). Clamp defensively instead of indexing one past the end.
+    let base = (wrapped.floor() as usize).min(length.saturating_sub(1));
     let fraction = wrapped - base as f32;
     let previous = if base == 0 { length - 1 } else { base - 1 };
     let next = if base + 1 == length { 0 } else { base + 1 };

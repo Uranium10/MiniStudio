@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { MidiNote } from '../engine'
-import { findVisibleNoteStart } from './pianoRollMath'
+import { findVisibleNoteStart, pianoPitchAtClientY } from './pianoRollMath'
 
 describe('piano-roll viewport lookup', () => {
   it('keeps 5,000 sorted notes searchable without a linear scan', () => {
@@ -23,5 +23,13 @@ describe('piano-roll viewport lookup', () => {
 
     expect(checksum).toBeGreaterThan(0)
     expect(elapsed).toBeLessThan(250)
+  })
+
+  it('maps every scrub row to a pitch without horizontal key-shape dead zones', () => {
+    expect(pianoPitchAtClientY(100, 100, 12)).toBe(127)
+    expect(pianoPitchAtClientY(112, 100, 12)).toBe(126)
+    expect(pianoPitchAtClientY(100 + 127 * 12 + 11, 100, 12)).toBe(0)
+    expect(pianoPitchAtClientY(99, 100, 12)).toBeNull()
+    expect(pianoPitchAtClientY(100 + 128 * 12, 100, 12)).toBeNull()
   })
 })

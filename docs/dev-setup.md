@@ -1,4 +1,4 @@
-# Windows development setup
+﻿# Windows development setup
 
 ## Toolchain
 
@@ -29,18 +29,20 @@ Exclusions → Add or remove exclusions** and add:
 ```text
 <project>\src-tauri\target
 <project>\node_modules
-C:\tmp\minidaw-msvc-target
+C:\tmp\ministudio-msvc-target
 %USERPROFILE%\.cargo
 %USERPROFILE%\.rustup
 ```
 
-`run.bat` uses `C:\tmp\minidaw-msvc-target`, so that is the active Rust cache
+`run.bat` uses `C:\tmp\ministudio-msvc-target`, so that is the active Rust cache
 on the default Windows workflow. Keep these directories outside OneDrive,
 Dropbox, and other cloud-synchronized roots.
 
 In **Indexing Options → Modify**, exclude the project build/cache directories,
 especially `target`, `node_modules`, and the external Cargo target directory.
 
-If incremental cache corruption reappears, verify these exclusions first and
-then run a one-time `cargo clean`. Do not disable incremental compilation as a
-permanent workaround.
+If an old incremental cache reports LNK2019/LNK1120 or an undefined
+`anon.*.llvm.*` symbol, verify these exclusions first and then run a one-time
+`cargo clean`. The `dev-dsp` profile already disables per-CGU incremental
+objects while retaining `rust-lld`; normal `dev` and `test` builds remain
+incremental.

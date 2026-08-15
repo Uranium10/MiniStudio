@@ -10,6 +10,13 @@ pub const MAX_BLOCK_SIZE: usize = 2048;
 pub const DISTORTION_SPECTRUM_BINS: usize = 48;
 pub const LIMITER_METER_VALUES: usize = 7;
 
+/// A host-side handle for a native plug-in view. The actual thread-affine GUI
+/// object may live on a dedicated message-pumped UI worker; this Send handle
+/// only forwards lifecycle and coalesced resize requests to that owner.
+pub trait EmbeddedPluginEditor: Send {
+    fn set_rect(&mut self, x: f32, y: f32, width: f32, height: f32);
+}
+
 /// Main-thread/control-plane access to an external plug-in instance.
 ///
 /// The realtime graph only keeps an `Arc` to this interface. Implementations
@@ -17,6 +24,19 @@ pub const LIMITER_METER_VALUES: usize = 7;
 pub trait PluginControl: Send + Sync {
     fn has_editor(&self) -> bool;
     fn open_editor(&self) -> Result<(), String>;
+    /// Opens the native editor inside a host-owned top-level window. The
+    /// coordinates are logical pixels so GUI work remains independent of the
+    /// audio callback and of monitor DPI.
+    fn open_editor_embedded(
+        &self,
+        _parent: usize,
+        _x: f32,
+        _y: f32,
+        _width: f32,
+        _height: f32,
+    ) -> Result<Box<dyn EmbeddedPluginEditor>, String> {
+        Err("embedded plug-in editors are not supported by this host".into())
+    }
     fn close_editor(&self) -> Result<(), String>;
     fn is_editor_open(&self) -> bool;
     fn save_state(&self) -> Result<Vec<u8>, String>;
@@ -101,8 +121,10 @@ pub fn create_builtin_effect(
         "builtin:lfo-tremolo" => Box::new(LfoTremolo::new()),
         "builtin:clipper" => Box::new(Clipper::new()),
         "builtin:upward-compressor" => Box::new(UpwardCompressor::new()),
+        "builtin:transient-shaper" => Box::new(TransientShaper::new()),
         "builtin:roboter" => Box::new(Roboter::new()),
         "builtin:resonator" => Box::new(Colorizer::new()),
+        "builtin:formant-shifter" => Box::new(FormantShifter::new()),
         _ => return None,
     };
     effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);

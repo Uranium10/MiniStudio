@@ -2,7 +2,7 @@
 use ministudio_audio::audio;
 
 use audio::{
-    engine::NativeEngine,
+    engine::{EmbeddedPluginEditor, NativeEngine},
     error::EngineError,
     plugin::PluginDescriptor,
     types::{
@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use specta_typescript::Typescript;
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -26,7 +27,9 @@ use std::{
 };
 use tauri::{
     ipc::{Channel, Response},
-    AppHandle, Manager, State,
+    webview::WebviewBuilder,
+    window::WindowBuilder,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewUrl, WindowEvent,
 };
 #[cfg(feature = "desktop")]
 use tauri::{plugin::TauriPlugin, Runtime};
@@ -36,6 +39,36 @@ use tauri_specta::{collect_commands, Builder};
 type AppRuntime = tauri::test::MockRuntime;
 #[cfg(feature = "desktop")]
 type AppRuntime = tauri::Wry;
+
+thread_local! {
+    /// Native editor views are strictly owned by Tauri's UI thread. A TLS
+    /// registry makes that ownership explicit and prevents accidental access
+    /// from Tokio, plug-in control, or audio threads.
+    static EMBEDDED_PLUGIN_EDITORS: RefCell<HashMap<String, EmbeddedPluginEditorSlot>> =
+        RefCell::new(HashMap::new());
+    static PINNED_PLUGIN_EDITORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+struct EmbeddedPluginEditorSlot {
+    window_label: String,
+    editor: Box<dyn EmbeddedPluginEditor>,
+}
+
+fn close_embedded_plugin_editor(target_id: &str) {
+    // Never run third-party GUI teardown while the TLS registry is borrowed.
+    // VST3 `removed()` may synchronously call back into its host (including a
+    // resize), and that re-entry must be able to inspect the registry safely.
+    let editor = EMBEDDED_PLUGIN_EDITORS.with(|editors| editors.borrow_mut().remove(target_id));
+    drop(editor);
+}
+
+fn resize_embedded_plugin_editor(target_id: &str, x: f32, y: f32, width: f32, height: f32) {
+    EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+        if let Some(editor) = editors.borrow_mut().get_mut(target_id) {
+            editor.editor.set_rect(x, y, width, height);
+        }
+    });
+}
 
 pub const WINDOWS_VST3_PATHS: &[&str] = &[r"C:\Program Files\Common Files\VST3"];
 pub const MACOS_VST3_PATHS: &[&str] = &[
@@ -47,6 +80,16 @@ pub const LINUX_VST3_PATHS: &[&str] = &["~/.vst3", "/usr/lib/vst3"];
 struct NativeEngineState {
     engine: Arc<Mutex<NativeEngine>>,
     export_cancelled: Arc<AtomicBool>,
+    /// Monotonic unpinned-open token. Every ordinary editor request supersedes
+    /// the previous one; pinned editors are the only intentional exception.
+    editor_open_generation: Arc<AtomicUsize>,
+    /// Thread-safe mirror of the UI-thread pin registry, used only to exempt
+    /// pinned resync requests from last-foreground-wins cancellation.
+    pinned_editor_targets: Mutex<HashSet<String>>,
+    /// WebView2 has a fragile destroy/focus edge on Windows. Editors that
+    /// reject embedding keep their hidden shell alive and use the established
+    /// standalone path for the rest of the process lifetime.
+    floating_editor_targets: Mutex<HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -86,6 +129,9 @@ impl Default for NativeEngineState {
         Self {
             engine: Arc::new(Mutex::new(NativeEngine::default())),
             export_cancelled: Arc::new(AtomicBool::new(false)),
+            editor_open_generation: Arc::new(AtomicUsize::new(0)),
+            pinned_editor_targets: Mutex::new(HashSet::new()),
+            floating_editor_targets: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -148,10 +194,13 @@ fn list_media_directory(path: String) -> Result<Vec<MediaDirectoryEntry>, Engine
         if is_hidden_media_entry(&entry) {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else {
+        // `DirEntry::file_type` reports Windows junctions and directory symlinks
+        // as links. Follow metadata here so sample-library subfolders remain
+        // expandable instead of disappearing from the browser tree.
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        let is_directory = file_type.is_dir();
+        let is_directory = metadata.is_dir();
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_audio = name
             .rsplit_once('.')
@@ -162,7 +211,7 @@ fn list_media_directory(path: String) -> Result<Vec<MediaDirectoryEntry>, Engine
                 )
             })
             .unwrap_or(false);
-        if is_directory || (file_type.is_file() && is_audio) {
+        if is_directory || (metadata.is_file() && is_audio) {
             result.push(MediaDirectoryEntry {
                 path: entry.path().to_string_lossy().into_owned(),
                 name,
@@ -200,8 +249,14 @@ fn search_media_directory_blocking(
     }
     let mut result = Vec::new();
     let mut pending = vec![PathBuf::from(path)];
+    let mut visited_paths = HashSet::new();
     let mut visited = 0_usize;
     while let Some(folder) = pending.pop() {
+        if let Ok(canonical) = folder.canonicalize() {
+            if !visited_paths.insert(canonical) {
+                continue;
+            }
+        }
         visited += 1;
         if visited > 20_000 || result.len() >= 500 {
             break;
@@ -213,15 +268,15 @@ fn search_media_directory_blocking(
             if is_hidden_media_entry(&entry) {
                 continue;
             }
-            let Ok(file_type) = entry.file_type() else {
+            let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if file_type.is_dir() {
+            if metadata.is_dir() {
                 pending.push(entry.path());
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if file_type.is_file()
+            if metadata.is_file()
                 && is_supported_audio_name(&name)
                 && name.to_lowercase().contains(&needle)
             {
@@ -283,7 +338,11 @@ fn engine_init(state: State<'_, NativeEngineState>) -> Result<(), EngineError> {
 
 #[tauri::command]
 #[specta::specta]
-fn engine_dispose(state: State<'_, NativeEngineState>) -> Result<(), EngineError> {
+async fn engine_dispose(
+    app: AppHandle<AppRuntime>,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    close_embedded_editors_on_main_thread(&app, None).await?;
     with_engine(&state, |engine| {
         engine.dispose();
         Ok(())
@@ -326,13 +385,35 @@ fn engine_unload_asset(
 
 #[tauri::command]
 #[specta::specta]
-fn engine_sync_graph(
+async fn engine_sync_graph(
     mut snapshot: GraphSnapshot,
+    app: AppHandle<AppRuntime>,
     state: State<'_, NativeEngineState>,
     plugins: State<'_, PluginRegistryState>,
 ) -> Result<(), EngineError> {
+    // Invalidate editor attachments aimed at the graph that is about to be
+    // retired. Shell resync requests receive a fresh generation afterward.
+    state.editor_open_generation.fetch_add(1, Ordering::AcqRel);
+    // A graph replacement can destroy the plug-in instance backing a native
+    // editor. Finish detaching every UI-thread-owned view before touching the
+    // graph, otherwise deleting a track leaves vendor GUI code with a stale
+    // instance pointer and can terminate the process.
+    close_embedded_editors_on_main_thread(&app, None).await?;
     resolve_plugin_paths(&mut snapshot, &plugins);
-    with_engine(&state, |engine| engine.sync_graph(snapshot))
+    state
+        .floating_editor_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+    with_engine(&state, |engine| {
+        let result = engine.sync_graph(snapshot);
+        // Requests that started while waiting for the engine lock must not
+        // attach a view to either the retired or half-rebuilt graph. Publish a
+        // second fence while still holding that lock; the frontend will issue
+        // restoration only after this command has returned.
+        state.editor_open_generation.fetch_add(1, Ordering::AcqRel);
+        result
+    })
 }
 
 fn resolve_plugin_paths(snapshot: &mut GraphSnapshot, registry: &PluginRegistryState) {
@@ -596,10 +677,12 @@ fn engine_get_audio_settings(
 
 #[tauri::command]
 #[specta::specta]
-fn engine_set_audio_settings(
+async fn engine_set_audio_settings(
     settings: AudioSettings,
+    app: AppHandle<AppRuntime>,
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
+    close_embedded_editors_on_main_thread(&app, None).await?;
     with_engine(&state, |engine| engine.set_settings(settings))
 }
 
@@ -653,26 +736,748 @@ fn validate_plugin_target_kind(kind: &str) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-#[specta::specta]
-fn engine_open_plugin_editor(
+const PLUGIN_SHELL_TOOLBAR_HEIGHT: f32 = 52.0;
+const PLUGIN_SHELL_CLOSED_EVENT: &str = "ministudio:plugin-shell-closed";
+const PLUGIN_SHELL_REACTIVATE_EVENT: &str = "ministudio:plugin-shell-reactivate";
+const PLUGIN_SHELL_CONNECTION_EVENT: &str = "ministudio:plugin-shell-connection";
+const PLUGIN_SHELL_REQUEST_EVENT: &str = "ministudio:plugin-shell-request";
+
+/// Embedded commercial plug-in HWNDs are still an experimental host path.
+/// The production-safe default uses each format's established, message-pumped
+/// native window and never destroys an unrelated editor while opening another.
+/// Developers can opt back into the shell while working on process-isolated
+/// editor hosting without making vendor-specific allow/deny lists.
+fn embedded_plugin_shells_enabled() -> bool {
+    std::env::var("MINISTUDIO_EXPERIMENTAL_EMBEDDED_EDITORS")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "on" | "ON"))
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginShellConnection {
+    status: &'static str,
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginShellTargetPayload {
     target_kind: String,
     target_id: String,
-    state: State<'_, NativeEngineState>,
+    window_label: String,
+}
+
+/// WebView2 controller creation is substantially slower than creating the
+/// native owner window or attaching most VST3 views. Build the toolbar after
+/// one paint frame so it never gates time-to-first-plug-in-pixel.
+fn spawn_plugin_shell_toolbar(window: tauri::Window<AppRuntime>, label: String, url: String) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        if window
+            .webviews()
+            .iter()
+            .any(|webview| webview.label() == label)
+        {
+            return;
+        }
+        let size = window.inner_size().ok();
+        let scale = window.scale_factor().unwrap_or(1.0).max(0.5);
+        let width = size.map(|size| size.width as f64 / scale).unwrap_or(920.0);
+        if let Err(error) = window.add_child(
+            WebviewBuilder::new(&label, WebviewUrl::App(url.into())),
+            LogicalPosition::new(0.0, 0.0),
+            LogicalSize::new(width, PLUGIN_SHELL_TOOLBAR_HEIGHT as f64),
+        ) {
+            eprintln!("failed to create deferred plug-in toolbar {label}: {error}");
+        }
+    });
+}
+
+fn plugin_shell_label(target_kind: &str, target_id: &str) -> String {
+    let safe = target_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("plugin-{target_kind}-{safe}")
+}
+
+/// Drops embedded editor handles on the UI thread that owns their HWNDs.
+/// Passing `None` closes every editor before a graph-wide mutation.
+async fn close_embedded_editors_on_main_thread(
+    app: &AppHandle<AppRuntime>,
+    target_id: Option<String>,
 ) -> Result<(), EngineError> {
-    with_engine(&state, |engine| {
-        validate_plugin_target_kind(&target_kind)?;
-        engine.open_plugin_editor(&target_id)
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    let ui_app = app.clone();
+    app.run_on_main_thread(move || {
+        let editors = if let Some(target_id) = target_id {
+            EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+                editors
+                    .borrow_mut()
+                    .remove(&target_id)
+                    .map(|slot| vec![slot])
+                    .unwrap_or_default()
+            })
+        } else {
+            EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+                editors
+                    .borrow_mut()
+                    .drain()
+                    .map(|(_, slot)| slot)
+                    .collect::<Vec<_>>()
+            })
+        };
+        // A graph rebuild temporarily detaches every native view. Hide the
+        // owner windows as part of the same UI-thread transaction; surviving
+        // targets are reopened by the shell bridge after graph sync, while a
+        // deleted track can never leave a stale blank host window behind.
+        for slot in editors {
+            if let Some(window) = ui_app.get_window(&slot.window_label) {
+                let _ = window.hide();
+            }
+            // Hiding the owner first prevents vendor paint/focus callbacks
+            // from racing the detach. The registry borrow ended above, so a
+            // synchronous VST3 host callback cannot trigger a RefCell panic.
+            drop(slot);
+        }
+        let _ = reply.send(());
     })
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| EngineError::Internal("native editor UI-thread detach timed out".into()))
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?
+}
+
+/// Keeps at most one ordinary hosted editor visible. Pinned editors are
+/// excluded, and the target currently being opened is never disturbed.
+async fn close_other_unpinned_editors_on_main_thread(
+    app: &AppHandle<AppRuntime>,
+    current_target_id: String,
+    cancellation: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<bool, EngineError> {
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    let ui_app = app.clone();
+    app.run_on_main_thread(move || {
+        if editor_open_is_superseded(&cancellation) {
+            let _ = reply.send(false);
+            return;
+        }
+        let pinned = PINNED_PLUGIN_EDITORS.with(|targets| targets.borrow().clone());
+        let closing = EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+            let mut editors = editors.borrow_mut();
+            let target_ids = editors
+                .keys()
+                .filter(|target_id| {
+                    target_id.as_str() != current_target_id.as_str() && !pinned.contains(*target_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            target_ids
+                .into_iter()
+                .filter_map(|target_id| editors.remove(&target_id).map(|slot| (target_id, slot)))
+                .collect::<Vec<_>>()
+        });
+        for (_, slot) in closing {
+            let label = slot.window_label.clone();
+            if let Some(window) = ui_app.get_window(&label) {
+                let _ = window.hide();
+            }
+            // Drop only after the registry borrow and window-hide operation
+            // have both completed; vendor `removed()` is allowed to re-enter.
+            drop(slot);
+            let _ = ui_app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, label);
+        }
+        let _ = reply.send(true);
+    })
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| EngineError::Internal("native editor switch timed out".into()))
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?
 }
 
 #[tauri::command]
 #[specta::specta]
-fn engine_close_plugin_editor(
-    target_kind: String,
+async fn engine_set_plugin_editor_pinned(
     target_id: String,
+    pinned: bool,
+    app: AppHandle<AppRuntime>,
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
+    {
+        let mut targets = state
+            .pinned_editor_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pinned {
+            targets.insert(target_id.clone());
+        } else {
+            targets.remove(&target_id);
+        }
+    }
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        PINNED_PLUGIN_EDITORS.with(|targets| {
+            let mut targets = targets.borrow_mut();
+            if pinned {
+                targets.insert(target_id);
+            } else {
+                targets.remove(&target_id);
+            }
+        });
+        let _ = reply.send(());
+    })
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| EngineError::Internal("native editor pin update timed out".into()))
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?
+}
+
+fn editor_open_is_superseded(cancellation: &Option<(Arc<AtomicUsize>, usize)>) -> bool {
+    cancellation
+        .as_ref()
+        .is_some_and(|(generation, expected)| generation.load(Ordering::Acquire) != *expected)
+}
+
+/// Opens a VST3 view on its message-pumped GUI worker without blocking Tauri's
+/// event loop, then installs only the Send proxy in the UI-thread registry.
+/// Registry mutation remains on Tauri's thread; third-party GUI construction
+/// and destruction remain on the dedicated thread that owns their HWNDs.
+async fn attach_embedded_editor(
+    app: &AppHandle<AppRuntime>,
+    engine: Arc<Mutex<NativeEngine>>,
+    target_id: String,
+    window_label: String,
+    parent: usize,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    cancellation: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<Result<bool, String>, EngineError> {
+    // Remove the previous proxy first. Its CloseEmbedded message is queued
+    // before the new OpenEmbedded request on the same plug-in GUI worker.
+    let (detach_reply, detach_receive) = std::sync::mpsc::sync_channel(1);
+    let detach_target = target_id.clone();
+    let detach_cancellation = cancellation.clone();
+    app.run_on_main_thread(move || {
+        if editor_open_is_superseded(&detach_cancellation) {
+            let _ = detach_reply.send(false);
+            return;
+        }
+        close_embedded_plugin_editor(&detach_target);
+        let _ = detach_reply.send(true);
+    })
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let detached = tauri::async_runtime::spawn_blocking(move || {
+        detach_receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| EngineError::Internal("native editor proxy detach timed out".into()))
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))??;
+    if !detached || editor_open_is_superseded(&cancellation) {
+        return Ok(Ok(false));
+    }
+
+    let open_cancellation = cancellation.clone();
+    let open_target = target_id.clone();
+    let opened = tauri::async_runtime::spawn_blocking(move || {
+        if editor_open_is_superseded(&open_cancellation) {
+            return Ok(None);
+        }
+        // Hold the global engine mutex only long enough to clone this target's
+        // control Arc. Commercial GUI startup never runs under that lock.
+        let control = engine
+            .lock()
+            .map_err(|_| "native engine control lock is poisoned".to_owned())
+            .and_then(|engine| engine.plugin_control(&open_target))?;
+        if editor_open_is_superseded(&open_cancellation) {
+            return Ok(None);
+        }
+        control
+            .open_editor_embedded(parent, x, y, width, height)
+            .map(Some)
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let editor = match opened {
+        Ok(Some(editor)) => editor,
+        Ok(None) => return Ok(Ok(false)),
+        Err(error) => return Ok(Err(error)),
+    };
+
+    let (reply, receive) = std::sync::mpsc::sync_channel(1);
+    let install_cancellation = cancellation.clone();
+    app.run_on_main_thread(move || {
+        if editor_open_is_superseded(&install_cancellation) {
+            drop(editor);
+            let _ = reply.send(false);
+            return;
+        }
+        EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+            editors.borrow_mut().insert(
+                target_id,
+                EmbeddedPluginEditorSlot {
+                    window_label,
+                    editor,
+                },
+            );
+        });
+        let _ = reply.send(true);
+    })
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let installed = tauri::async_runtime::spawn_blocking(move || {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| EngineError::Internal("native editor proxy install timed out".into()))
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))??;
+    Ok(Ok(installed))
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn engine_open_plugin_editor(
+    target_kind: String,
+    target_id: String,
+    foreground: bool,
+    app: AppHandle<AppRuntime>,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    validate_plugin_target_kind(&target_kind).map_err(EngineError::from)?;
+    if !embedded_plugin_shells_enabled() {
+        // Clone the per-plug-in control under the engine mutex, then release
+        // the global lock before entering vendor GUI code. Standalone VST3 and
+        // CLAP windows own a dedicated message-pumped thread, matching the
+        // stable pre-shell behavior and allowing several editors to coexist.
+        let control = state
+            .engine
+            .lock()
+            .map_err(|_| EngineError::Internal("native engine control lock is poisoned".into()))?
+            .plugin_control(&target_id)
+            .map_err(EngineError::from)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            control.open_editor().map_err(EngineError::from)
+        })
+        .await
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    }
+    let pinned = state
+        .pinned_editor_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&target_id);
+    let request_generation = if pinned {
+        state.editor_open_generation.load(Ordering::Acquire)
+    } else {
+        state
+            .editor_open_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    };
+    // Retained in IPC as an explicit distinction for diagnostics and future
+    // scheduling policy; request order already makes foreground opens win.
+    let _intent_is_foreground = foreground;
+    let cancellation = (!pinned).then(|| {
+        (
+            Arc::clone(&state.editor_open_generation),
+            request_generation,
+        )
+    });
+    if !close_other_unpinned_editors_on_main_thread(&app, target_id.clone(), cancellation.clone())
+        .await?
+        || editor_open_is_superseded(&cancellation)
+    {
+        return Ok(());
+    }
+    // Standalone fallback editors (for example CLAP editors that cannot be
+    // embedded safely) have no MiniStudio toolbar, and therefore cannot be
+    // pinned. Apply the same single-active-editor policy to them explicitly.
+    let floating_to_close = {
+        let mut targets = state
+            .floating_editor_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let closing = targets
+            .iter()
+            .filter(|candidate| candidate.as_str() != target_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        for candidate in &closing {
+            targets.remove(candidate);
+        }
+        closing
+    };
+    for candidate in floating_to_close {
+        let _ = with_engine(&state, |engine| engine.close_plugin_editor(&candidate));
+        for kind in ["instrument", "effect"] {
+            let old_label = plugin_shell_label(kind, &candidate);
+            if let Some(window) = app.get_window(&old_label) {
+                let _ = window.hide();
+            }
+            let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, old_label);
+        }
+    }
+    let label = plugin_shell_label(&target_kind, &target_id);
+    if let Some(window) = app.get_window(&label) {
+        let is_open = with_engine(
+            &state,
+            |engine| Ok(engine.plugin_editor_is_open(&target_id)),
+        )?;
+        let floating = state
+            .floating_editor_targets
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&target_id);
+        if floating {
+            if !is_open {
+                with_engine(&state, |engine| engine.open_plugin_editor(&target_id))?;
+            }
+            return Ok(());
+        }
+        if !is_open {
+            // Show WebView2 before parenting the native editor. Showing the
+            // shell after embedding raises wry's browser HWND above the VST3
+            // sibling and leaves a connected editor hidden behind the page.
+            let _ = window.unminimize();
+            window
+                .show()
+                .map_err(|error| EngineError::Internal(error.to_string()))?;
+            let size = window
+                .inner_size()
+                .map_err(|error| EngineError::Internal(error.to_string()))?;
+            let scale = window.scale_factor().unwrap_or(1.0).max(0.5) as f32;
+            #[cfg(target_os = "windows")]
+            let parent = window
+                .hwnd()
+                .map_err(|error| EngineError::Internal(error.to_string()))?
+                .0 as usize;
+            #[cfg(not(target_os = "windows"))]
+            let parent = 0usize;
+            let _ = app.emit_to(
+                &label,
+                PLUGIN_SHELL_CONNECTION_EVENT,
+                PluginShellConnection {
+                    status: "connecting",
+                    error: None,
+                },
+            );
+            let result = attach_embedded_editor(
+                &app,
+                Arc::clone(&state.engine),
+                target_id.clone(),
+                label.clone(),
+                parent,
+                0.0,
+                PLUGIN_SHELL_TOOLBAR_HEIGHT,
+                size.width as f32 / scale,
+                (size.height as f32 / scale - PLUGIN_SHELL_TOOLBAR_HEIGHT).max(1.0),
+                cancellation.clone(),
+            )
+            .await;
+            if editor_open_is_superseded(&cancellation) {
+                close_embedded_editors_on_main_thread(&app, Some(target_id.clone())).await?;
+                let _ = window.hide();
+                return Ok(());
+            }
+            match result {
+                Ok(Ok(true)) => {
+                    let _ = app.emit_to(
+                        &label,
+                        PLUGIN_SHELL_CONNECTION_EVENT,
+                        PluginShellConnection {
+                            status: "ready",
+                            error: None,
+                        },
+                    );
+                }
+                Ok(Ok(false)) => {
+                    let _ = window.hide();
+                    return Ok(());
+                }
+                Ok(Err(embed_error)) => {
+                    let _ = window.hide();
+                    state
+                        .floating_editor_targets
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(target_id.clone());
+                    let _ = app.emit_to(
+                        &label,
+                        PLUGIN_SHELL_CONNECTION_EVENT,
+                        PluginShellConnection {
+                            status: "failed",
+                            error: Some(embed_error.clone()),
+                        },
+                    );
+                    let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, &label);
+                    return with_engine(&state, |engine| engine.open_plugin_editor(&target_id))
+                        .map_err(|fallback| {
+                            EngineError::Internal(format!(
+                                "{embed_error}; fallback failed: {fallback}"
+                            ))
+                        });
+                }
+                Err(error) => {
+                    let _ = window.hide();
+                    let _ = app.emit_to(
+                        &label,
+                        PLUGIN_SHELL_CONNECTION_EVENT,
+                        PluginShellConnection {
+                            status: "failed",
+                            error: Some(error.to_string()),
+                        },
+                    );
+                    let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, &label);
+                    return Err(error);
+                }
+            }
+        }
+        let _ = window.unminimize();
+        window
+            .show()
+            .map_err(|error| EngineError::Internal(error.to_string()))?;
+        let size = window
+            .inner_size()
+            .map_err(|error| EngineError::Internal(error.to_string()))?;
+        let scale = window.scale_factor().unwrap_or(1.0).max(0.5) as f32;
+        // `show` may raise WebView2's browser child. Re-applying the native
+        // rectangle also restores the editor container's sibling z-order.
+        resize_embedded_plugin_editor(
+            &target_id,
+            0.0,
+            PLUGIN_SHELL_TOOLBAR_HEIGHT,
+            size.width as f32 / scale,
+            (size.height as f32 / scale - PLUGIN_SHELL_TOOLBAR_HEIGHT).max(1.0),
+        );
+        let _ = app.emit_to(&label, PLUGIN_SHELL_REACTIVATE_EVENT, ());
+        return Ok(());
+    }
+
+    let url = format!(
+        "index.html?pluginShell=1&targetKind={target_kind}&targetId={target_id}&windowLabel={label}"
+    );
+    let mut builder = WindowBuilder::new(&app, &label)
+        .title("MiniStudio Plug-in")
+        .inner_size(920.0, 680.0)
+        .min_inner_size(420.0, 260.0)
+        .resizable(true)
+        .focused(false)
+        .visible(false);
+    if let Some(main) = app.get_window("main") {
+        builder = builder
+            .parent(&main)
+            .map_err(|error| EngineError::Internal(error.to_string()))?;
+    }
+    let window = builder
+        .build()
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    // Register the target before the deferred toolbar is alive. Graph rebuilds
+    // can therefore preserve/reopen this editor without waiting for WebView2.
+    let _ = app.emit_to(
+        "main",
+        PLUGIN_SHELL_REQUEST_EVENT,
+        PluginShellTargetPayload {
+            target_kind: target_kind.clone(),
+            target_id: target_id.clone(),
+            window_label: label.clone(),
+        },
+    );
+    // Never destroy a secondary WebView2 toolbar during an editor transition.
+    // Hiding retains its initialized controller and is cheaper on reopen.
+    let lifecycle_engine = Arc::clone(&state.engine);
+    let lifecycle_id = target_id.clone();
+    let event_window = window.clone();
+    let lifecycle_app = app.clone();
+    let lifecycle_label = label.clone();
+    window.on_window_event(move |event| match event {
+        WindowEvent::Resized(size) => {
+            let scale = event_window.scale_factor().unwrap_or(1.0).max(0.5) as f32;
+            if let Some(toolbar) = lifecycle_app.get_webview(&lifecycle_label) {
+                let _ = toolbar.set_size(LogicalSize::new(
+                    size.width as f64 / scale as f64,
+                    PLUGIN_SHELL_TOOLBAR_HEIGHT as f64,
+                ));
+            }
+            resize_embedded_plugin_editor(
+                &lifecycle_id,
+                0.0,
+                PLUGIN_SHELL_TOOLBAR_HEIGHT,
+                size.width as f32 / scale,
+                (size.height as f32 / scale - PLUGIN_SHELL_TOOLBAR_HEIGHT).max(1.0),
+            );
+        }
+        WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            let _ = event_window.hide();
+            let _ = lifecycle_app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, &lifecycle_label);
+            close_embedded_plugin_editor(&lifecycle_id);
+            let engine = Arc::clone(&lifecycle_engine);
+            let target_id = lifecycle_id.clone();
+            let _ = std::thread::Builder::new()
+                .name("ministudio-plugin-editor-close".into())
+                .spawn(move || {
+                    if let Ok(engine) = engine.lock() {
+                        let _ = engine.close_plugin_editor(&target_id);
+                    }
+                });
+        }
+        WindowEvent::Destroyed => {
+            close_embedded_plugin_editor(&lifecycle_id);
+        }
+        _ => {}
+    });
+    // Show the lightweight native owner immediately. The slower toolbar
+    // WebView2 controller is deliberately created only after attachment.
+    window
+        .show()
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let size = window
+        .inner_size()
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let scale = window.scale_factor().unwrap_or(1.0).max(0.5) as f32;
+    #[cfg(target_os = "windows")]
+    let parent = window
+        .hwnd()
+        .map_err(|error| EngineError::Internal(error.to_string()))?
+        .0 as usize;
+    #[cfg(not(target_os = "windows"))]
+    let parent = 0usize;
+    let _ = app.emit_to(
+        &label,
+        PLUGIN_SHELL_CONNECTION_EVENT,
+        PluginShellConnection {
+            status: "connecting",
+            error: None,
+        },
+    );
+    let open_result = match attach_embedded_editor(
+        &app,
+        Arc::clone(&state.engine),
+        target_id.clone(),
+        label.clone(),
+        parent,
+        0.0,
+        PLUGIN_SHELL_TOOLBAR_HEIGHT,
+        size.width as f32 / scale,
+        (size.height as f32 / scale - PLUGIN_SHELL_TOOLBAR_HEIGHT).max(1.0),
+        cancellation.clone(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = window.hide();
+            let _ = app.emit_to(
+                &label,
+                PLUGIN_SHELL_CONNECTION_EVENT,
+                PluginShellConnection {
+                    status: "failed",
+                    error: Some(error.to_string()),
+                },
+            );
+            let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, &label);
+            return Err(error);
+        }
+    };
+
+    if editor_open_is_superseded(&cancellation) {
+        close_embedded_editors_on_main_thread(&app, Some(target_id.clone())).await?;
+        let _ = window.hide();
+        return Ok(());
+    }
+    let attached = match open_result {
+        Ok(attached) => attached,
+        Err(embed_error) => {
+            let _ = window.hide();
+            state
+                .floating_editor_targets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(target_id.clone());
+            let _ = app.emit_to(
+                &label,
+                PLUGIN_SHELL_CONNECTION_EVENT,
+                PluginShellConnection {
+                    status: "failed",
+                    error: Some(embed_error.clone()),
+                },
+            );
+            let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, &label);
+            // Fixed-size or legacy plug-ins may reject parenting. Keep the proven
+            // standalone editor path as a compatibility fallback.
+            return with_engine(&state, |engine| engine.open_plugin_editor(&target_id)).map_err(
+                |fallback| {
+                    EngineError::Internal(format!("{embed_error}; fallback failed: {fallback}"))
+                },
+            );
+        }
+    };
+    if !attached {
+        let _ = window.hide();
+        return Ok(());
+    }
+    state
+        .floating_editor_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&target_id);
+    window
+        .show()
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let size = window
+        .inner_size()
+        .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let scale = window.scale_factor().unwrap_or(1.0).max(0.5) as f32;
+    resize_embedded_plugin_editor(
+        &target_id,
+        0.0,
+        PLUGIN_SHELL_TOOLBAR_HEIGHT,
+        size.width as f32 / scale,
+        (size.height as f32 / scale - PLUGIN_SHELL_TOOLBAR_HEIGHT).max(1.0),
+    );
+    let _ = app.emit_to(
+        &label,
+        PLUGIN_SHELL_CONNECTION_EVENT,
+        PluginShellConnection {
+            status: "ready",
+            error: None,
+        },
+    );
+    let _ = app.emit_to(&label, PLUGIN_SHELL_REACTIVATE_EVENT, ());
+    spawn_plugin_shell_toolbar(window.clone(), label, url);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn engine_close_plugin_editor(
+    target_kind: String,
+    target_id: String,
+    app: AppHandle<AppRuntime>,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    close_embedded_editors_on_main_thread(&app, Some(target_id.clone())).await?;
     with_engine(&state, |engine| {
         validate_plugin_target_kind(&target_kind)?;
         engine.close_plugin_editor(&target_id)
@@ -949,7 +1754,7 @@ fn probe_plugin_isolated(
     catalog_only: bool,
 ) -> Vec<PluginDescriptor> {
     let mut child = match Command::new(executable)
-        .arg("--minidaw-plugin-probe")
+        .arg("--ministudio-plugin-probe")
         .arg(format)
         .arg(path)
         .arg(if catalog_only { "catalog" } else { "full" })
@@ -1053,11 +1858,21 @@ mod plugin_probe_tests {
     }
 }
 
+/// Runs the private VST3 host-process mode before Tauri/WebView startup.
+pub fn run_plugin_host_from_args() -> bool {
+    if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new("--ministudio-vst3-host"))
+    {
+        return false;
+    }
+    audio::plugin::run_vst3_helper_process();
+    true
+}
+
 /// Runs the disposable native-plugin probe mode and returns true when normal Tauri startup must stop.
 pub fn run_plugin_probe_from_args() -> bool {
     let mut args = std::env::args_os();
     let _ = args.next();
-    if args.next().as_deref() != Some(std::ffi::OsStr::new("--minidaw-plugin-probe")) {
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("--ministudio-plugin-probe")) {
         return false;
     }
     let Some(format) = args.next().and_then(|v| v.into_string().ok()) else {
@@ -1208,6 +2023,7 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_open_plugin_editor,
             engine_close_plugin_editor,
             engine_plugin_editor_is_open,
+            engine_set_plugin_editor_pinned,
             engine_save_plugin_state,
             engine_load_plugin_state,
             cached_vst3_plugins,
@@ -1259,7 +2075,7 @@ pub fn run() {
         .invoke_handler(invoke_handler)
         .run(tauri::generate_context!());
     if let Err(error) = result {
-        eprintln!("failed to run MiniDAW: {error}");
+        eprintln!("failed to run MiniStudio: {error}");
     }
 }
 
@@ -1267,10 +2083,58 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    struct ReentrantEditor;
+
+    impl EmbeddedPluginEditor for ReentrantEditor {
+        fn set_rect(&mut self, _x: f32, _y: f32, _width: f32, _height: f32) {}
+    }
+
+    impl Drop for ReentrantEditor {
+        fn drop(&mut self) {
+            // Models a vendor VST3 view calling back into the host from
+            // IPlugView::removed(). This must not overlap a mutable registry
+            // borrow or the real UI thread will panic during editor switching.
+            EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+                let _ = editors.borrow().len();
+            });
+        }
+    }
+
     #[test]
     fn export_bindings() {
         if let Err(error) = export_bindings_file(&specta_builder()) {
             panic!("failed to export typed IPC bindings: {error}")
         }
+    }
+
+    #[test]
+    fn embedded_editor_teardown_allows_vendor_reentry() {
+        let target_id = "reentrant-editor-regression".to_owned();
+        EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+            editors.borrow_mut().insert(
+                target_id.clone(),
+                EmbeddedPluginEditorSlot {
+                    window_label: "reentrant-editor-window".to_owned(),
+                    editor: Box::new(ReentrantEditor),
+                },
+            );
+        });
+
+        close_embedded_plugin_editor(&target_id);
+
+        EMBEDDED_PLUGIN_EDITORS.with(|editors| {
+            assert!(!editors.borrow().contains_key(&target_id));
+        });
+    }
+
+    #[test]
+    fn stale_background_editor_request_yields_to_foreground_generation() {
+        let generation = Arc::new(AtomicUsize::new(4));
+        let request = Some((Arc::clone(&generation), 4));
+        assert!(!editor_open_is_superseded(&request));
+
+        generation.fetch_add(1, Ordering::AcqRel);
+        assert!(editor_open_is_superseded(&request));
+        assert!(!editor_open_is_superseded(&None));
     }
 }

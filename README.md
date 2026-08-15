@@ -1,4 +1,4 @@
-# MiniDAW
+# MiniStudio
 
 Studio One의 아레인지 워크플로와 Ableton Live의 믹서·디바이스 랙 구조를 참고한 Tauri 2 기반 데스크톱 DAW입니다. 2단계부터 모든 재생·믹싱·DSP는 Rust 네이티브 엔진이 소유하며 React/Zustand UI에는 네이티브 오디오 타입이 노출되지 않습니다.
 
@@ -14,7 +14,7 @@ npm run tauri dev
 Windows에서는 `run.bat`을 사용하면 Cargo/MSVC 환경과 외부 빌드 캐시,
 실시간 DSP 최적화 개발 프로필이 자동으로 설정됩니다.
 개발·테스트 프로필은 증분 오브젝트와 의존성 디버그 심볼을 만들지 않아
-`C:\tmp\minidaw-msvc-target`의 장기적인 증가량을 제한합니다. 이 폴더는
+`C:\tmp\ministudio-msvc-target`의 장기적인 증가량을 제한합니다. 이 폴더는
 Cargo/Tauri가 실행 중이지 않을 때 언제든 삭제할 수 있으며 다음 실행에서 재생성됩니다.
 
 ```bash
@@ -23,7 +23,7 @@ npm test
 npm run lint
 npm run bindings
 cd src-tauri && cargo test --no-default-features
-cd src-tauri && cargo build --bin minidaw
+cd src-tauri && cargo build --bin ministudio
 ```
 
 브라우저에서 `npm run dev`로 UI를 볼 수 있지만 네이티브 오디오 IPC는 Tauri 프로세스에서만 동작합니다. Rust 단위 테스트와 바인딩 생성은 GUI 런타임을 링크하지 않는 `--no-default-features` 구성을 사용하고, 실제 앱은 기본 `desktop` 기능으로 빌드합니다. Windows에서는 MSVC 링커가 포함된 개발자 환경에서 실행해야 합니다.

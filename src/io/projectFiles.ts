@@ -22,6 +22,16 @@ export function toStoredProject(project: ProjectState): StoredProject {
   }
 }
 
+export type DevicePreset = {
+  format: 'ministudio-device-preset'
+  version: 1
+  name: string
+  deviceType: string
+  pluginUid?: string
+  params: Record<string, number>
+  state?: number[]
+}
+
 export function fromStoredProject(stored: StoredProject): ProjectState {
   const project = {
     ...stored,
@@ -36,7 +46,7 @@ export function serializeProject(project: ProjectState): string {
 
 export function deserializeProject(json: string): ProjectState {
   const value: unknown = JSON.parse(json)
-  if (!isStoredProject(value)) throw new Error('올바른 MiniDAW 프로젝트가 아닙니다.')
+  if (!isStoredProject(value)) throw new Error('올바른 MiniStudio 프로젝트가 아닙니다.')
   return fromStoredProject(value)
 }
 
@@ -58,17 +68,17 @@ export function migrateProject(source: ProjectState | (Omit<ProjectState, 'forma
 }
 
 export async function saveProject(project: ProjectState): Promise<string | null> {
-  const path = await save({ defaultPath: `${project.meta.name}.json`, filters: [{ name: 'MiniDAW Project', extensions: ['json'] }] })
+  const path = await save({ defaultPath: `${project.meta.name}.json`, filters: [{ name: 'MiniStudio Project', extensions: ['json'] }] })
   if (!path) return null
   await writeTextFile(path, JSON.stringify(toStoredProject(project), null, 2))
   return path
 }
 
 export async function openProject(): Promise<{ path: string; project: ProjectState } | null> {
-  const path = await open({ multiple: false, directory: false, filters: [{ name: 'MiniDAW Project', extensions: ['json'] }] })
+  const path = await open({ multiple: false, directory: false, filters: [{ name: 'MiniStudio Project', extensions: ['json'] }] })
   if (!path) return null
   const value: unknown = JSON.parse(await readTextFile(path))
-  if (!isStoredProject(value)) throw new Error('올바른 MiniDAW 프로젝트가 아닙니다.')
+  if (!isStoredProject(value)) throw new Error('올바른 MiniStudio 프로젝트가 아닙니다.')
   return { path, project: fromStoredProject(value) }
 }
 
@@ -79,6 +89,24 @@ export async function chooseAudioFile(): Promise<string | null> {
 
 export async function chooseExportPath(projectName: string, format: 'wav' | 'mp3' = 'wav'): Promise<string | null> {
   return save({ defaultPath: `${projectName}.${format}`, filters: [{ name: format === 'mp3' ? 'MP3 Audio' : 'Wave Audio', extensions: [format] }] })
+}
+
+export async function saveDevicePreset(preset: DevicePreset): Promise<string | null> {
+  const safeName = preset.name.replace(/[<>:"/\\|?*]+/g, '_') || 'Device Preset'
+  const path = await save({ defaultPath: `${safeName}.mspreset`, filters: [{ name: 'MiniStudio Device Preset', extensions: ['mspreset'] }] })
+  if (!path) return null
+  await writeTextFile(path, JSON.stringify(preset, null, 2))
+  return path
+}
+
+export async function openDevicePreset(): Promise<DevicePreset | null> {
+  const path = await open({ multiple: false, directory: false, filters: [{ name: 'MiniStudio Device Preset', extensions: ['mspreset'] }] })
+  if (!path) return null
+  const value: unknown = JSON.parse(await readTextFile(path))
+  if (!value || typeof value !== 'object') throw new Error('올바른 MiniStudio 디바이스 프리셋이 아닙니다.')
+  const preset = value as Partial<DevicePreset>
+  if (preset.format !== 'ministudio-device-preset' || preset.version !== 1 || typeof preset.deviceType !== 'string' || !preset.params || typeof preset.params !== 'object') throw new Error('지원하지 않는 디바이스 프리셋입니다.')
+  return preset as DevicePreset
 }
 
 export async function hydrateProjectAudio(engine: IAudioEngine, source: ProjectState): Promise<{ project: ProjectState; missing: Array<{ id: string; name: string }> }> {

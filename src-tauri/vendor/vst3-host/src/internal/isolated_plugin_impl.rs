@@ -10,10 +10,11 @@ use crate::{
     parameters::Parameter,
     plugin::{PluginInfo, PluginInternal, StateContext},
     process_isolation::{HostCommand, HostResponse, PluginHostProcess},
+    realtime_ipc::RealtimeClient,
 };
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::{ffi::OsString, path::PathBuf};
 
 /// Plugin implementation that communicates with an isolated process
 pub struct IsolatedPluginImpl {
@@ -47,11 +48,15 @@ pub struct IsolatedPluginImpl {
     editor_size: Option<(i32, i32)>,
     /// Total output audio channels (reported by the helper's introspection).
     output_channels: usize,
+    /// Lock-free audio/MIDI/parameter transport used by the realtime callback.
+    realtime: Option<RealtimeClient>,
     /// MIDI the plugin has emitted across the boundary, buffered for the host to poll
     /// (mirrors PluginImpl::output_midi). Capped to bound growth if never read.
     output_events: Mutex<Vec<PluginEvent>>,
     /// Explicit helper-binary path override (re-used when respawning after a crash).
     helper_path: Option<PathBuf>,
+    /// Private helper-mode argument when the application executable is re-used.
+    helper_arg: Option<OsString>,
     /// Per-command IPC response timeout (re-used when respawning after a crash).
     response_timeout: Duration,
     /// When true, a crashed/hung helper is transparently respawned+reloaded and the command
@@ -87,7 +92,9 @@ impl IsolatedPluginImpl {
         time_sig_numerator: i32,
         time_sig_denominator: i32,
         output_channels: usize,
+        realtime: Option<RealtimeClient>,
         helper_path: Option<PathBuf>,
+        helper_arg: Option<OsString>,
         response_timeout: Duration,
         auto_recover: bool,
         auto_recover_max_retries: u32,
@@ -106,8 +113,10 @@ impl IsolatedPluginImpl {
             has_open_editor: false,
             editor_size: None,
             output_channels,
+            realtime,
             output_events: Mutex::new(Vec::new()),
             helper_path,
+            helper_arg,
             response_timeout,
             auto_recover,
             auto_recover_max_retries,
@@ -263,10 +272,18 @@ impl IsolatedPluginImpl {
 
 impl PluginInternal for IsolatedPluginImpl {
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()> {
+        if self.is_processing {
+            if let Some(realtime) = self.realtime.as_mut() {
+                return realtime.queue_parameter(id, value, 0);
+            }
+        }
         self.expect_success(HostCommand::SetParameter { id, value }, "SetParameter")
     }
 
     fn set_parameter_at(&mut self, id: u32, value: f64, sample_offset: i32) -> Result<()> {
+        if let Some(realtime) = self.realtime.as_mut() {
+            return realtime.queue_parameter(id, value, sample_offset);
+        }
         self.expect_success(
             HostCommand::SetParameterAt {
                 id,
@@ -403,6 +420,9 @@ impl PluginInternal for IsolatedPluginImpl {
     }
 
     fn process_buses(&mut self, buffers: &mut BusAudioBuffers) -> Result<()> {
+        if let Some(realtime) = self.realtime.as_mut() {
+            return realtime.process_buses(buffers);
+        }
         let frames = buffers
             .outputs
             .iter()
@@ -466,10 +486,16 @@ impl PluginInternal for IsolatedPluginImpl {
     }
 
     fn send_midi_event(&mut self, event: MidiEvent) -> Result<()> {
+        if let Some(realtime) = self.realtime.as_mut() {
+            return realtime.queue_midi(event, 0);
+        }
         self.expect_success(HostCommand::SendMidi { event }, "SendMidi")
     }
 
     fn send_midi_event_at(&mut self, event: MidiEvent, sample_offset: i32) -> Result<()> {
+        if let Some(realtime) = self.realtime.as_mut() {
+            return realtime.queue_midi(event, sample_offset);
+        }
         self.expect_success(
             HostCommand::SendMidiAt {
                 event,
@@ -818,6 +844,9 @@ impl PluginInternal for IsolatedPluginImpl {
         // Track the new config so a post-crash reload uses it.
         self.sample_rate = sample_rate;
         self.block_size = block_size;
+        if let Some(realtime) = self.realtime.as_mut() {
+            realtime.set_sample_rate(sample_rate);
+        }
         Ok(())
     }
 
@@ -1020,6 +1049,12 @@ impl PluginInternal for IsolatedPluginImpl {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn realtime_transport_faulted(&self) -> bool {
+        self.realtime
+            .as_ref()
+            .is_some_and(RealtimeClient::is_faulted)
+    }
+
     fn recover(&mut self) -> Result<()> {
         self.recover_locked()
     }
@@ -1039,9 +1074,21 @@ impl IsolatedPluginImpl {
             .lock()
             .map_err(|e| Error::Other(format!("Failed to lock process: {}", e)))?;
 
+        // A timed-out audio worker may still be waiting or returning late. Stop its whole helper
+        // before a replacement attaches to the same named request event, so two workers can never
+        // consume alternate blocks from one client mapping.
+        if self.realtime.is_some() {
+            process.shutdown();
+        }
+
         // Spawn a fresh helper and reload the plugin from the original path + settings.
-        let mut fresh = PluginHostProcess::new(self.helper_path.clone(), self.response_timeout)
-            .map_err(|e| Error::ProcessError(format!("Failed to respawn helper: {e}")))?;
+        let mut fresh = match (&self.helper_path, &self.helper_arg) {
+            (Some(path), Some(arg)) => {
+                PluginHostProcess::new_self_hosted(path.clone(), arg.clone(), self.response_timeout)
+            }
+            _ => PluginHostProcess::new(self.helper_path.clone(), self.response_timeout),
+        }
+        .map_err(|e| Error::ProcessError(format!("Failed to respawn helper: {e}")))?;
         match fresh.send_command(HostCommand::LoadPlugin {
             path: self.info.path.display().to_string(),
             sample_rate: self.sample_rate,
@@ -1059,6 +1106,25 @@ impl IsolatedPluginImpl {
             Ok(_) => return Err(Error::Other("unexpected response while reloading".into())),
             // The reload itself crashed the fresh helper — the plugin is unrecoverable.
             Err(e) => return Err(classify_ipc_error(&e)),
+        }
+
+        if let Some(realtime) = self.realtime.as_ref() {
+            match fresh.send_command(HostCommand::AttachRealtime {
+                descriptor: realtime.descriptor(),
+            }) {
+                Ok(HostResponse::Success { .. }) => realtime.reset_after_recovery(),
+                Ok(HostResponse::Error { message }) => {
+                    return Err(Error::ProcessError(format!(
+                        "failed to reattach realtime transport: {message}"
+                    )))
+                }
+                Ok(_) => {
+                    return Err(Error::ProcessError(
+                        "unexpected realtime reattach response".to_string(),
+                    ))
+                }
+                Err(error) => return Err(classify_ipc_error(&error)),
+            }
         }
 
         // Re-apply a non-default process mode before (re)starting processing — the fresh
@@ -1186,7 +1252,9 @@ mod tests {
             4,
             4,
             2,
+            None,
             Some(fake.script.clone()),
+            None,
             FAKE_HELPER_TIMEOUT,
             false,
             0,

@@ -1,4 +1,4 @@
-import type { IAudioEngine, PluginDescriptor } from '../engine'
+import type { ExternalPluginRef, IAudioEngine, PluginDescriptor } from '../engine'
 
 let pluginCache: PluginDescriptor[] | null = null
 let initialLoad: Promise<PluginDescriptor[]> | null = null
@@ -51,6 +51,29 @@ export function hydratePlugin(engine: IAudioEngine, plugin: PluginDescriptor): P
   }).catch(() => plugin).finally(() => detailLoads.delete(key))
   detailLoads.set(key, task)
   return task
+}
+
+/** Hydrate a portable project/browser reference at the moment it is inserted.
+ * This closes the pointer-down race where a fast drag can finish before the
+ * lazy metadata request and would otherwise create a parameter-less device. */
+export async function hydratePluginRef(engine: IAudioEngine, reference: ExternalPluginRef, isInstrument: boolean): Promise<ExternalPluginRef> {
+  if (reference.parameters?.length || !reference.paramCount) return reference
+  const detailed = await hydratePlugin(engine, {
+    format: reference.format,
+    uid: reference.uid,
+    name: reference.name,
+    vendor: reference.vendor,
+    category: isInstrument ? 'Instrument' : 'Effect',
+    path: reference.path,
+    isInstrument,
+    paramCount: reference.paramCount ?? 0,
+    hasEditor: reference.hasEditor ?? false,
+    audioInputBuses: reference.audioInputBuses ?? 0,
+    audioOutputBuses: reference.audioOutputBuses ?? 0,
+    supportsSidechain: reference.supportsSidechain ?? false,
+    parameters: reference.parameters ?? [],
+  })
+  return { format: detailed.format, uid: detailed.uid, name: detailed.name, vendor: detailed.vendor, path: detailed.path, audioInputBuses: detailed.audioInputBuses, audioOutputBuses: detailed.audioOutputBuses, supportsSidechain: detailed.supportsSidechain, hasEditor: detailed.hasEditor, paramCount: detailed.paramCount, parameters: detailed.parameters }
 }
 
 function refreshPlugins(engine: IAudioEngine, force: boolean): Promise<PluginDescriptor[]> {

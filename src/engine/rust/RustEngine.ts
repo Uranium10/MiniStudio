@@ -213,9 +213,9 @@ export class RustEngine implements IAudioEngine {
   async inspectPlugin(plugin: PluginDescriptor): Promise<PluginDescriptor> {
     return this.normalizePlugins([await unwrapCommand(commands.inspectPluginMetadata(plugin.format, plugin.path, plugin.uid))])[0] ?? plugin
   }
-  async openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void> {
+  async openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string, foreground = true): Promise<void> {
     await this.init()
-    if (isTauriRuntime()) await unwrapCommand(commands.engineOpenPluginEditor(targetKind, targetId))
+    if (isTauriRuntime()) await unwrapCommand(commands.engineOpenPluginEditor(targetKind, targetId, foreground))
   }
   async closePluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void> {
     if (isTauriRuntime()) await unwrapCommand(commands.engineClosePluginEditor(targetKind, targetId))

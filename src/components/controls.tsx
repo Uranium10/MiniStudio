@@ -11,13 +11,13 @@ type KnobDrag = { pointerId: number; anchorY: number; anchorValue: number; fine:
 type KnobScale = 'linear' | 'log'
 
 type ParameterAutomationContextValue = {
-  add(parameterId: string | undefined, label: string, value: number): void
+  items(parameterId: string | undefined, label: string, value: number): MenuItem[]
 }
 
 const ParameterAutomationContext = createContext<ParameterAutomationContextValue | null>(null)
 
-export function ParameterAutomationProvider({ add, children }: { add: ParameterAutomationContextValue['add']; children: ReactNode }) {
-  return <ParameterAutomationContext.Provider value={{ add }}>{children}</ParameterAutomationContext.Provider>
+export function ParameterAutomationProvider({ items, children }: { items: ParameterAutomationContextValue['items']; children: ReactNode }) {
+  return <ParameterAutomationContext.Provider value={{ items }}>{children}</ParameterAutomationContext.Provider>
 }
 
 export function Knob({ value, min, max, step, scale = 'linear', label, format = (current) => current.toFixed(1), defaultValue, onChange, parameterId }: { value: number; min: number; max: number; step: number; scale?: KnobScale; label: string; format?: (value: number) => string; defaultValue: number; onChange(value: number): void; parameterId?: string }) {
@@ -101,9 +101,15 @@ export function Knob({ value, min, max, step, scale = 'linear', label, format = 
       ><i /></button>
       <EditableNumber value={value} min={min} max={max} step={step} onChange={onChange} format={format} ariaLabel={`${label} 값`} />
       <span>{label}</span>
-      {menu && <MenuPanel items={[{ kind: 'item', label: `${label} 오토메이션 추가`, run: () => automation?.add(parameterId, label, value) } satisfies MenuItem]} anchor={menu} onClose={() => setMenu(null)} className="parameter-context-menu" />}
+      {menu && <MenuPanel items={automation?.items(parameterId, label, value) ?? []} anchor={menu} onClose={() => setMenu(null)} className="parameter-context-menu" />}
     </div>
   )
+}
+
+export function AutomationButton({ parameterId, label, value, className = '', title, onClick, children }: { parameterId?: string; label: string; value: number; className?: string; title?: string; onClick(): void; children: ReactNode }) {
+  const automation = useContext(ParameterAutomationContext)
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
+  return <><button className={className} title={title} onClick={onClick} onContextMenu={automation ? (event) => { event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY }) } : undefined}>{children}</button>{menu && <MenuPanel items={automation?.items(parameterId, label, value) ?? []} anchor={menu} onClose={() => setMenu(null)} className="parameter-context-menu" />}</>
 }
 
 export function EditableNumber({ value, min, max, step, onChange, format = String, className = '', ariaLabel = '수치', children }: { value: number; min: number; max: number; step: number; onChange(value: number): void; format?: (value: number) => string; className?: string; ariaLabel?: string; children?: ReactNode }) {
@@ -215,6 +221,48 @@ function runMeterFrames(time: number): void {
   }
   if (meterFrameTasks.size || analyzerFrameTasks.size) meterAnimationFrame = requestAnimationFrame(runMeterFrames)
   else meterAnimationFrame = 0
+}
+
+/** Adds Shift fine-drag/keyboard behavior to every native range control without
+ * forcing each DSP, mixer strip, and editor slider to re-render through React. */
+export function useFineRangeControls(): void {
+  useEffect(() => {
+    const setNativeValue = (input: HTMLInputElement, value: number) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(input, String(value))
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    }
+    const pointerDown = (event: PointerEvent) => {
+      const input = event.target instanceof HTMLInputElement && event.target.type === 'range' ? event.target : null
+      if (!input || event.button !== 0 || !event.shiftKey) return
+      event.preventDefault()
+      input.setPointerCapture(event.pointerId)
+      const min = Number(input.min || 0); const max = Number(input.max || 100); const step = Number(input.step || 1)
+      const origin = Number(input.value); const originX = event.clientX; const originY = event.clientY
+      const vertical = input.classList.contains('vertical-fader') || input.clientHeight > input.clientWidth * 1.5
+      const travel = Math.max(40, vertical ? input.clientHeight : input.clientWidth)
+      const move = (pointer: PointerEvent) => {
+        const pixels = vertical ? originY - pointer.clientY : pointer.clientX - originX
+        const raw = origin + pixels / travel * (max - min) * .1
+        setNativeValue(input, clampStep(raw, min, max, Math.max(Number.EPSILON, step / 10)))
+      }
+      const finish = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', finish); window.removeEventListener('pointercancel', finish) }
+      window.addEventListener('pointermove', move)
+      window.addEventListener('pointerup', finish)
+      window.addEventListener('pointercancel', finish)
+    }
+    const keyDown = (event: KeyboardEvent) => {
+      const input = event.target instanceof HTMLInputElement && event.target.type === 'range' ? event.target : null
+      if (!input || !event.shiftKey || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
+      event.preventDefault()
+      const min = Number(input.min || 0); const max = Number(input.max || 100); const step = Number(input.step || 1) / 10
+      const direction = event.key === 'ArrowRight' || event.key === 'ArrowUp' ? 1 : -1
+      setNativeValue(input, clampStep(Number(input.value) + direction * step, min, max, step))
+    }
+    window.addEventListener('pointerdown', pointerDown, true)
+    window.addEventListener('keydown', keyDown, true)
+    return () => { window.removeEventListener('pointerdown', pointerDown, true); window.removeEventListener('keydown', keyDown, true) }
+  }, [])
 }
 
 export function subscribeMeterFrame(task: MeterFrameTask): () => void {

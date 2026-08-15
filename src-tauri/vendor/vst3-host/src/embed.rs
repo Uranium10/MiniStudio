@@ -9,7 +9,7 @@
 //! Implemented on macOS (verified), Windows, and Linux/X11. A Wayland `RawWindowHandle` is
 //! rejected explicitly: VST 3.8 requires the host to provide a compositor connection through
 //! `IWaylandHost`, not merely pass the application's system-compositor `wl_surface`. Other
-//! platforms return an error from [`EmbeddedEditor::embed`]. Requires the `egui-widgets` feature.
+//! platforms return an error from [`EmbeddedEditor::embed`]. Requires the `embedded-editor` feature.
 //!
 //! Sizing goes both ways. The host proposes a size through [`EmbeddedEditor::set_rect`] and the
 //! plugin may adjust or refuse it; the plugin proposes one through
@@ -20,7 +20,7 @@
 //! type cannot intercept `WM_DPICHANGED`. Forward framework scale-factor changes explicitly with
 //! [`Plugin::set_editor_scale_factor`](crate::Plugin::set_editor_scale_factor); the initial child
 //! DPI is communicated automatically when embedding.
-#![cfg(feature = "egui-widgets")]
+#![cfg(any(feature = "egui-widgets", feature = "embedded-editor"))]
 
 use crate::error::{Error, Result};
 use crate::plugin::Plugin;
@@ -404,14 +404,20 @@ mod windows {
     use super::*;
     use winapi::shared::windef::HWND;
     use winapi::um::libloaderapi::GetModuleHandleW;
+    use winapi::um::processthreadsapi::GetCurrentThreadId;
     use winapi::um::winuser::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
-        CS_HREDRAW, CS_VREDRAW, SWP_NOZORDER, SW_SHOW, WNDCLASSEXW, WS_CHILD, WS_VISIBLE,
+        AttachThreadInput, CreateWindowExW, DefWindowProcW, DestroyWindow,
+        GetWindowThreadProcessId, RegisterClassExW, SetWindowPos, ShowWindow, CS_HREDRAW,
+        CS_VREDRAW, HWND_TOP, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOW, WNDCLASSEXW, WS_CHILD,
+        WS_VISIBLE,
     };
 
     /// A plugin editor embedded as a child `HWND` of the host window.
     pub struct WinEmbed {
         child: HWND,
+        owner_thread: u32,
+        parent_thread: u32,
+        input_attached: bool,
     }
 
     impl WinEmbed {
@@ -428,6 +434,15 @@ mod windows {
             unsafe {
                 let parent_hwnd = h.hwnd.get() as HWND;
                 let hinstance = GetModuleHandleW(std::ptr::null());
+                let owner_thread = GetCurrentThreadId();
+                let parent_thread = GetWindowThreadProcessId(parent_hwnd, std::ptr::null_mut());
+                // Windows permits a child HWND to be owned by a dedicated GUI
+                // thread while its parent belongs to the host event loop. Join
+                // their input queues for the editor lifetime so focus, keyboard
+                // capture and IME behavior match a same-thread child.
+                let input_attached = parent_thread != 0
+                    && parent_thread != owner_thread
+                    && AttachThreadInput(owner_thread, parent_thread, 1) != 0;
 
                 // Register a child window class (idempotent across calls).
                 let class_name: Vec<u16> = "VST3EmbeddedEditor\0".encode_utf16().collect();
@@ -454,6 +469,9 @@ mod windows {
                     std::ptr::null_mut(),
                 );
                 if child.is_null() {
+                    if input_attached {
+                        AttachThreadInput(owner_thread, parent_thread, 0);
+                    }
                     return Err(Error::Other("Failed to create child window".to_string()));
                 }
 
@@ -468,17 +486,28 @@ mod windows {
                     if let Err(error) = plugin.set_editor_scale_factor(dpi as f32 / 96.0) {
                         drop(plugin);
                         DestroyWindow(child);
+                        if input_attached {
+                            AttachThreadInput(owner_thread, parent_thread, 0);
+                        }
                         return Err(error);
                     }
                 }
                 if let Err(e) = plugin.open_editor(handle) {
                     drop(plugin);
                     DestroyWindow(child);
+                    if input_attached {
+                        AttachThreadInput(owner_thread, parent_thread, 0);
+                    }
                     return Err(e);
                 }
                 drop(plugin);
                 ShowWindow(child, SW_SHOW);
-                Ok(Self { child })
+                Ok(Self {
+                    child,
+                    owner_thread,
+                    parent_thread,
+                    input_attached,
+                })
             }
         }
 
@@ -486,12 +515,12 @@ mod windows {
             unsafe {
                 SetWindowPos(
                     self.child,
-                    std::ptr::null_mut(),
+                    HWND_TOP,
                     rect.x as i32,
                     rect.y as i32,
                     rect.width as i32,
                     rect.height as i32,
-                    SWP_NOZORDER,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
             }
         }
@@ -501,6 +530,9 @@ mod windows {
         fn drop(&mut self) {
             unsafe {
                 DestroyWindow(self.child);
+                if self.input_attached {
+                    AttachThreadInput(self.owner_thread, self.parent_thread, 0);
+                }
             }
         }
     }

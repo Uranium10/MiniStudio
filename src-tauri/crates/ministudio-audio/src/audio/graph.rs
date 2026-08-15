@@ -7,10 +7,14 @@ use super::{
         DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES,
     },
     instrument::{create_instrument, Instrument, NoteEvent, NoteEventKind, TempoMap},
+    plugin::ExternalPluginRegistry,
     types::{db_to_gain, sec_to_samples, GraphSnapshot, Level},
     MAX_BLOCK_SIZE, MAX_CHANNELS, MAX_EFFECT_METERS, MAX_TRACKS,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 /// Master-output safety knee: nothing below -0.18 dBFS is touched, so normal mixing is
 /// untouched, but a plugin note that spikes past 0 dBFS (resonant filters, unison stacks,
@@ -186,7 +190,17 @@ impl AudioGraph {
         spec: &GraphSnapshot,
         assets: &HashMap<String, Arc<AudioAsset>>,
         sample_rate: u32,
-    ) -> (Box<Self>, Bindings) {
+    ) -> Result<(Box<Self>, Bindings), String> {
+        let mut plugins = ExternalPluginRegistry::default();
+        Self::build_with_plugins(spec, assets, sample_rate, &mut plugins)
+    }
+
+    pub fn build_with_plugins(
+        spec: &GraphSnapshot,
+        assets: &HashMap<String, Arc<AudioAsset>>,
+        sample_rate: u32,
+        plugins: &mut ExternalPluginRegistry,
+    ) -> Result<(Box<Self>, Bindings), String> {
         let sr = sample_rate as f32;
         let mut effects = HashMap::new();
         let mut plugin_controls = HashMap::new();
@@ -199,6 +213,8 @@ impl AudioGraph {
         let mut limiter_meter_ids = Vec::new();
         let mut latencies = Vec::new();
         let mut tracks = Vec::new();
+        let mut live_effect_ids = HashSet::new();
+        let mut live_instrument_ids = HashSet::new();
         let tempo = TempoMap::new(spec.transport.bpm, sample_rate);
         let mut next_note_id = 1_i32;
         for (ts_idx, ts) in spec.tracks.iter().take(MAX_TRACKS).enumerate() {
@@ -207,7 +223,15 @@ impl AudioGraph {
             let mut chain = Vec::new();
             let mut effect_sidechains = Vec::new();
             for (es_idx, es) in ts.effects.iter().enumerate() {
-                if let Some(fx) = create_effect(es, sr) {
+                let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
+                    live_effect_ids.insert(es.id.clone());
+                    Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                        format!("failed to load effect '{}' ({}): {error}", es.id, es.kind)
+                    })?)
+                } else {
+                    create_effect(es, sr)
+                };
+                if let Some(fx) = fx {
                     if let Some(control) = fx.plugin_control() {
                         plugin_controls.insert(es.id.clone(), control);
                     }
@@ -404,10 +428,24 @@ impl AudioGraph {
                 }
             }
             midi_events.sort_by_key(|event| event.sample);
-            let instrument = ts
-                .instrument
-                .as_ref()
-                .and_then(|spec| create_instrument(spec, sr));
+            let instrument = match ts.instrument.as_ref() {
+                Some(instrument)
+                    if instrument.kind.starts_with("vst3:")
+                        || instrument.kind.starts_with("clap:") =>
+                {
+                    live_instrument_ids.insert(ts.id.clone());
+                    plugins
+                        .instrument(&ts.id, instrument, sr)
+                        .map_err(|error| {
+                            format!(
+                                "failed to load instrument for track '{}' ({}): {error}",
+                                ts.id, instrument.kind
+                            )
+                        })?
+                }
+                Some(instrument) => create_instrument(instrument, sr),
+                None => None,
+            };
             if let Some(control) = instrument
                 .as_ref()
                 .and_then(|instrument| instrument.plugin_control())
@@ -462,7 +500,18 @@ impl AudioGraph {
             let mut chain = Vec::new();
             let mut effect_sidechains = Vec::new();
             for es in &bs.effects {
-                if let Some(fx) = create_effect(es, sr) {
+                let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
+                    live_effect_ids.insert(es.id.clone());
+                    Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                        format!(
+                            "failed to load bus effect '{}' ({}): {error}",
+                            es.id, es.kind
+                        )
+                    })?)
+                } else {
+                    create_effect(es, sr)
+                };
+                if let Some(fx) = fx {
                     if let Some(control) = fx.plugin_control() {
                         plugin_controls.insert(es.id.clone(), control);
                     }
@@ -510,7 +559,18 @@ impl AudioGraph {
         let mut master_effects = Vec::new();
         let mut master_effect_sidechains = Vec::new();
         for es in &spec.master.effects {
-            if let Some(fx) = create_effect(es, sr) {
+            let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
+                live_effect_ids.insert(es.id.clone());
+                Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                    format!(
+                        "failed to load master effect '{}' ({}): {error}",
+                        es.id, es.kind
+                    )
+                })?)
+            } else {
+                create_effect(es, sr)
+            };
+            if let Some(fx) = fx {
                 if let Some(control) = fx.plugin_control() {
                     plugin_controls.insert(es.id.clone(), control);
                 }
@@ -546,7 +606,8 @@ impl AudioGraph {
         }
         let track_count = tracks.len();
         let bus_count = buses.len();
-        (
+        plugins.retain(&live_effect_ids, &live_instrument_ids);
+        Ok((
             Box::new(Self {
                 sample_rate,
                 tracks,
@@ -575,7 +636,7 @@ impl AudioGraph {
                 distortion_meter_ids,
                 limiter_meter_ids,
             },
-        )
+        ))
     }
     pub fn empty(sample_rate: u32) -> Box<Self> {
         let s = GraphSnapshot {
@@ -596,7 +657,9 @@ impl AudioGraph {
                 },
             },
         };
-        Self::build(&s, &HashMap::new(), sample_rate).0
+        Self::build(&s, &HashMap::new(), sample_rate)
+            .expect("empty graph construction cannot fail")
+            .0
     }
     pub fn process(
         &mut self,
@@ -1197,14 +1260,14 @@ mod tests {
         dry.midi_clips.clear();
         snapshot.tracks[0].effects = vec![effect("colorizer", "builtin:resonator", &[])];
         snapshot.tracks.push(dry);
-        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         assert_eq!(graph.max_latency(), 4_096);
         assert_eq!(graph.tracks[0].pdc.delay, 0);
         assert_eq!(graph.tracks[1].pdc.delay, 4_096);
     }
 
     fn render_midi(block_size: usize) -> Vec<f32> {
-        let (mut graph, _) = AudioGraph::build(&midi_snapshot(), &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&midi_snapshot(), &HashMap::new(), 48_000).unwrap();
         let mut rendered = Vec::with_capacity(48_000 * 2);
         let mut position = 0_u64;
         let mut levels = [Level::default(); MAX_TRACKS];
@@ -1217,6 +1280,82 @@ mod tests {
             position += frames as u64;
         }
         rendered
+    }
+
+    /// Manual regression for the commercial-instrument failure that motivated
+    /// the stable registry: keep editor A open, add instrument B through a new
+    /// graph, then open B. The A control pointer must survive the rebuild.
+    #[test]
+    #[ignore = "opens two installed vendor VST3 editors"]
+    fn unchanged_vst3_survives_graph_rebuild_while_second_editor_opens() {
+        fn external_instrument(
+            id: &str,
+            path_var: &str,
+            uid_var: &str,
+        ) -> ministudio_contracts::InstrumentSpec {
+            let path = std::env::var(path_var).unwrap_or_else(|_| panic!("{path_var} is required"));
+            let uid = std::env::var(uid_var).unwrap_or_else(|_| panic!("{uid_var} is required"));
+            ministudio_contracts::InstrumentSpec {
+                id: id.into(),
+                kind: format!("vst3:{uid}"),
+                params: HashMap::new(),
+                bypassed: false,
+                plugin: Some(ministudio_contracts::ExternalPluginRef {
+                    format: "vst3".into(),
+                    uid,
+                    name: id.into(),
+                    vendor: String::new(),
+                    path,
+                    audio_input_buses: 0,
+                    audio_output_buses: 0,
+                    supports_sidechain: false,
+                    has_editor: true,
+                    state: Vec::new(),
+                }),
+            }
+        }
+
+        let mut first = midi_snapshot();
+        first.tracks[0].id = "stable-a".into();
+        first.tracks[0].instrument = Some(external_instrument(
+            "instrument-a",
+            "MINISTUDIO_VST3_SMOKE_PATH_A",
+            "MINISTUDIO_VST3_SMOKE_UID_A",
+        ));
+        let mut registry = ExternalPluginRegistry::default();
+        let (first_graph, first_bindings) =
+            AudioGraph::build_with_plugins(&first, &HashMap::new(), 48_000, &mut registry)
+                .expect("first VST3 graph should build");
+        let first_control = first_bindings.plugin_controls["stable-a"].clone();
+        first_control.open_editor().expect("editor A should open");
+
+        let mut second = first.clone();
+        let mut track_b = second.tracks[0].clone();
+        track_b.id = "new-b".into();
+        track_b.instrument = Some(external_instrument(
+            "instrument-b",
+            "MINISTUDIO_VST3_SMOKE_PATH_B",
+            "MINISTUDIO_VST3_SMOKE_UID_B",
+        ));
+        second.tracks.push(track_b);
+        let (second_graph, second_bindings) =
+            AudioGraph::build_with_plugins(&second, &HashMap::new(), 48_000, &mut registry)
+                .expect("second VST3 graph should build without rebuilding A");
+        assert!(Arc::ptr_eq(
+            &first_control,
+            &second_bindings.plugin_controls["stable-a"]
+        ));
+        let second_control = second_bindings.plugin_controls["new-b"].clone();
+        second_control.open_editor().expect("editor B should open");
+        assert!(first_control.is_editor_open());
+        assert!(second_control.is_editor_open());
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        second_control
+            .close_editor()
+            .expect("editor B should close");
+        first_control.close_editor().expect("editor A should close");
+        drop(second_graph);
+        drop(first_graph);
     }
 
     #[test]
@@ -1250,7 +1389,7 @@ mod tests {
                 }],
             },
         ];
-        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         assert!(matches!(
             graph.tracks[0].midi_events[0].kind,
             NoteEventKind::PitchBend { value } if (value - 0.5).abs() < 0.0001
@@ -1265,7 +1404,7 @@ mod tests {
     fn transport_all_notes_off_releases_a_sustained_voice() {
         let mut snapshot = midi_snapshot();
         snapshot.tracks[0].midi_clips[0].notes[0].length_ticks = 20_000;
-        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         let mut levels = [Level::default(); MAX_TRACKS];
         let mut master = Level::default();
         let mut output = vec![0.0; MAX_BLOCK_SIZE * 2];
@@ -1302,7 +1441,7 @@ mod tests {
         clip.duration_sec = 4.0;
         clip.loop_enabled = true;
         clip.loop_length_ticks = 960;
-        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         let mut energy = [0.0_f32; 4];
         let mut levels = [Level::default(); MAX_TRACKS];
         let mut master = Level::default();
@@ -1401,7 +1540,7 @@ mod tests {
             ),
         ];
 
-        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         let mut levels = [Level::default(); MAX_TRACKS];
         let mut master = Level::default();
         let mut energy = [0.0_f32; 4];
@@ -1463,7 +1602,7 @@ mod tests {
         });
         snapshot.master.effects = vec![master_compressor];
 
-        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         assert!(matches!(
             graph.buses[0].effect_sidechains[0],
             Some(SidechainSource::Track(0))
@@ -1496,7 +1635,7 @@ mod tests {
             volume_db: -144.0,
             effects: Vec::new(),
         });
-        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000);
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
         assert_eq!(graph.tracks[0].output_bus, Some(0));
         let mut levels = [Level::default(); MAX_TRACKS];
         let mut master = Level::default();

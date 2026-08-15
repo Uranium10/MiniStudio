@@ -11,7 +11,8 @@ ministudio-contracts = { path = "../ministudio-contracts" }
 ministudio-dsp = { path = "../ministudio-dsp" }
 serde = { version = "1", features = ["derive"] }
 specta = { version = "=2.0.0-rc.25", features = ["derive"] }
-vst3-host = { version = "0.9.0", default-features = false }
+vst3-host = { version = "0.9.0", default-features = false, features = ["embedded-editor", "process-isolation"] }
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "winuser"] }
+winapi = { version = "0.3", features = ["combaseapi", "handleapi", "objbase", "processthreadsapi", "winnt", "winuser"] }

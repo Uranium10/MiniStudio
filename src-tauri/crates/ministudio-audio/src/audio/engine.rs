@@ -3,9 +3,10 @@ use super::{
     asset::{decode_asset, AudioAsset},
     command::{param_key, AudioCommand},
     device,
-    dsp::{create_effect, DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES},
+    dsp::{create_effect, PluginControl, DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES},
     graph::{AudioGraph, Bindings},
     instrument::{LiveMidiMessage, NoteEvent, NoteEventKind},
+    plugin::ExternalPluginRegistry,
     types::{
         db_to_gain, AudioBackendInfo, AudioDeviceInfo, AudioSettings, DecodeProgress, EffectSpec,
         EngineSnapshot, EqFrequencyResponse, ExportProgress, ExportRequest, ExportResult,
@@ -17,6 +18,7 @@ use super::{
 use cpal::Stream;
 use crossbeam_queue::ArrayQueue;
 use midir::{Ignore, MidiInput, MidiInputConnection};
+pub use ministudio_dsp::EmbeddedPluginEditor;
 use mp3lame_encoder::{
     max_required_buffer_size, Bitrate, Builder as Mp3Builder, FlushGap, InterleavedPcm, Mode,
     Quality,
@@ -475,6 +477,7 @@ pub struct NativeEngine {
     midi_connections: HashMap<String, MidiInputConnection<()>>,
     midi_connection_targets: HashMap<String, String>,
     midi_note_counter: Arc<AtomicI32>,
+    plugin_instances: ExternalPluginRegistry,
 }
 impl Default for NativeEngine {
     fn default() -> Self {
@@ -500,6 +503,7 @@ impl Default for NativeEngine {
             midi_connections: HashMap::new(),
             midi_connection_targets: HashMap::new(),
             midi_note_counter: Arc::new(AtomicI32::new(1)),
+            plugin_instances: ExternalPluginRegistry::default(),
         }
     }
 }
@@ -515,6 +519,7 @@ impl NativeEngine {
         self.runtime = None;
         self.midi_connections.clear();
         self.midi_connection_targets.clear();
+        self.plugin_instances.clear();
     }
     fn restart_stream(&mut self) -> Result<(), String> {
         self.close_all_plugin_editors();
@@ -531,7 +536,12 @@ impl NativeEngine {
             self.settings.sample_rate = rate;
         }
         let graph = if let Some(spec) = &self.last_snapshot {
-            let (g, b) = AudioGraph::build(spec, &self.assets, self.settings.sample_rate);
+            let (g, b) = AudioGraph::build_with_plugins(
+                spec,
+                &self.assets,
+                self.settings.sample_rate,
+                &mut self.plugin_instances,
+            )?;
             self.bindings = b;
             g
         } else {
@@ -575,8 +585,12 @@ impl NativeEngine {
                     self.settings.sample_rate = rate;
                 }
                 let graph = if let Some(spec) = &self.last_snapshot {
-                    let (graph, bindings) =
-                        AudioGraph::build(spec, &self.assets, self.settings.sample_rate);
+                    let (graph, bindings) = AudioGraph::build_with_plugins(
+                        spec,
+                        &self.assets,
+                        self.settings.sample_rate,
+                        &mut self.plugin_instances,
+                    )?;
                     self.bindings = bindings;
                     graph
                 } else {
@@ -670,12 +684,25 @@ impl NativeEngine {
             .ok_or_else(|| format!("unsupported peak LOD: {lod}"))
     }
     pub fn sync_graph(&mut self, spec: GraphSnapshot) -> Result<(), String> {
-        self.close_all_plugin_editors();
-        let (graph, bindings) = AudioGraph::build(&spec, &self.assets, self.settings.sample_rate);
+        // Do not synchronously close every vendor GUI under the global engine
+        // mutex. The old graph remains valid until the realtime swap retires
+        // it; dropping its final PluginControl sends the GUI worker a
+        // nonblocking Shutdown in graph-retirement order. This keeps unrelated
+        // editors responsive while a new track/plugin graph is constructed.
+        let (graph, bindings) = AudioGraph::build_with_plugins(
+            &spec,
+            &self.assets,
+            self.settings.sample_rate,
+            &mut self.plugin_instances,
+        )?;
+        // Commit control-plane bindings only after the realtime queue accepts
+        // the graph. If the bounded queue is full, the currently audible graph
+        // and its editor/parameter lookup table must remain one transaction.
+        self.push(AudioCommand::SwapGraph(graph))?;
         self.bindings = bindings;
         self.last_snapshot = Some(spec);
         self.graph_revision = self.graph_revision.wrapping_add(1);
-        self.push(AudioCommand::SwapGraph(graph))
+        Ok(())
     }
     pub fn open_plugin_editor(&self, target_id: &str) -> Result<(), String> {
         let control = self
@@ -687,6 +714,20 @@ impl NativeEngine {
             return Err("plug-in does not expose a compatible native editor".into());
         }
         control.open_editor()
+    }
+    /// Looks up a plug-in's control handle without holding it past the lookup. Callers whose
+    /// next step is a slow, blocking native call (opening a heavy instrument's editor view, for
+    /// example) must clone this Arc and release the engine lock *before* making that call - the
+    /// same `Arc<Mutex<NativeEngine>>` gates every other control-plane command (parameter
+    /// changes, meters, transport), so holding it for however long one plug-in's GUI takes to
+    /// come up would freeze every other loaded instrument's controls along with it, not just
+    /// the slow one's.
+    pub fn plugin_control(&self, target_id: &str) -> Result<Arc<dyn PluginControl>, String> {
+        self.bindings
+            .plugin_controls
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| format!("plug-in instance is not available: {target_id}"))
     }
     pub fn close_plugin_editor(&self, target_id: &str) -> Result<(), String> {
         self.bindings
@@ -970,7 +1011,7 @@ impl NativeEngine {
         device::list_devices(id)
     }
     pub fn midi_inputs(&self) -> Result<Vec<MidiInputPortInfo>, String> {
-        let input = MidiInput::new("MiniDAW MIDI scan").map_err(|error| error.to_string())?;
+        let input = MidiInput::new("MiniStudio MIDI scan").map_err(|error| error.to_string())?;
         input
             .ports()
             .iter()
@@ -1002,7 +1043,8 @@ impl NativeEngine {
             .tracks
             .get(track_id)
             .ok_or("unknown MIDI target track")?;
-        let mut input = MidiInput::new("MiniDAW MIDI input").map_err(|error| error.to_string())?;
+        let mut input =
+            MidiInput::new("MiniStudio MIDI input").map_err(|error| error.to_string())?;
         input.ignore(Ignore::None);
         let port_index = port_id.parse::<usize>().map_err(|_| "invalid MIDI port")?;
         let port = input
@@ -1017,7 +1059,7 @@ impl NativeEngine {
         let connection = input
             .connect(
                 &port,
-                "MiniDAW",
+                "MiniStudio",
                 move |_stamp, message, _| {
                     if message.is_empty() {
                         return;
@@ -1109,7 +1151,7 @@ impl NativeEngine {
         if request.sample_rate != self.settings.sample_rate {
             return Err("export sample rate must match the loaded project sample rate".into());
         }
-        let (graph, _) = AudioGraph::build(spec, &self.assets, request.sample_rate);
+        let (graph, _) = AudioGraph::build(spec, &self.assets, request.sample_rate)?;
         let end = spec
             .tracks
             .iter()
@@ -1130,7 +1172,7 @@ impl NativeEngine {
         let progress_step = (total / 100).max(MAX_BLOCK_SIZE);
         let mut normalization_gain = 1.0_f32;
         if request.normalize {
-            let (mut analysis, _) = AudioGraph::build(spec, &self.assets, request.sample_rate);
+            let (mut analysis, _) = AudioGraph::build(spec, &self.assets, request.sample_rate)?;
             analysis.reset(0);
             let mut output = vec![0.0_f32; MAX_BLOCK_SIZE * 2];
             let mut levels = [Level::default(); MAX_TRACKS];
@@ -1287,7 +1329,7 @@ mod realtime_tests {
     #[test]
     fn mp3_sink_writes_a_decodable_frame_stream() {
         let path = std::env::temp_dir().join(format!(
-            "minidaw-mp3-smoke-{}-{}.mp3",
+            "ministudio-mp3-smoke-{}-{}.mp3",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

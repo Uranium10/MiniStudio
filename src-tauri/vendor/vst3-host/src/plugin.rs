@@ -1090,6 +1090,10 @@ pub(crate) trait PluginInternal: Send {
     fn recovery_count(&self) -> u64 {
         0
     }
+    /// Whether the process-isolated realtime transport requires control-thread recovery.
+    fn realtime_transport_faulted(&self) -> bool {
+        false
+    }
     /// Recover from a crashed isolated helper by respawning and reloading. Only meaningful
     /// for process-isolated plugins.
     fn recover(&mut self) -> Result<()> {
@@ -1996,6 +2000,22 @@ impl Plugin {
             .open_editor(parent.0)
     }
 
+    /// Ask a process-isolated plug-in helper to create its own standalone editor window.
+    ///
+    /// Unlike [`Self::open_editor`], no parent handle crosses the process boundary: the helper
+    /// owns the native top-level window and all GUI calls remain on its process main thread.
+    pub fn open_isolated_editor(&mut self) -> Result<()> {
+        if self.isolation_pid().is_none() {
+            return Err(Error::Other(
+                "standalone helper editor requires process isolation".to_string(),
+            ));
+        }
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .open_editor(std::ptr::null_mut())
+    }
+
     /// Drive the Linux `IRunLoop` services (timers and file-descriptor
     /// events) that the plugin's editor registered with the host frame.
     /// VSTGUI-based editors paint and respond ONLY when this runs - call it
@@ -2404,6 +2424,14 @@ impl Plugin {
             .as_ref()
             .map(|i| i.recovery_count())
             .unwrap_or(0)
+    }
+
+    /// Whether a process-isolated realtime block timed out or failed protocol validation.
+    /// Recovery must run on a control thread, never inline in the audio callback.
+    pub fn realtime_transport_faulted(&self) -> bool {
+        self.internal
+            .as_ref()
+            .is_some_and(|internal| internal.realtime_transport_faulted())
     }
 
     /// Total number of output audio channels across the plugin's output buses.

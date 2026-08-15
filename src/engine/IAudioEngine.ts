@@ -70,7 +70,7 @@ export interface IAudioEngine {
   cachedPlugins(): Promise<PluginDescriptor[]>
   scanPlugins(force?: boolean): Promise<PluginDescriptor[]>
   inspectPlugin(plugin: PluginDescriptor): Promise<PluginDescriptor>
-  openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void>
+  openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string, foreground?: boolean): Promise<void>
   closePluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void>
   isPluginEditorOpen(targetKind: 'effect' | 'instrument', targetId: string): Promise<boolean>
   savePluginState(targetKind: 'effect' | 'instrument', targetId: string): Promise<number[]>

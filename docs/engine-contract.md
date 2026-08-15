@@ -1,4 +1,4 @@
-# MiniDAW 오디오 엔진 계약
+﻿# MiniStudio 오디오 엔진 계약
 
 ## 경계
 

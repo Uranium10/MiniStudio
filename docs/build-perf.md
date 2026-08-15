@@ -1,10 +1,10 @@
-# Build performance
+﻿# Build performance
 
 Measured on Windows 11 with Rust 1.97.1 (MSVC), Cargo 1.97.1, and the external
 target directory used by `run.bat`:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'C:\tmp\minidaw-msvc-target'
+$env:CARGO_TARGET_DIR = 'C:\tmp\ministudio-msvc-target'
 ```
 
 The clean-build numbers include `cargo clean`; they naturally vary with Windows
@@ -42,7 +42,7 @@ Baseline top ten units from Cargo's timing report:
 | windows 0.61.3 | 44.57 s |
 | tauri-utils 2.9.3 | 19.70 s |
 | windows 0.54.0 | 19.53 s |
-| minidaw 0.2.0 | 14.70 s |
+| ministudio 0.2.0 | 14.70 s |
 | tauri-utils 2.9.3 (second unit) | 14.42 s |
 | tokio 1.53.1 | 12.55 s |
 | syn 2.0.119 | 11.13 s |
@@ -66,12 +66,15 @@ Final top ten units after the complete workspace split:
 | tauri 2.11.5 | 7.28 s |
 
 The reports are generated under
-`C:\tmp\minidaw-msvc-target\cargo-timings`. They are machine-local build
+`C:\tmp\ministudio-msvc-target\cargo-timings`. They are machine-local build
 artifacts and are not committed.
 
 ## Implemented changes
 
-- Restored incremental compilation for `dev`, `test`, and `dev-dsp`.
+- Restored incremental compilation for `dev` and `test`. `dev-dsp` deliberately
+  remains non-incremental: after the workspace split its warm rebuild benefit is
+  negligible, while reusing per-CGU LLVM objects with `rust-lld` reproduced an
+  undefined `anon.*.llvm.*` link failure.
 - Configured `rust-lld` only for `x86_64-pc-windows-msvc` in
   `src-tauri/.cargo/config.toml`. Supplying `-fuse-ld=lld` to `rust-lld` was
   intentionally omitted because rust-lld reports it as an unknown, ignored
@@ -115,12 +118,14 @@ no speculative frontend configuration was added.
 
 ## Cache recovery
 
-If incremental-link errors such as LNK2019/LNK1120 return, do not permanently
-set `incremental = false`. First close running MiniStudio processes, verify the
+If an old cache still reports LNK2019/LNK1120 or an undefined
+`anon.*.llvm.*` symbol, first close running MiniStudio processes, verify the
 Defender/indexer exclusions in [dev-setup.md](dev-setup.md), then clear the
-affected cache once:
+affected cache once. The normal `dev` and `test` profiles remain incremental;
+`dev-dsp` is intentionally non-incremental to prevent this class of mixed-CGU
+failure:
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'C:\tmp\minidaw-msvc-target'
+$env:CARGO_TARGET_DIR = 'C:\tmp\ministudio-msvc-target'
 cargo clean --manifest-path src-tauri/Cargo.toml
 ```

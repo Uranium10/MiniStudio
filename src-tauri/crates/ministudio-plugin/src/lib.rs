@@ -20,9 +20,10 @@ use clack_host::{
 };
 use ministudio_contracts::{EffectSpec, InstrumentSpec};
 use ministudio_dsp::{
-    AudioBuffer, DspEffect, Instrument, NoteEvent, NoteEventKind, PluginControl, MAX_BLOCK_SIZE,
-    MAX_CHANNELS,
+    AudioBuffer, DspEffect, EmbeddedPluginEditor, Instrument, NoteEvent, NoteEventKind,
+    PluginControl, MAX_BLOCK_SIZE, MAX_CHANNELS,
 };
+use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::{
@@ -37,9 +38,18 @@ use std::{
     },
 };
 use vst3_host::{
-    midi::NoteId, BusAudioBuffers, BusDirection, MediaType, MidiChannel, MidiEvent, Plugin,
-    PluginWindow, Vst3Host,
+    embed::{EditorRect, EmbeddedEditor},
+    midi::NoteId,
+    BusAudioBuffers, BusDirection, MediaType, MidiChannel, MidiEvent, Plugin, PluginWindow,
+    Vst3Host,
 };
+
+/// Enter the VST3 helper process loop in the current executable. MiniStudio
+/// calls this only after recognizing its private helper-mode command-line flag,
+/// before Tauri, WebView2, audio devices or project state are initialized.
+pub fn run_vst3_helper_process() {
+    vst3_host::helper_process::run();
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -401,8 +411,8 @@ fn inspect_clap_metadata(
 ) -> Result<(u32, u32, bool, Vec<PluginParameterDescriptor>), String> {
     let uid = CString::new(uid).map_err(|_| "CLAP plugin ID contains a NUL byte")?;
     let host_info = HostInfo::new(
-        "MiniDAW Probe",
-        "MiniDAW",
+        "MiniStudio Probe",
+        "MiniStudio",
         "https://github.com",
         env!("CARGO_PKG_VERSION"),
     )
@@ -446,14 +456,29 @@ enum Vst3Role {
 
 fn load_vst3(path: &str, uid: &str, sample_rate: f32, role: Vst3Role) -> Result<Plugin, String> {
     let normalized_path = normalize_plugin_path(PathBuf::from(path));
-    let mut host = Vst3Host::builder()
+    #[cfg(target_os = "windows")]
+    let isolate = std::env::var("MINISTUDIO_VST3_PROCESS_ISOLATION")
+        .ok()
+        .map(|value| !matches!(value.trim(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true);
+    #[cfg(not(target_os = "windows"))]
+    let isolate = false;
+    let mut builder = Vst3Host::builder()
         .sample_rate(sample_rate as f64)
         .block_size(MAX_BLOCK_SIZE)
         .input_channels(MAX_CHANNELS)
         .output_channels(MAX_CHANNELS)
-        .with_process_isolation(false)
-        .build()
-        .map_err(|error| error.to_string())?;
+        .with_process_isolation(isolate);
+    if isolate {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("failed to locate MiniStudio plug-in host: {error}"))?;
+        builder = builder
+            .self_hosted_helper(executable, "--ministudio-vst3-host")
+            .response_timeout(std::time::Duration::from_secs(10))
+            .auto_recover_plugins(true)
+            .auto_recover_max_retries(1);
+    }
+    let mut host = builder.build().map_err(|error| error.to_string())?;
     let mut plugin = host
         .load_plugin_class(&normalized_path, uid)
         .map_err(|error| error.to_string())?;
@@ -495,6 +520,12 @@ fn load_vst3(path: &str, uid: &str, sample_rate: f32, role: Vst3Role) -> Result<
 
 enum Vst3ControlCommand {
     Open(Sender<Result<(), String>>),
+    OpenEmbedded {
+        parent: usize,
+        rect: EditorRect,
+        reply: Sender<Result<(), String>>,
+    },
+    CloseEmbedded,
     Close(Sender<Result<(), String>>),
     SaveState(Sender<Result<Vec<u8>, String>>),
     LoadState(Vec<u8>, Sender<Result<(), String>>),
@@ -504,48 +535,204 @@ enum Vst3ControlCommand {
 struct Vst3Control {
     sender: Sender<Vst3ControlCommand>,
     editor_open: Arc<AtomicBool>,
-    has_editor: bool,
+    pending_editor_rect: Arc<Mutex<Option<EditorRect>>>,
+    has_editor: Arc<AtomicBool>,
+}
+
+struct Vst3Ready {
+    plugin: Arc<Mutex<Plugin>>,
+    buffers: BusAudioBuffers,
+    latency: usize,
+    tail: usize,
+}
+
+struct Vst3EmbeddedEditor {
+    sender: Sender<Vst3ControlCommand>,
+    editor_open: Arc<AtomicBool>,
+    pending_editor_rect: Arc<Mutex<Option<EditorRect>>>,
+}
+
+impl EmbeddedPluginEditor for Vst3EmbeddedEditor {
+    fn set_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
+        let rect = EditorRect {
+            x,
+            y,
+            width: width.max(1.0),
+            height: height.max(1.0),
+        };
+        *self
+            .pending_editor_rect
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(rect);
+    }
+}
+
+impl Drop for Vst3EmbeddedEditor {
+    fn drop(&mut self) {
+        // The real editor is destroyed by the same message-pumped GUI thread
+        // that created it. This is intentionally asynchronous: graph teardown
+        // can release the Tauri UI thread immediately, while channel ordering
+        // guarantees CloseEmbedded precedes the control's later Shutdown.
+        self.editor_open.store(false, Ordering::Release);
+        let _ = self.sender.send(Vst3ControlCommand::CloseEmbedded);
+    }
 }
 
 impl Vst3Control {
-    fn new(plugin: Arc<Mutex<Plugin>>, has_editor: bool) -> Result<Arc<Self>, String> {
-        let (sender, receiver) = channel();
-        let editor_open = Arc::new(AtomicBool::new(false));
-        let thread_open = Arc::clone(&editor_open);
-        std::thread::Builder::new()
-            .name("minidaw-vst3-control".into())
-            .spawn(move || run_vst3_control(plugin, receiver, thread_open))
-            .map_err(|error| error.to_string())?;
-        Ok(Arc::new(Self {
-            sender,
-            editor_open,
-            has_editor,
-        }))
-    }
-
     fn request<T>(
         &self,
         build: impl FnOnce(Sender<Result<T, String>>) -> Vst3ControlCommand,
+    ) -> Result<T, String> {
+        self.request_with_timeout(
+            build,
+            std::time::Duration::from_secs(10),
+            "VST3 control operation",
+        )
+    }
+
+    fn request_with_timeout<T>(
+        &self,
+        build: impl FnOnce(Sender<Result<T, String>>) -> Vst3ControlCommand,
+        timeout: std::time::Duration,
+        operation: &str,
     ) -> Result<T, String> {
         let (reply, receive) = channel();
         self.sender
             .send(build(reply))
             .map_err(|_| "VST3 control thread is unavailable".to_owned())?;
         receive
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(|_| "VST3 control operation timed out".to_owned())?
+            .recv_timeout(timeout)
+            .map_err(|_| format!("{operation} timed out after {} seconds", timeout.as_secs()))?
     }
+}
+
+fn start_vst3_instance(
+    path: String,
+    uid: String,
+    state: Vec<u8>,
+    params: Vec<(String, f32)>,
+    sample_rate: f32,
+    role: Vst3Role,
+) -> Result<(Vst3Ready, Arc<Vst3Control>), String> {
+    let (sender, receiver) = channel();
+    let (ready_sender, ready_receiver) = sync_channel(1);
+    let editor_open = Arc::new(AtomicBool::new(false));
+    let has_editor = Arc::new(AtomicBool::new(false));
+    let pending_editor_rect = Arc::new(Mutex::new(None));
+    let state_checkpoint = Arc::new(Mutex::new(state.clone()));
+    let parameter_checkpoint = params.clone();
+    let control = Arc::new(Vst3Control {
+        sender,
+        editor_open: Arc::clone(&editor_open),
+        pending_editor_rect: Arc::clone(&pending_editor_rect),
+        has_editor: Arc::clone(&has_editor),
+    });
+
+    std::thread::Builder::new()
+        .name("ministudio-vst3-owner".into())
+        .spawn(move || {
+            let owner_checkpoint = Arc::clone(&state_checkpoint);
+            // VST3's control-thread identity is captured while the component and
+            // controller are initialized. Keep every non-realtime operation,
+            // native window, message pump, and final destruction on this same
+            // owner thread for the complete instance lifetime.
+            let initialized = (|| -> Result<Vst3Ready, String> {
+                let mut plugin = load_vst3(&path, &uid, sample_rate, role)?;
+                if !state.is_empty() {
+                    plugin
+                        .load_state(&state)
+                        .map_err(|error| format!("failed to restore VST3 state: {error}"))?;
+                }
+                for (id, value) in params {
+                    if let Ok(id) = id.strip_prefix("param:").unwrap_or(&id).parse::<u32>() {
+                        let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
+                    }
+                }
+                let latency = plugin.latency_samples() as usize;
+                let tail = plugin.tail_samples() as usize;
+                let buffers = plugin
+                    .create_bus_audio_buffers(MAX_BLOCK_SIZE)
+                    .map_err(|error| error.to_string())?;
+                has_editor.store(plugin.has_editor(), Ordering::Release);
+                Ok(Vst3Ready {
+                    plugin: Arc::new(Mutex::new(plugin)),
+                    buffers,
+                    latency,
+                    tail,
+                })
+            })();
+
+            match initialized {
+                Ok(ready) => {
+                    let plugin = Arc::clone(&ready.plugin);
+                    if ready_sender.send(Ok(ready)).is_ok() {
+                        run_vst3_control(
+                            plugin,
+                            receiver,
+                            editor_open,
+                            pending_editor_rect,
+                            owner_checkpoint,
+                            parameter_checkpoint,
+                        );
+                    }
+                }
+                Err(error) => {
+                    let _ = ready_sender.send(Err(error));
+                }
+            }
+        })
+        .map_err(|error| error.to_string())?;
+
+    let ready = ready_receiver
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .map_err(|_| "VST3 instance initialization timed out after 120 seconds".to_owned())??;
+    Ok((ready, control))
 }
 
 impl PluginControl for Vst3Control {
     fn has_editor(&self) -> bool {
-        self.has_editor
+        self.has_editor.load(Ordering::Acquire)
     }
     fn open_editor(&self) -> Result<(), String> {
-        if !self.has_editor {
+        if !self.has_editor() {
             return Err("This VST3 plug-in does not provide an editor".into());
         }
-        self.request(Vst3ControlCommand::Open)
+        self.request_with_timeout(
+            Vst3ControlCommand::Open,
+            std::time::Duration::from_secs(120),
+            "VST3 editor open",
+        )
+    }
+    fn open_editor_embedded(
+        &self,
+        parent: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Result<Box<dyn EmbeddedPluginEditor>, String> {
+        if !self.has_editor() {
+            return Err("This VST3 plug-in does not provide an editor".into());
+        }
+        let rect = EditorRect {
+            x,
+            y,
+            width: width.max(1.0),
+            height: height.max(1.0),
+        };
+        #[cfg(not(target_os = "windows"))]
+        return Err("embedded plug-in shell currently requires Windows".into());
+        #[cfg(target_os = "windows")]
+        self.request(|reply| Vst3ControlCommand::OpenEmbedded {
+            parent,
+            rect,
+            reply,
+        })?;
+        Ok(Box::new(Vst3EmbeddedEditor {
+            sender: self.sender.clone(),
+            editor_open: Arc::clone(&self.editor_open),
+            pending_editor_rect: Arc::clone(&self.pending_editor_rect),
+        }))
     }
     fn close_editor(&self) -> Result<(), String> {
         self.request(Vst3ControlCommand::Close)
@@ -571,12 +758,37 @@ fn run_vst3_control(
     plugin: Arc<Mutex<Plugin>>,
     receiver: Receiver<Vst3ControlCommand>,
     editor_open: Arc<AtomicBool>,
+    pending_editor_rect: Arc<Mutex<Option<EditorRect>>>,
+    state_checkpoint: Arc<Mutex<Vec<u8>>>,
+    parameter_checkpoint: Vec<(String, f32)>,
 ) {
+    // Do not preselect a COM apartment for a vendor's standalone GUI thread.
+    // The original standalone host left this thread uninitialized and allowed
+    // each plug-in framework to choose the apartment it requires. Forcing STA
+    // here made some otherwise valid commercial editors (including sample
+    // players) silently stop during view creation.
     let mut window = PluginWindow::new(Arc::clone(&plugin));
+    let isolated = plugin
+        .lock()
+        .map(|plugin| plugin.isolation_pid().is_some())
+        .unwrap_or(false);
+    let mut embedded: Option<EmbeddedEditor> = None;
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(8)) {
             Ok(Vst3ControlCommand::Open(reply)) => {
-                let result = if window.is_open() {
+                // Standalone and embedded views are mutually exclusive for one
+                // VST3 instance. Both are owned by this same GUI worker.
+                embedded.take();
+                let result = if isolated {
+                    plugin
+                        .lock()
+                        .map_err(|_| "VST3 instance lock was poisoned".to_owned())
+                        .and_then(|mut plugin| {
+                            plugin
+                                .open_isolated_editor()
+                                .map_err(|error| error.to_string())
+                        })
+                } else if window.is_open() {
                     Ok(())
                 } else {
                     window.open().map_err(|error| error.to_string())
@@ -587,8 +799,75 @@ fn run_vst3_control(
                 editor_open.store(result.is_ok(), Ordering::Release);
                 let _ = reply.send(result);
             }
-            Ok(Vst3ControlCommand::Close(reply)) => {
+            Ok(Vst3ControlCommand::OpenEmbedded {
+                parent,
+                rect,
+                reply,
+            }) => {
+                if isolated {
+                    editor_open.store(false, Ordering::Release);
+                    let _ = reply.send(Err(
+                        "process-isolated VST3 editors use a helper-owned standalone window"
+                            .to_owned(),
+                    ));
+                    continue;
+                }
                 window.close();
+                embedded.take();
+                pending_editor_rect
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                #[cfg(target_os = "windows")]
+                let result = std::num::NonZeroIsize::new(parent as isize)
+                    .ok_or_else(|| "invalid native parent window".to_owned())
+                    .and_then(|hwnd| {
+                        EmbeddedEditor::embed(
+                            Arc::clone(&plugin),
+                            RawWindowHandle::Win32(Win32WindowHandle::new(hwnd)),
+                            rect,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                #[cfg(not(target_os = "windows"))]
+                let result: Result<EmbeddedEditor, String> =
+                    Err("embedded plug-in shell currently requires Windows".into());
+                match result {
+                    Ok(editor) => {
+                        embedded = Some(editor);
+                        editor_open.store(true, Ordering::Release);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        editor_open.store(false, Ordering::Release);
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            Ok(Vst3ControlCommand::CloseEmbedded) => {
+                embedded.take();
+                pending_editor_rect
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                editor_open.store(window.is_open(), Ordering::Release);
+            }
+            Ok(Vst3ControlCommand::Close(reply)) => {
+                embedded.take();
+                pending_editor_rect
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                if isolated {
+                    let _ = plugin
+                        .lock()
+                        .map_err(|_| "VST3 instance lock was poisoned".to_owned())
+                        .and_then(|mut plugin| {
+                            plugin.close_editor().map_err(|error| error.to_string())
+                        });
+                } else {
+                    window.close();
+                }
                 editor_open.store(false, Ordering::Release);
                 let _ = reply.send(Ok(()));
             }
@@ -597,30 +876,89 @@ fn run_vst3_control(
                     .lock()
                     .map_err(|_| "VST3 instance lock was poisoned".to_owned())
                     .and_then(|plugin| plugin.save_state().map_err(|error| error.to_string()));
+                if let Ok(snapshot) = result.as_ref() {
+                    *state_checkpoint
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = snapshot.clone();
+                }
                 let _ = reply.send(result);
             }
             Ok(Vst3ControlCommand::LoadState(state, reply)) => {
+                let checkpoint = state.clone();
                 let result = plugin
                     .lock()
                     .map_err(|_| "VST3 instance lock was poisoned".to_owned())
                     .and_then(|mut plugin| {
                         plugin.load_state(&state).map_err(|error| error.to_string())
                     });
+                if result.is_ok() {
+                    *state_checkpoint
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = checkpoint;
+                }
                 let _ = reply.send(result);
             }
             Ok(Vst3ControlCommand::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                window.close();
+                embedded.take();
+                pending_editor_rect
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .take();
+                if isolated {
+                    if let Ok(mut plugin) = plugin.lock() {
+                        let _ = plugin.close_editor();
+                    }
+                } else {
+                    window.close();
+                }
                 editor_open.store(false, Ordering::Release);
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if window.closed_by_user() {
+        if !isolated && window.closed_by_user() {
             window.close();
             editor_open.store(false, Ordering::Release);
-        } else if window.is_open() {
+        } else if !isolated && window.is_open() {
             let _ = window.service_platform_events();
+        }
+        if isolated {
+            let needs_recovery = plugin
+                .try_lock()
+                .map(|plugin| plugin.realtime_transport_faulted())
+                .unwrap_or(false);
+            if needs_recovery {
+                editor_open.store(false, Ordering::Release);
+                if let Ok(mut plugin) = plugin.lock() {
+                    if plugin.recover().is_ok() {
+                        let checkpoint = state_checkpoint
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .clone();
+                        if !checkpoint.is_empty() {
+                            let _ = plugin.load_state(&checkpoint);
+                        } else {
+                            for (id, value) in &parameter_checkpoint {
+                                if let Ok(id) =
+                                    id.strip_prefix("param:").unwrap_or(id).parse::<u32>()
+                                {
+                                    let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(editor) = embedded.as_ref() {
+            if let Some(rect) = pending_editor_rect
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                editor.set_rect(rect);
+            }
         }
         pump_vst3_window_messages();
     }
@@ -691,37 +1029,24 @@ impl Vst3Effect {
             .plugin
             .as_ref()
             .ok_or("external effect is missing its plugin reference")?;
-        let mut plugin = load_vst3(
-            &reference.path,
-            &reference.uid,
+        let (ready, control) = start_vst3_instance(
+            reference.path.clone(),
+            reference.uid.clone(),
+            reference.state.clone(),
+            spec.params
+                .iter()
+                .map(|(id, value)| (id.clone(), *value))
+                .collect(),
             sample_rate,
             Vst3Role::Effect,
         )?;
-        if !reference.state.is_empty() {
-            plugin
-                .load_state(&reference.state)
-                .map_err(|error| format!("failed to restore VST3 state: {error}"))?;
-        }
-        for (id, value) in &spec.params {
-            if let Ok(id) = id.strip_prefix("param:").unwrap_or(id).parse::<u32>() {
-                let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
-            }
-        }
-        let latency = plugin.latency_samples() as usize;
-        let tail = plugin.tail_samples() as usize;
-        let buffers = plugin
-            .create_bus_audio_buffers(MAX_BLOCK_SIZE)
-            .map_err(|error| error.to_string())?;
-        let has_editor = plugin.has_editor();
-        let plugin = Arc::new(Mutex::new(plugin));
-        let control = Vst3Control::new(Arc::clone(&plugin), has_editor)?;
         Ok(Self {
-            plugin,
+            plugin: ready.plugin,
             control,
-            buffers,
+            buffers: ready.buffers,
             bypassed: spec.bypassed,
-            latency,
-            tail,
+            latency: ready.latency,
+            tail: ready.tail,
         })
     }
 }
@@ -813,39 +1138,74 @@ impl Vst3Instrument {
             .plugin
             .as_ref()
             .ok_or("external instrument is missing its plugin reference")?;
-        let mut plugin = load_vst3(
-            &reference.path,
-            &reference.uid,
+        let (ready, control) = start_vst3_instance(
+            reference.path.clone(),
+            reference.uid.clone(),
+            reference.state.clone(),
+            spec.params
+                .iter()
+                .map(|(id, value)| (id.clone(), *value))
+                .collect(),
             sample_rate,
             Vst3Role::Instrument,
         )?;
-        if !reference.state.is_empty() {
-            plugin
-                .load_state(&reference.state)
-                .map_err(|error| format!("failed to restore VST3 state: {error}"))?;
-        }
-        for (id, value) in &spec.params {
-            if let Ok(id) = id.strip_prefix("param:").unwrap_or(id).parse::<u32>() {
-                let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
-            }
-        }
-        let tail = plugin.tail_samples() as usize;
-        let buffers = plugin
-            .create_bus_audio_buffers(MAX_BLOCK_SIZE)
-            .map_err(|error| error.to_string())?;
-        let has_editor = plugin.has_editor();
-        let plugin = Arc::new(Mutex::new(plugin));
-        let control = Vst3Control::new(Arc::clone(&plugin), has_editor)?;
         Ok(Self {
-            plugin,
+            plugin: ready.plugin,
             control,
-            buffers,
+            buffers: ready.buffers,
             active_notes: HashMap::with_capacity(64),
-            tail,
+            tail: ready.tail,
         })
     }
     fn send_event(plugin: &mut Plugin, active_notes: &mut HashMap<i32, NoteId>, event: &NoteEvent) {
         let offset = event.sample_offset as i32;
+        // In process isolation, note IDs belong to the helper and a synchronous JSON NoteOn
+        // round-trip would block the audio callback. Use the fixed-capacity short-MIDI section of
+        // the next shared-memory audio block instead; pitch and sample offset remain exact.
+        if plugin.isolation_pid().is_some() {
+            let midi = match event.kind {
+                NoteEventKind::NoteOn {
+                    pitch, velocity, ..
+                } => MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: pitch,
+                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                },
+                NoteEventKind::NoteOff {
+                    pitch, velocity, ..
+                } => MidiEvent::NoteOff {
+                    channel: MidiChannel::Ch1,
+                    note: pitch,
+                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                },
+                NoteEventKind::PolyPressure {
+                    pitch, pressure, ..
+                } => MidiEvent::PolyAftertouch {
+                    channel: MidiChannel::Ch1,
+                    note: pitch,
+                    pressure: (pressure.clamp(0.0, 1.0) * 127.0).round() as u8,
+                },
+                NoteEventKind::Controller { cc, value } => MidiEvent::ControlChange {
+                    channel: MidiChannel::Ch1,
+                    controller: cc,
+                    value: (value.clamp(0.0, 1.0) * 127.0).round() as u8,
+                },
+                NoteEventKind::PitchBend { value } => MidiEvent::PitchBend {
+                    channel: MidiChannel::Ch1,
+                    value: ((value.clamp(-1.0, 1.0) + 1.0) * 8191.5).round() as u16,
+                },
+                NoteEventKind::AllNotesOff => {
+                    active_notes.clear();
+                    MidiEvent::ControlChange {
+                        channel: MidiChannel::Ch1,
+                        controller: 123,
+                        value: 0,
+                    }
+                }
+            };
+            let _ = plugin.send_midi_event_at(midi, offset);
+            return;
+        }
         let midi = match event.kind {
             NoteEventKind::NoteOn {
                 note_id,
@@ -1036,6 +1396,274 @@ mod vst_bus_block_tests {
     }
 }
 
+#[cfg(all(test, target_os = "windows"))]
+mod isolated_realtime_hardware_tests {
+    use super::*;
+
+    /// Physical end-to-end regression for the signed self-host executable, named mapping,
+    /// request/response events, timestamped MIDI, and bus-preserving audio return path.
+    #[test]
+    #[ignore = "requires the built MiniStudio executable and locally installed Serum VST3"]
+    fn isolated_shared_memory_serum_renders() {
+        let executable = PathBuf::from(
+            std::env::var_os("MINISTUDIO_SELF_HOST_EXE")
+                .expect("MINISTUDIO_SELF_HOST_EXE must point to ministudio.exe"),
+        );
+        let path = PathBuf::from(
+            std::env::var_os("MINISTUDIO_TEST_SERUM_VST3")
+                .expect("MINISTUDIO_TEST_SERUM_VST3 must point to Serum.vst3"),
+        );
+        let uid = std::env::var("MINISTUDIO_TEST_SERUM_UID")
+            .unwrap_or_else(|_| "56535458667358736572756D00000000".to_string());
+        let mut host = Vst3Host::builder()
+            .sample_rate(48_000.0)
+            .block_size(MAX_BLOCK_SIZE)
+            .input_channels(MAX_CHANNELS)
+            .output_channels(MAX_CHANNELS)
+            .with_process_isolation(true)
+            .self_hosted_helper(executable, "--ministudio-vst3-host")
+            .build()
+            .expect("build isolated host");
+        let mut plugin = host
+            .load_plugin_class(path, &uid)
+            .expect("load Serum in helper");
+        plugin.start_processing().expect("start Serum");
+        let mut buffers = plugin
+            .create_bus_audio_buffers(MAX_BLOCK_SIZE)
+            .expect("create bus buffers");
+        plugin
+            .send_midi_event_at(
+                MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: 60,
+                    velocity: 110,
+                },
+                0,
+            )
+            .expect("queue note on");
+        let started = std::time::Instant::now();
+        let mut energy = 0.0f64;
+        let mut samples = 0usize;
+        for _ in 0..96 {
+            prepare_vst_bus_block(&mut buffers, 256);
+            plugin
+                .process_bus_audio(&mut buffers)
+                .expect("process shared-memory block");
+            for sample in buffers
+                .outputs
+                .iter()
+                .flat_map(|bus| &bus.channels)
+                .flat_map(|channel| channel.iter())
+            {
+                energy += f64::from(*sample) * f64::from(*sample);
+                samples += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        let rms = (energy / samples.max(1) as f64).sqrt();
+        assert!(rms > 1.0e-5, "isolated Serum render was silent: {rms}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "96 realtime blocks took {elapsed:?}"
+        );
+        eprintln!("shared-memory Serum: 96x256 frames in {elapsed:?}, rms={rms:.6}");
+        plugin.stop_processing().expect("stop Serum");
+    }
+
+    #[test]
+    #[ignore = "requires the built MiniStudio executable and locally installed Serum VST3"]
+    fn isolated_worker_recovers_and_reattaches_the_same_mapping() {
+        use winapi::{
+            shared::minwindef::FALSE,
+            um::{
+                handleapi::CloseHandle,
+                processthreadsapi::{OpenProcess, TerminateProcess},
+                winnt::PROCESS_TERMINATE,
+            },
+        };
+
+        let executable = PathBuf::from(
+            std::env::var_os("MINISTUDIO_SELF_HOST_EXE")
+                .expect("MINISTUDIO_SELF_HOST_EXE must point to ministudio.exe"),
+        );
+        let path = PathBuf::from(
+            std::env::var_os("MINISTUDIO_TEST_SERUM_VST3")
+                .expect("MINISTUDIO_TEST_SERUM_VST3 must point to Serum.vst3"),
+        );
+        let mut host = Vst3Host::builder()
+            .sample_rate(48_000.0)
+            .block_size(MAX_BLOCK_SIZE)
+            .input_channels(MAX_CHANNELS)
+            .output_channels(MAX_CHANNELS)
+            .with_process_isolation(true)
+            .self_hosted_helper(executable, "--ministudio-vst3-host")
+            .build()
+            .expect("build isolated host");
+        let mut plugin = host
+            .load_plugin_class(path, "56535458667358736572756D00000000")
+            .expect("load Serum in helper");
+        plugin.start_processing().expect("start Serum");
+        let original_pid = plugin.isolation_pid().expect("helper pid");
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE, FALSE, original_pid);
+            assert!(!process.is_null(), "open helper process");
+            assert_ne!(TerminateProcess(process, 91), 0, "terminate helper");
+            CloseHandle(process);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        plugin.recover().expect("recover isolated Serum");
+        let replacement_pid = plugin.isolation_pid().expect("replacement pid");
+        assert_ne!(replacement_pid, original_pid);
+        assert_eq!(plugin.recovery_count(), 1);
+
+        let mut buffers = plugin
+            .create_bus_audio_buffers(MAX_BLOCK_SIZE)
+            .expect("create buffers after recovery");
+        plugin
+            .send_midi_event_at(
+                MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: 64,
+                    velocity: 110,
+                },
+                0,
+            )
+            .expect("queue note after recovery");
+        let mut peak = 0.0f32;
+        for _ in 0..32 {
+            prepare_vst_bus_block(&mut buffers, 256);
+            plugin
+                .process_bus_audio(&mut buffers)
+                .expect("process recovered block");
+            for sample in buffers
+                .outputs
+                .iter()
+                .flat_map(|bus| &bus.channels)
+                .flat_map(|channel| channel.iter())
+            {
+                peak = peak.max(sample.abs());
+            }
+        }
+        assert!(peak > 1.0e-4, "recovered shared-memory render was silent");
+        plugin.stop_processing().expect("stop recovered Serum");
+    }
+
+    #[test]
+    #[ignore = "requires the built MiniStudio executable and locally installed BBC SO VST3"]
+    fn isolated_shared_memory_bbc_editor_opens_and_closes() {
+        let executable = PathBuf::from(
+            std::env::var_os("MINISTUDIO_SELF_HOST_EXE")
+                .expect("MINISTUDIO_SELF_HOST_EXE must point to ministudio.exe"),
+        );
+        let path = PathBuf::from(
+            std::env::var_os("MINISTUDIO_TEST_BBC_VST3")
+                .expect("MINISTUDIO_TEST_BBC_VST3 must point to BBC SO.vst3"),
+        );
+        let mut host = Vst3Host::builder()
+            .sample_rate(48_000.0)
+            .block_size(MAX_BLOCK_SIZE)
+            .input_channels(MAX_CHANNELS)
+            .output_channels(MAX_CHANNELS)
+            .with_process_isolation(true)
+            .self_hosted_helper(executable, "--ministudio-vst3-host")
+            .build()
+            .expect("build isolated host");
+        let mut plugin = host
+            .load_plugin_class(path, "56535453616E746262632073796D7068")
+            .expect("load BBC in helper");
+        plugin.start_processing().expect("start BBC");
+        plugin
+            .open_isolated_editor()
+            .expect("open BBC helper-owned editor");
+        assert_eq!(plugin.get_editor_size().expect("editor size"), (1083, 917));
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        plugin.close_editor().expect("close BBC editor");
+        plugin.stop_processing().expect("stop BBC");
+    }
+}
+
+#[cfg(test)]
+mod vst3_editor_proxy_tests {
+    use super::*;
+
+    #[test]
+    fn resize_is_coalesced_and_drop_requests_owner_thread_teardown() {
+        let (sender, receiver) = channel();
+        let editor_open = Arc::new(AtomicBool::new(true));
+        let pending_editor_rect = Arc::new(Mutex::new(None));
+        {
+            let mut proxy = Vst3EmbeddedEditor {
+                sender,
+                editor_open: Arc::clone(&editor_open),
+                pending_editor_rect: Arc::clone(&pending_editor_rect),
+            };
+            proxy.set_rect(0.0, 52.0, 640.0, 480.0);
+            proxy.set_rect(4.0, 56.0, 800.0, 600.0);
+        }
+
+        assert!(!editor_open.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(50)),
+            Ok(Vst3ControlCommand::CloseEmbedded)
+        ));
+        let latest = pending_editor_rect
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .expect("latest resize should remain available to the GUI worker");
+        assert_eq!(latest.x, 4.0);
+        assert_eq!(latest.y, 56.0);
+        assert_eq!(latest.width, 800.0);
+        assert_eq!(latest.height, 600.0);
+    }
+
+    /// Manual cross-vendor smoke test for the exact production owner-thread
+    /// path, without involving Tauri/WebView. Example:
+    ///
+    /// `MINISTUDIO_VST3_SMOKE_PATH=... MINISTUDIO_VST3_SMOKE_UID=... cargo test
+    /// -p ministudio-plugin installed_vst3_editor_opens -- --ignored`
+    #[test]
+    #[ignore = "opens an installed vendor plug-in's native editor"]
+    fn installed_vst3_editor_opens() {
+        let path = std::env::var("MINISTUDIO_VST3_SMOKE_PATH")
+            .expect("MINISTUDIO_VST3_SMOKE_PATH is required");
+        let uid = std::env::var("MINISTUDIO_VST3_SMOKE_UID")
+            .expect("MINISTUDIO_VST3_SMOKE_UID is required");
+        let spec = InstrumentSpec {
+            id: "manual-vst3-editor-smoke".into(),
+            kind: format!("vst3:{uid}"),
+            params: HashMap::new(),
+            bypassed: false,
+            plugin: Some(ministudio_contracts::ExternalPluginRef {
+                format: "vst3".into(),
+                uid,
+                name: "Manual VST3 smoke".into(),
+                vendor: String::new(),
+                path,
+                audio_input_buses: 0,
+                audio_output_buses: 0,
+                supports_sidechain: false,
+                has_editor: true,
+                state: Vec::new(),
+            }),
+        };
+        let instrument = try_create_external_instrument(&spec, 48_000.0)
+            .expect("installed VST3 instance should initialize");
+        let control = instrument
+            .plugin_control()
+            .expect("installed VST3 should expose a control handle");
+        control
+            .open_editor()
+            .expect("installed VST3 editor should open");
+        assert!(control.is_editor_open());
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        control
+            .close_editor()
+            .expect("installed VST3 editor should close");
+        assert!(!control.is_editor_open());
+    }
+}
+
 fn copy_stereo_to_vst_bus(
     bus: &mut vst3_host::AudioBusBuffer,
     source: &AudioBuffer,
@@ -1078,14 +1706,31 @@ fn copy_vst_bus_to_stereo(
 }
 
 pub fn create_external_effect(spec: &EffectSpec, sample_rate: f32) -> Option<Box<dyn DspEffect>> {
-    match spec.plugin.as_ref()?.format.as_str() {
-        "vst3" => Vst3Effect::new(spec, sample_rate)
-            .ok()
-            .map(|effect| Box::new(effect) as Box<dyn DspEffect>),
-        "clap" => ClapEffect::new(spec, sample_rate)
-            .ok()
-            .map(|effect| Box::new(effect) as Box<dyn DspEffect>),
-        _ => None,
+    try_create_external_effect(spec, sample_rate).ok()
+}
+
+/// Result-returning construction is the production path. A native plug-in
+/// failure must reach the project loader instead of being collapsed into an
+/// absent device, which otherwise leaves a silent rack card with the deeply
+/// misleading "instance is not available" editor error.
+pub fn try_create_external_effect(
+    spec: &EffectSpec,
+    sample_rate: f32,
+) -> Result<Box<dyn DspEffect>, String> {
+    match spec
+        .plugin
+        .as_ref()
+        .ok_or("external effect is missing its plugin reference")?
+        .format
+        .as_str()
+    {
+        "vst3" => {
+            Vst3Effect::new(spec, sample_rate).map(|effect| Box::new(effect) as Box<dyn DspEffect>)
+        }
+        "clap" => {
+            ClapEffect::new(spec, sample_rate).map(|effect| Box::new(effect) as Box<dyn DspEffect>)
+        }
+        format => Err(format!("unsupported external effect format: {format}")),
     }
 }
 
@@ -1232,7 +1877,7 @@ impl PluginControl for ClapControl {
     }
 }
 
-fn clap_gui_configuration() -> Option<GuiConfiguration<'static>> {
+fn clap_gui_configuration(is_floating: bool) -> Option<GuiConfiguration<'static>> {
     #[cfg(target_os = "windows")]
     let api_type = GuiApiType::WIN32;
     #[cfg(target_os = "macos")]
@@ -1243,22 +1888,22 @@ fn clap_gui_configuration() -> Option<GuiConfiguration<'static>> {
     return None;
     Some(GuiConfiguration {
         api_type,
-        is_floating: true,
+        is_floating,
     })
 }
 
-fn clap_has_floating_editor(instance: &mut PluginInstance<ClapHost>) -> bool {
-    let Some(configuration) = clap_gui_configuration() else {
+fn clap_has_editor(instance: &mut PluginInstance<ClapHost>) -> bool {
+    let Some(floating) = clap_gui_configuration(true) else {
         return false;
     };
     let mut plugin = instance.plugin_handle();
     plugin
         .get_extension::<PluginGui>()
-        .is_some_and(|gui| gui.is_api_supported(&mut plugin, configuration))
+        .is_some_and(|gui| gui.is_api_supported(&mut plugin, floating))
 }
 
 fn open_clap_editor(instance: &mut PluginInstance<ClapHost>) -> Result<(), String> {
-    let configuration = clap_gui_configuration().ok_or("No CLAP GUI API for this platform")?;
+    let configuration = clap_gui_configuration(true).ok_or("No CLAP GUI API for this platform")?;
     let mut plugin = instance.plugin_handle();
     let gui = plugin
         .get_extension::<PluginGui>()
@@ -1317,15 +1962,15 @@ impl ClapRuntime {
         let thread_editor_open = Arc::clone(&editor_open);
         let thread_has_editor = Arc::clone(&has_editor);
         std::thread::Builder::new()
-            .name("minidaw-clap-owner".into())
+            .name("ministudio-clap-owner".into())
             .spawn(move || {
                 let result = (|| -> Result<(PluginEntry, PluginInstance<ClapHost>, StartedPluginAudioProcessor<ClapHost>, Vec<ClapPortLayout>, Vec<ClapPortLayout>), String> {
                     let entry = unsafe { PluginEntry::load(OsStr::new(&path)) }
                         .map_err(|error| error.to_string())?;
                     let uid = CString::new(uid).map_err(|_| "CLAP plugin ID contains a NUL byte")?;
                     let host_info = HostInfo::new(
-                        "MiniDAW",
-                        "MiniDAW",
+                        "MiniStudio",
+                        "MiniStudio",
                         "https://github.com",
                         env!("CARGO_PKG_VERSION"),
                     )
@@ -1368,7 +2013,7 @@ impl ClapRuntime {
                 match result {
                     Ok((_entry, mut instance, processor, inputs, outputs)) => {
                         thread_has_editor.store(
-                            clap_has_floating_editor(&mut instance),
+                            clap_has_editor(&mut instance),
                             Ordering::Release,
                         );
                         if ready_tx.send(Ok(ClapReady { processor, inputs, outputs })).is_ok() {

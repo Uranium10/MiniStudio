@@ -15,8 +15,10 @@ export type EffectType =
   | 'builtin:lfo-tremolo'
   | 'builtin:clipper'
   | 'builtin:upward-compressor'
+  | 'builtin:transient-shaper'
   | 'builtin:roboter'
   | 'builtin:resonator'
+  | 'builtin:formant-shifter'
   | `vst3:${string}`
   | `clap:${string}`
 
@@ -225,7 +227,7 @@ export function toBarsBeats(sec: number, bpm: number, signature: TimeSignature):
 
 export type GridOption = { label: string; ticks: number }
 
-/** Shared musical grid used by the toolbar, arrangement snapping, and the piano roll. */
+/** Musical grid choices used independently by the arrangement and piano roll. */
 export const GRID_OPTIONS: readonly GridOption[] = [
   { label: '1/1', ticks: 3840 }, { label: '1/2', ticks: 1920 }, { label: '1/4', ticks: 960 },
   { label: '1/8', ticks: 480 }, { label: '1/16', ticks: 240 }, { label: '1/32', ticks: 120 }, { label: '1/64', ticks: 60 },
