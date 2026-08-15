@@ -7,10 +7,12 @@ import { invoke as __TAURI_INVOKE, Channel } from "@tauri-apps/api/core";
 export const commands = {
 	listStorageRoots: () => __TAURI_INVOKE<string[]>("list_storage_roots"),
 	listMediaDirectory: (path: string) => typedError<MediaDirectoryEntry[], EngineError>(__TAURI_INVOKE("list_media_directory", { path })),
+	searchMediaDirectory: (path: string, query: string) => typedError<MediaDirectoryEntry[], EngineError>(__TAURI_INVOKE("search_media_directory", { path, query })),
 	engineInit: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_init")),
 	engineDispose: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_dispose")),
 	engineLoadAudioFile: (path: string, onProgress: Channel<DecodeProgress>) => typedError<NativeAssetInfo, EngineError>(__TAURI_INVOKE("engine_load_audio_file", { path, onProgress })),
 	engineUnloadAsset: (assetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_unload_asset", { assetId })),
+	engineAssetPeaks: (assetId: string, lod: number) => typedError<(number | null)[], EngineError>(__TAURI_INVOKE("engine_asset_peaks", { assetId, lod })),
 	engineSyncGraph: (snapshot: GraphSnapshot) => typedError<null, EngineError>(__TAURI_INVOKE("engine_sync_graph", { snapshot })),
 	enginePlay: (fromSec: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_play", { fromSec })),
 	enginePause: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_pause")),
@@ -24,6 +26,7 @@ export const commands = {
 	engineSetBusVolume: (busId: string, gainDb: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_bus_volume", { busId, gainDb })),
 	engineSetMasterVolume: (gainDb: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_master_volume", { gainDb })),
 	engineSetEffectParam: (effectId: string, paramId: string, value: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_effect_param", { effectId, paramId, value })),
+	engineSetEffectBypass: (effectId: string, bypassed: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_effect_bypass", { effectId, bypassed })),
 	engineSetInstrumentParam: (trackId: string, paramId: string, value: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_instrument_param", { trackId, paramId, value })),
 	engineMidiNote: (trackId: string, noteId: number, pitch: number, velocity: number | null, noteOn: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_midi_note", { trackId, noteId, pitch, velocity, noteOn })),
 	engineMidiAllNotesOff: (trackId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_midi_all_notes_off", { trackId })),
@@ -38,7 +41,14 @@ export const commands = {
 	engineExportProject: (request: ExportRequest, onProgress: Channel<ExportProgress>) => typedError<ExportResult, EngineError>(__TAURI_INVOKE("engine_export_project", { request, onProgress })),
 	engineCancelExport: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_cancel_export")),
 	engineEqResponse: (effectId: string, points: number) => typedError<EqFrequencyResponse, EngineError>(__TAURI_INVOKE("engine_eq_response", { effectId, points })),
-	scanVst3Plugins: (paths: string[]) => typedError<PluginDescriptor[], EngineError>(__TAURI_INVOKE("scan_vst3_plugins", { paths })),
+	engineOpenPluginEditor: (targetKind: string, targetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_open_plugin_editor", { targetKind, targetId })),
+	engineClosePluginEditor: (targetKind: string, targetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_close_plugin_editor", { targetKind, targetId })),
+	enginePluginEditorIsOpen: (targetKind: string, targetId: string) => typedError<boolean, EngineError>(__TAURI_INVOKE("engine_plugin_editor_is_open", { targetKind, targetId })),
+	engineSavePluginState: (targetKind: string, targetId: string) => typedError<number[], EngineError>(__TAURI_INVOKE("engine_save_plugin_state", { targetKind, targetId })),
+	engineLoadPluginState: (targetKind: string, targetId: string, pluginState: number[]) => typedError<null, EngineError>(__TAURI_INVOKE("engine_load_plugin_state", { targetKind, targetId, pluginState })),
+	cachedVst3Plugins: () => typedError<PluginDescriptor[], EngineError>(__TAURI_INVOKE("cached_vst3_plugins")),
+	scanVst3Plugins: (paths: string[], force: boolean) => typedError<PluginDescriptor[], EngineError>(__TAURI_INVOKE("scan_vst3_plugins", { paths, force })),
+	inspectPluginMetadata: (format: string, path: string, uid: string) => typedError<PluginDescriptor, EngineError>(__TAURI_INVOKE("inspect_plugin_metadata", { format, path, uid })),
 	renderOfflineEffect: (req: OfflineRenderRequest) => typedError<OfflineRenderResult, EngineError>(__TAURI_INVOKE("render_offline_effect", { req })),
 };
 
@@ -165,6 +175,8 @@ export type ExternalPluginRef = {
 	audioInputBuses?: number,
 	audioOutputBuses?: number,
 	supportsSidechain?: boolean,
+	hasEditor?: boolean,
+	state?: number[],
 };
 
 export type GraphSnapshot = {
@@ -244,6 +256,7 @@ export type MidiInputPortInfo = {
 	id: string,
 	name: string,
 	connected: boolean,
+	targetTrackId: string | null,
 };
 
 export type MidiNoteSpec = {

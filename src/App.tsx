@@ -12,16 +12,19 @@ import { MenuBar, ToolBar } from './components/TopChrome'
 import { Timeline } from './components/Timeline'
 import { TransportBar } from './components/TransportBar'
 import { ShortcutsDialog } from './components/ShortcutsDialog'
+import { StartupDialog } from './components/StartupDialog'
 import { VirtualPiano } from './components/VirtualPiano'
-import { describeEngineError, effectiveBusGainDb, effectiveMasterGainDb, type AutomationLane, type IAudioEngine, type ProjectState } from './engine'
+import { describeEngineError, effectiveBusGainDb, effectiveMasterGainDb, type AutomationLane, type IAudioEngine, type PluginDescriptor, type ProjectState } from './engine'
 import { useEngine } from './hooks/useEngine'
+import { markSessionClean, writeRecoverySnapshot } from './io/autosave'
+import { scanPluginsOnce } from './plugins/scan'
 import { useShortcuts } from './shortcuts/useShortcuts'
 import { useProjectStore } from './store/projectStore'
 import './App.css'
 
 export default function App() {
   const engine = useEngine()
-  const lowerHeight = useProjectStore((state) => state.lowerPanelHeight)
+  const lowerHeight = useProjectStore((state) => (state.lowerTab === 'effects' ? state.effectsPanelHeight : state.mixerPanelHeight) ?? state.lowerPanelHeight)
   const collapsed = useProjectStore((state) => state.lowerPanelCollapsed)
   const editorMaximized = useProjectStore((state) => state.editorMaximized)
   const pianoRollOpen = useProjectStore((state) => state.pianoRollOpen)
@@ -31,6 +34,24 @@ export default function App() {
   const browserDock = useProjectStore((state) => state.browserDock)
   const toast = useProjectStore((state) => state.toast)
   useShortcuts()
+
+  useEffect(() => { void scanPluginsOnce(engine).catch(() => undefined) }, [engine])
+
+  useEffect(() => {
+    let saveTimer = 0
+    let active = false
+    const schedule = () => {
+      if (!active) return
+      window.clearTimeout(saveTimer)
+      saveTimer = window.setTimeout(() => writeRecoverySnapshot(useProjectStore.getState().project), 1_500)
+    }
+    const start = () => { active = true; writeRecoverySnapshot(useProjectStore.getState().project) }
+    const clean = () => markSessionClean()
+    window.addEventListener('ministudio:session-started', start)
+    window.addEventListener('beforeunload', clean)
+    const unsubscribe = useProjectStore.subscribe((state, previous) => { if (state.project !== previous.project) schedule() })
+    return () => { unsubscribe(); window.clearTimeout(saveTimer); window.removeEventListener('ministudio:session-started', start); window.removeEventListener('beforeunload', clean) }
+  }, [])
 
   useEffect(() => {
     let timer = 0
@@ -45,7 +66,7 @@ export default function App() {
         buses: current.buses.map((bus) => ({ ...bus, volumeDb: effectiveBusGainDb(bus) })),
         master: { ...current.master, volumeDb: effectiveMasterGainDb(current.master) },
         transport: { ...current.transport, playheadSec: 0, isPlaying: false },
-      }).catch((error) => useProjectStore.getState().showToast(`오디오 그래프를 준비하지 못했습니다: ${describeEngineError(error)}`))
+      }).then(() => window.dispatchEvent(new Event('ministudio:graph-synced'))).catch((error) => useProjectStore.getState().showToast(`오디오 그래프를 준비하지 못했습니다: ${describeEngineError(error)}`))
     }
     const syncEngineState = () => {
       const project = useProjectStore.getState().project
@@ -62,7 +83,9 @@ export default function App() {
     }
     syncEngineState()
     const unsubscribe = useProjectStore.subscribe(syncEngineState)
-    return () => { unsubscribe(); window.clearTimeout(timer) }
+    const pluginsRefreshed = (event: Event) => { refreshProjectPluginMetadata((event as CustomEvent<PluginDescriptor[]>).detail ?? []); syncGraph() }
+    window.addEventListener('ministudio:plugins-refreshed', pluginsRefreshed)
+    return () => { unsubscribe(); window.clearTimeout(timer); window.removeEventListener('ministudio:plugins-refreshed', pluginsRefreshed) }
   }, [engine])
 
   useEffect(() => engine.onPlayhead((sec) => {
@@ -70,6 +93,69 @@ export default function App() {
     store.setPlayhead(sec)
     applyReadAutomation(engine, store.project, sec)
   }), [engine])
+
+  useEffect(() => {
+    let cancelled = false
+    let checking = false
+    let requestedRevision = 0
+    let resetRequested = false
+    let knownPorts = new Set<string>()
+    const announced = new Set<string>()
+    const reconcileMidi = async (resetConnections = false) => {
+      requestedRevision += 1
+      resetRequested ||= resetConnections
+      if (checking || cancelled) return
+      checking = true
+      try {
+        while (!cancelled) {
+          const revision = requestedRevision
+          const shouldReset = resetRequested
+          resetRequested = false
+          const store = useProjectStore.getState()
+          const target = store.project.tracks.find((track) => track.id === store.selectedTrackId && track.kind === 'instrument')
+            ?? store.project.tracks.find((track) => track.kind === 'instrument' && track.armed)
+            ?? store.project.tracks.find((track) => track.kind === 'instrument')
+          if (!target) {
+            for (const portId of knownPorts) await engine.disconnectMidiInput(portId).catch(() => undefined)
+            knownPorts.clear()
+          } else {
+            if (shouldReset) {
+              engine.midiAllNotesOff(target.id)
+              for (const portId of knownPorts) await engine.disconnectMidiInput(portId).catch(() => undefined)
+            }
+            const ports = await engine.listMidiInputs()
+            const available = new Set(ports.map((port) => port.id))
+            for (const removed of knownPorts) if (!available.has(removed)) await engine.disconnectMidiInput(removed).catch(() => undefined)
+            knownPorts = available
+            for (const port of ports) {
+              if (cancelled || (port.connected && port.targetTrackId === target.id && !shouldReset)) continue
+              try {
+                if (port.targetTrackId && port.targetTrackId !== target.id) engine.midiAllNotesOff(port.targetTrackId)
+                await engine.connectMidiInput(port.id, target.id)
+                if (!announced.has(port.id)) { announced.add(port.id); store.showToast(`${port.name} MIDI 입력을 ${target.name}에 연결했습니다.`) }
+              } catch { /* Graph rebuilds and hot-plug can invalidate a port transiently; the next revision retries. */ }
+            }
+          }
+          if (revision === requestedRevision) break
+        }
+      } finally { checking = false }
+    }
+    void reconcileMidi()
+    let selectedTrackId = useProjectStore.getState().selectedTrackId
+    const unsubscribe = useProjectStore.subscribe((state) => {
+      if (state.selectedTrackId === selectedTrackId) return
+      selectedTrackId = state.selectedTrackId
+      void reconcileMidi()
+    })
+    const refresh = () => void reconcileMidi()
+    const devicesChanged = () => void reconcileMidi(true)
+    window.addEventListener('focus', refresh)
+    window.addEventListener('ministudio:midi-refresh', devicesChanged)
+    window.addEventListener('ministudio:graph-synced', devicesChanged)
+    let access: MIDIAccess | null = null
+    void navigator.requestMIDIAccess?.({ sysex: false }).then((value) => { if (!cancelled) { access = value; value.onstatechange = devicesChanged } }).catch(() => undefined)
+    return () => { cancelled = true; unsubscribe(); window.removeEventListener('focus', refresh); window.removeEventListener('ministudio:midi-refresh', devicesChanged); window.removeEventListener('ministudio:graph-synced', devicesChanged); if (access) access.onstatechange = null }
+  }, [engine])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -89,18 +175,17 @@ export default function App() {
 
   return (
     <div
-      className={`daw-shell ${editorMaximized ? 'editor-maximized' : ''}`}
+      className={`daw-shell ${editorMaximized ? 'editor-maximized' : ''} ${browserVisible ? `browser-visible browser-${browserDock}` : ''}`}
       style={{ '--lower-height': collapsed || editorMaximized ? '0px' : `${lowerHeight}px`, '--piano-height': pianoRollOpen ? `${pianoRollHeight}px` : '0px' } as React.CSSProperties}
       onContextMenu={(event) => event.preventDefault()}
     >
       <MenuBar />
       <ToolBar />
-      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'} ${browserVisible ? 'browser-visible' : ''} browser-${browserDock}`}>
-        {browserVisible && browserDock === 'left' && <BrowserPanel />}
+      <main className={`workspace ${inspectorVisible ? '' : 'inspector-hidden'}`}>
         {inspectorVisible && <Inspector />}
         <Timeline />
-        {browserVisible && browserDock === 'right' && <BrowserPanel />}
       </main>
+      {browserVisible && <BrowserPanel />}
       <PianoRollPanel />
       <LowerPanel />
       <TransportBar />
@@ -108,10 +193,33 @@ export default function App() {
       <AudioSettingsDialog />
       <ExportDialog />
       <ShortcutsDialog />
+      <StartupDialog />
       <VirtualPiano />
       {toast && <button className="toast" type="button" title="클릭하여 닫기" onClick={() => useProjectStore.getState().clearToast()}><span role="status">{toast}</span></button>}
     </div>
   )
+}
+
+function refreshProjectPluginMetadata(plugins: PluginDescriptor[]): void {
+  if (!plugins.length) return
+  const byId = new Map(plugins.map((plugin) => [`${plugin.format}:${plugin.uid}`, plugin]))
+  const project = structuredClone(useProjectStore.getState().project)
+  let changed = false
+  const refresh = (reference: NonNullable<ProjectState['tracks'][number]['instrument']>['plugin']) => {
+    if (!reference) return
+    const descriptor = byId.get(`${reference.format}:${reference.uid}`)
+    if (!descriptor) return
+    const isCurrent = reference.path === descriptor.path
+      && reference.hasEditor === descriptor.hasEditor
+      && (reference.parameters?.length ?? 0) === descriptor.parameters.length
+    if (isCurrent) return
+    Object.assign(reference, { path: descriptor.path, audioInputBuses: descriptor.audioInputBuses, audioOutputBuses: descriptor.audioOutputBuses, supportsSidechain: descriptor.supportsSidechain, hasEditor: descriptor.hasEditor, paramCount: descriptor.paramCount, parameters: descriptor.parameters })
+    changed = true
+  }
+  for (const track of project.tracks) { refresh(track.instrument?.plugin); for (const effect of track.effects) refresh(effect.plugin) }
+  for (const bus of project.buses) for (const effect of bus.effects) refresh(effect.plugin)
+  for (const effect of project.master.effects) refresh(effect.plugin)
+  if (changed) useProjectStore.setState({ project })
 }
 
 function automationValueAt(lane: AutomationLane, sec: number): number | null {
@@ -134,12 +242,15 @@ function automationValueAt(lane: AutomationLane, sec: number): number | null {
 /** Read-mode automation. Native smoothers make the 30 fps control stream click-free. */
 function applyReadAutomation(engine: IAudioEngine, project: ProjectState, sec: number): void {
   for (const track of project.tracks) for (const lane of track.automationLanes ?? []) {
+    if ((lane.mode ?? 'read') === 'off' || lane.mode === 'write') continue
     const value = automationValueAt(lane, sec)
     if (value === null) continue
     if (lane.targetKind === 'track') {
       if (lane.parameterId === 'volumeDb') engine.setTrackVolume(track.id, value)
       else if (lane.parameterId === 'pan') engine.setTrackPan(track.id, value)
-    } else if (lane.targetKind === 'instrument') engine.setInstrumentParam(track.id, lane.parameterId, value)
+    } else if (lane.targetKind === 'send') engine.setSendLevel(lane.targetId, value)
+    else if (lane.targetKind === 'instrument') engine.setInstrumentParam(track.id, lane.parameterId, value)
+    else if (lane.parameterId === '__bypass') engine.setEffectBypass(lane.targetId, value >= .5)
     else engine.setEffectParam(lane.targetId, lane.parameterId, value)
   }
 }

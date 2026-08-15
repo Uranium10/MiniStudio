@@ -4,7 +4,7 @@ import { commands } from '../engine/rust/bindings'
 import { useEngine } from '../hooks/useEngine'
 import { useProjectStore } from '../store/projectStore'
 import { MenuPanel, type MenuItem } from './Menu'
-import { writeBrowserDrag } from './browserPayload'
+import { beginBrowserDrag } from './browserPayload'
 
 type LocationTab = { id: string; title: string; root: string | null }
 type FsNode = { path: string; name: string; directory: boolean }
@@ -13,16 +13,35 @@ type Context = { x: number; y: number; path: string | null; title: string }
 const STORAGE_KEY = 'minidaw.media-browser.tabs.v2'
 
 export function MediaTreeBrowser({ query, onQueryChange }: { query: string; onQueryChange(value: string): void }) {
+  const engine = useEngine()
   const initialTabs = useMemo(loadTabs, [])
   const [tabs, setTabs] = useState<LocationTab[]>(initialTabs)
   const [activeId, setActiveId] = useState(initialTabs[0]!.id)
   const [roots, setRoots] = useState<string[]>([])
   const [revision, setRevision] = useState(0)
   const [context, setContext] = useState<Context | null>(null)
+  const [searchResults, setSearchResults] = useState<FsNode[]>([])
+  const [searching, setSearching] = useState(false)
   const active = tabs.find((tab) => tab.id === activeId) ?? tabs[0]!
 
   useEffect(() => { localStorage.setItem(STORAGE_KEY, JSON.stringify(tabs)) }, [tabs])
   useEffect(() => { void commands.listStorageRoots().then((items) => setRoots(items.length ? items : fallbackRoots())).catch(() => setRoots(fallbackRoots())) }, [])
+  useEffect(() => {
+    const needle = query.trim()
+    if (!needle) { setSearchResults([]); setSearching(false); return }
+    const scopes = active.root ? [active.root] : roots
+    if (!scopes.length) return
+    let cancelled = false
+    setSearching(true)
+    const timer = window.setTimeout(() => {
+      void Promise.all(scopes.map((root) => commands.searchMediaDirectory(root, needle))).then((responses) => {
+        if (cancelled) return
+        const items = responses.flatMap((response) => response.status === 'ok' ? response.data : []).map((entry) => ({ path: entry.path, name: entry.name, directory: false }))
+        setSearchResults([...new Map(items.map((item) => [item.path, item])).values()].slice(0, 500))
+      }).finally(() => { if (!cancelled) setSearching(false) })
+    }, 250)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [active.root, query, roots])
 
   const setRoot = useCallback((path: string | null, title?: string) => {
     setTabs((items) => items.map((tab) => tab.id === active.id ? { ...tab, root: path, title: title ?? (path ? basename(path) : '저장소') } : tab))
@@ -56,9 +75,10 @@ export function MediaTreeBrowser({ query, onQueryChange }: { query: string; onQu
       {tabs.map((tab) => <button key={tab.id} className={tab.id === active.id ? 'active' : ''} onClick={() => setActiveId(tab.id)} title={tab.root ?? '저장소'}><span>{tab.title}</span><i onClick={(event) => { event.stopPropagation(); closeTab(tab.id) }}><X size={10} /></i></button>)}
       <button className="add" title="위치 탭 추가" onClick={() => addTab()}><Plus size={12} /></button>
     </div>
-    <label className="browser-search"><Search size={13} /><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="현재 트리 검색" /></label>
+    <label className="browser-search"><Search size={13} /><input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="루트 폴더 전체 검색" /></label>
     <div className="media-tree" onContextMenu={(event) => openContext(event, active.root, active.title)}>
-      {active.root
+      {query.trim() ? <>{searching && <div className="media-tree-status">검색 중…</div>}{!searching && !searchResults.length && <div className="browser-empty">검색 결과가 없습니다.</div>}{searchResults.map((child) => <button key={child.path} className="media-file-row search-result" title={child.path} onPointerDown={(event) => beginBrowserDrag(event, { kind: 'media', path: child.path, name: child.name })} onDoubleClick={() => { void engine.loadAudioFile(child.path).then((asset) => useProjectStore.getState().addAssetAsTrack(asset)).catch((reason) => useProjectStore.getState().showToast(`오디오를 불러오지 못했습니다: ${String(reason)}`)) }}><FileAudio size={12} /><span><b>{child.name}</b><small>{child.path}</small></span></button>)}</>
+        : active.root
         ? <FolderNode key={`${active.id}:${active.root}:${revision}`} node={{ path: active.root, name: active.title, directory: true }} depth={0} query={query} initiallyOpen onContext={openContext} />
         : roots.map((path) => <FolderNode key={`${path}:${revision}`} node={{ path, name: path, directory: true }} depth={0} query={query} drive onContext={openContext} />)}
       {!roots.length && !active.root && <div className="browser-empty">저장소를 찾는 중…</div>}
@@ -91,7 +111,7 @@ function FolderNode({ node, depth, query, initiallyOpen = false, drive = false, 
     {open && <div>{children === null && !error && <div className="media-tree-status" style={{ paddingLeft: 24 + depth * 13 }}>읽는 중…</div>}{error && <div className="media-tree-status error" style={{ paddingLeft: 24 + depth * 13 }}>열 수 없음</div>}
       {visible.map((child) => child.directory
         ? <FolderNode key={child.path} node={child} depth={depth + 1} query={query} onContext={onContext} />
-        : <button key={child.path} className="media-file-row" style={{ paddingLeft: 24 + depth * 13 }} draggable onDragStart={(event) => writeBrowserDrag(event, { kind: 'media', path: child.path, name: child.name })} onDoubleClick={() => { void engine.loadAudioFile(child.path).then((asset) => useProjectStore.getState().addAssetAsTrack(asset)).catch((reason) => useProjectStore.getState().showToast(`오디오를 불러오지 못했습니다: ${String(reason)}`)) }}><FileAudio size={12} /><span>{child.name}</span></button>)}
+        : <button key={child.path} className="media-file-row" style={{ paddingLeft: 24 + depth * 13 }} onPointerDown={(event) => beginBrowserDrag(event, { kind: 'media', path: child.path, name: child.name })} onDoubleClick={() => { void engine.loadAudioFile(child.path).then((asset) => useProjectStore.getState().addAssetAsTrack(asset)).catch((reason) => useProjectStore.getState().showToast(`오디오를 불러오지 못했습니다: ${String(reason)}`)) }}><FileAudio size={12} /><span>{child.name}</span></button>)}
     </div>}
   </div>
 }

@@ -2,14 +2,14 @@
 import { create } from 'zustand'
 import type { AudioAssetInfo, AutomationLane, Clip, EffectInstance, ExternalPluginRef, MidiClip, MidiControlPoint, MidiNote, ProjectState, TimeSignature, Track } from '../engine'
 import { MIDI_PITCH_BEND_LANE, MIDI_PPQ, secondsPerBeat } from '../engine'
-import { createDemoProject, createEmptyProject } from './demoProject'
+import { createEmptyProject } from './demoProject'
 
 export type LowerTab = 'mixer' | 'effects'
 export type EditFocus = 'arrangement' | 'pianoRoll'
 export type RackTarget = { kind: 'track' | 'bus' | 'master'; id: string }
 export type BrowserDock = 'left' | 'right'
 export type HistoryEntry = { id: string; label: string; timestamp: number }
-export type AutomationOption = Omit<AutomationLane, 'id' | 'points' | 'height'>
+export type AutomationOption = Omit<AutomationLane, 'id' | 'points' | 'height' | 'mode'>
 export type ClipboardEntry = { trackOffset: number; kind: 'audio'; clip: Clip } | { trackOffset: number; kind: 'midi'; clip: MidiClip }
 export type Clipboard = { originSec: number; entries: ClipboardEntry[] }
 export type AutomationPointRef = { trackId: string; laneId: string; pointId: string }
@@ -43,6 +43,8 @@ type ProjectStore = {
   gridTicks: number
   followPlayhead: boolean
   lowerPanelHeight: number
+  mixerPanelHeight: number
+  effectsPanelHeight: number
   lowerPanelCollapsed: boolean
   lowerTab: LowerTab
   toast: string | null
@@ -56,6 +58,7 @@ type ProjectStore = {
   virtualPianoOctave: number
   virtualPianoVelocity: number
   rackTarget: RackTarget
+  focusedEffectId: string | null
   past: ProjectState[]
   future: ProjectState[]
   history: HistoryEntry[]
@@ -77,7 +80,7 @@ type ProjectStore = {
   selectClip(id: string, additive?: boolean): void
   clearClipSelection(): void
   addTrack(): void
-  addInstrumentTrack(plugin?: ExternalPluginRef): string
+  addInstrumentTrack(plugin?: ExternalPluginRef, insertIndex?: number): string
   replaceTrackInstrument(trackId: string, plugin?: ExternalPluginRef): void
   removeSelectedTrack(): void
   removeTrack(trackId: string): void
@@ -86,8 +89,10 @@ type ProjectStore = {
   updateTrackVolumes(updates: Array<{ id: string; volumeDb: number }>): void
   createBusFromSelectedTracks(): string | null
   setTrackAutomationOpen(trackId: string, open: boolean): void
-  addAutomationLane(trackId: string, lane: Omit<AutomationLane, 'id' | 'points' | 'height'>): void
+  addAutomationLane(trackId: string, lane: Omit<AutomationLane, 'id' | 'points' | 'height' | 'mode'>): void
   removeAutomationLane(trackId: string, laneId: string): void
+  replaceAutomationLane(trackId: string, laneId: string, lane: AutomationOption): void
+  setAutomationLaneMode(trackId: string, laneId: string, mode: NonNullable<AutomationLane['mode']>): void
   setAutomationLaneHeight(trackId: string, laneId: string, value: number): void
   upsertAutomationPoint(trackId: string, laneId: string, point: { id?: string; timeSec: number; value: number }): string | null
   setAutomationCurve(trackId: string, laneId: string, pointId: string, curve: number): void
@@ -157,6 +162,8 @@ type ProjectStore = {
   setTrackInstrumentPlugin(trackId: string, plugin: ExternalPluginRef): void
   toggleTargetEffect(target: RackTarget, effectId: string): void
   addTargetEffect(target: RackTarget, type: EffectInstance['type'], plugin?: ExternalPluginRef): void
+  duplicateTargetEffect(target: RackTarget, effectId: string): void
+  clearFocusedEffect(): void
   removeTargetEffect(target: RackTarget, effectId: string): void
   reorderTargetEffect(target: RackTarget, fromIndex: number, toIndex: number): void
   setTargetEffectSidechain(target: RackTarget, effectId: string, enabled: boolean, sourceId: string | null): void
@@ -294,7 +301,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     commitProject(current, { ...current, tracks }, historyKey)
   }
 
-  const initialProject = createDemoProject()
+  const initialProject = createEmptyProject()
   return {
     project: initialProject,
     playheadSec: initialProject.transport.playheadSec,
@@ -322,6 +329,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     gridTicks: 240,
     followPlayhead: true,
     lowerPanelHeight: 350,
+    mixerPanelHeight: 350,
+    effectsPanelHeight: 350,
     lowerPanelCollapsed: false,
     lowerTab: 'mixer',
     toast: null,
@@ -335,6 +344,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     virtualPianoOctave: 4,
     virtualPianoVelocity: 100,
     rackTarget: { kind: 'track', id: 'track-0' },
+    focusedEffectId: null,
     past: [],
     future: [],
     history: [],
@@ -345,12 +355,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         ...project,
         formatVersion: 2 as const,
         transport: { ...project.transport, timeSignature: project.transport.timeSignature ?? { numerator: 4, denominator: 4 } },
-        tracks: project.tracks.map((track) => ({ ...track, kind: track.kind ?? 'audio', clips: (track.clips ?? []).map((clip) => ({ ...clip, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ ...point })), warpMode: clip.warpMode ?? 'none', warpSourceBpm: clip.warpSourceBpm ?? project.transport.bpm })), midiClips: (track.midiClips ?? []).map((clip) => ({ ...clip, notes: clip.notes ?? [], ccLanes: clip.ccLanes ?? [] })), instrument: track.instrument ?? null, outputBusId: track.outputBusId ?? null, automationOpen: track.automationOpen ?? false, automationLanes: (track.automationLanes ?? []).map((lane) => ({ ...lane, height: lane.height == null ? undefined : Math.max(54, Math.min(240, lane.height)), points: lane.points ?? [] })), height: track.height == null ? undefined : Math.max(46, Math.min(240, track.height)) })),
+        tracks: project.tracks.map((track) => ({ ...track, kind: track.kind ?? 'audio', clips: (track.clips ?? []).map((clip) => ({ ...clip, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ ...point })), warpMode: clip.warpMode ?? 'none', warpSourceBpm: clip.warpSourceBpm ?? project.transport.bpm })), midiClips: (track.midiClips ?? []).map((clip) => ({ ...clip, notes: clip.notes ?? [], ccLanes: clip.ccLanes ?? [] })), instrument: track.instrument ?? null, outputBusId: track.outputBusId ?? null, automationOpen: track.automationOpen ?? false, automationLanes: (track.automationLanes ?? []).map((lane) => ({ ...lane, mode: lane.mode ?? 'read', height: lane.height == null ? undefined : Math.max(54, Math.min(240, lane.height)), points: lane.points ?? [] })), height: track.height == null ? undefined : Math.max(46, Math.min(240, track.height)) })),
         buses: project.buses.map((bus) => ({ ...bus, muted: bus.muted ?? false })),
         master: { ...project.master, muted: project.master.muted ?? false, dim: project.master.dim ?? false },
       }
       const selectedTrackId = migrated.tracks[0]?.id ?? null
-      set({ project: migrated, playheadSec: migrated.transport.playheadSec, past: [], future: [], history: [], futureHistory: [], selectedTrackId, selectedTrackIds: selectedTrackId ? [selectedTrackId] : [], selectedClipIds: [], selectedNoteIds: [], selectedAutomationPoints: [], selectedClipGainPoint: null, editFocus: 'arrangement', editorClip: null, pianoRollOpen: false, editorMaximized: false, virtualPianoOpen: false })
+      set({ project: migrated, playheadSec: migrated.transport.playheadSec, past: [], future: [], history: [], futureHistory: [], selectedTrackId, selectedTrackIds: selectedTrackId ? [selectedTrackId] : [], selectedClipIds: [], selectedNoteIds: [], selectedAutomationPoints: [], selectedClipGainPoint: null, editFocus: 'arrangement', editorClip: null, pianoRollOpen: false, editorMaximized: false, virtualPianoOpen: false, focusedEffectId: null })
     },
     newProject: () => get().setProject(createEmptyProject()),
     setMissingAssets: (assets) => set({ missingAssets: assets }),
@@ -385,11 +395,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       project.tracks.push({ id, kind: 'audio', name: `Audio ${project.tracks.length + 1}`, color: '#5ba8ff', clips: [], midiClips: [], instrument: null, volumeDb: 0, pan: 0, muted: false, solo: false, armed: false, effects: [], sends: project.buses.map((bus) => ({ id: crypto.randomUUID(), targetBusId: bus.id, gainDb: -60, preFader: false })), outputBusId: null, automationOpen: false, automationLanes: [], height: get().trackHeight })
       queueMicrotask(() => set({ selectedTrackId: id, selectedTrackIds: [id] }))
     }, { historyLabel: '오디오 트랙 추가' }),
-    addInstrumentTrack: (plugin) => {
+    addInstrumentTrack: (plugin, insertIndex) => {
       const id = `instrument-${crypto.randomUUID()}`
       mutateProject((project) => {
         const instrumentNumber = project.tracks.filter((track) => track.kind === 'instrument').length + 1
-        project.tracks.push({ id, kind: 'instrument', name: plugin?.name ?? `Instrument ${instrumentNumber}`, color: '#66d3ff', clips: [], midiClips: [], instrument: createInstrumentInstance(plugin), volumeDb: 0, pan: 0, muted: false, solo: false, armed: true, effects: [], sends: [], outputBusId: null, automationOpen: false, automationLanes: [], height: get().trackHeight })
+        const track: Track = { id, kind: 'instrument', name: plugin?.name ?? `Instrument ${instrumentNumber}`, color: '#66d3ff', clips: [], midiClips: [], instrument: createInstrumentInstance(plugin), volumeDb: 0, pan: 0, muted: false, solo: false, armed: true, effects: [], sends: [], outputBusId: null, automationOpen: false, automationLanes: [], height: get().trackHeight }
+        const index = insertIndex == null ? project.tracks.length : Math.max(0, Math.min(project.tracks.length, Math.round(insertIndex)))
+        project.tracks.splice(index, 0, track)
       }, { historyLabel: `${plugin?.name ?? 'DefaultSynth'} 트랙 추가` })
       set({ selectedTrackId: id, selectedTrackIds: [id] })
       return id
@@ -444,14 +456,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const index = current.tracks.findIndex((track) => track.id === trackId)
       if (index < 0) return
       const tracks = current.tracks.slice()
-      tracks[index] = { ...tracks[index]!, ...patch }
+      let updated = { ...tracks[index]!, ...patch }
+      if (typeof patch.volumeDb === 'number') updated = recordArmedAutomation(updated, get().playheadSec, 'track', trackId, 'volumeDb', patch.volumeDb, current.transport.isPlaying)
+      if (typeof patch.pan === 'number') updated = recordArmedAutomation(updated, get().playheadSec, 'track', trackId, 'pan', patch.pan, current.transport.isPlaying)
+      tracks[index] = updated
       commitProject(current, { ...current, tracks }, `track:${trackId}:${Object.keys(patch).sort().join(',')}`)
     },
     updateTrackVolumes: (updates) => {
       const current = get().project
       const values = new Map(updates.map((update) => [update.id, Math.max(-60, Math.min(12, update.volumeDb))]))
       if (!values.size) return
-      const tracks = current.tracks.map((track) => values.has(track.id) ? { ...track, volumeDb: values.get(track.id)! } : track)
+      const tracks = current.tracks.map((track) => values.has(track.id) ? recordArmedAutomation({ ...track, volumeDb: values.get(track.id)! }, get().playheadSec, 'track', track.id, 'volumeDb', values.get(track.id)!, current.transport.isPlaying) : track)
       commitProject(current, { ...current, tracks }, `track-volumes:${[...values.keys()].sort().join(',')}`)
     },
     createBusFromSelectedTracks: () => {
@@ -476,12 +491,23 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (!track) return
       track.automationLanes ??= []
       if (track.automationLanes.some((item) => item.targetKind === lane.targetKind && item.targetId === lane.targetId && item.parameterId === lane.parameterId)) return
-      track.automationLanes.push({ ...lane, id: crypto.randomUUID(), points: [] })
+      track.automationLanes.push({ ...lane, id: crypto.randomUUID(), points: [], mode: 'read' })
       track.automationOpen = true
     }),
     removeAutomationLane: (trackId, laneId) => mutateProject((project) => {
       const track = project.tracks.find((candidate) => candidate.id === trackId)
       if (track) track.automationLanes = (track.automationLanes ?? []).filter((lane) => lane.id !== laneId)
+    }),
+    replaceAutomationLane: (trackId, laneId, lane) => mutateProject((project) => {
+      const lanes = project.tracks.find((candidate) => candidate.id === trackId)?.automationLanes
+      const index = lanes?.findIndex((candidate) => candidate.id === laneId) ?? -1
+      if (!lanes || index < 0) return
+      const previous = lanes[index]!
+      lanes[index] = { ...lane, id: previous.id, points: [], height: previous.height, mode: previous.mode ?? 'read' }
+    }),
+    setAutomationLaneMode: (trackId, laneId, mode) => mutateProject((project) => {
+      const lane = project.tracks.find((candidate) => candidate.id === trackId)?.automationLanes?.find((candidate) => candidate.id === laneId)
+      if (lane) lane.mode = mode
     }),
     setAutomationLaneHeight: (trackId, laneId, value) => {
       const current = get().project
@@ -582,7 +608,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const sends = track.sends.slice()
       sends[sendIndex] = { ...sends[sendIndex]!, gainDb }
       const tracks = current.tracks.slice()
-      tracks[trackIndex] = { ...track, sends }
+      tracks[trackIndex] = recordArmedAutomation({ ...track, sends }, get().playheadSec, 'send', sendId, 'gainDb', gainDb, current.transport.isPlaying)
       commitProject(current, { ...current, tracks }, `send:${trackId}:${sendId}`)
     },
     addSend: (trackId, busId) => mutateProject((project) => {
@@ -1049,16 +1075,20 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const effects = track.effects.slice()
       effects[effectIndex] = { ...effects[effectIndex]!, params: { ...effects[effectIndex]!.params, ...params } }
       const tracks = current.tracks.slice()
-      tracks[trackIndex] = { ...track, effects }
+      tracks[trackIndex] = Object.entries(params).reduce<Track>((updated, [parameterId, value]) => recordArmedAutomation(updated, get().playheadSec, 'effect', effectId, parameterId, value, current.transport.isPlaying), { ...track, effects })
       commitProject(current, { ...current, tracks }, `effect:${trackId}:${effectId}:${Object.keys(params).sort().join(',')}`)
     },
     toggleEffectBypass: (trackId, effectId) => mutateProject((project) => {
       const effect = project.tracks.find((track) => track.id === trackId)?.effects.find((item) => item.id === effectId)
       if (effect) effect.bypassed = !effect.bypassed
     }),
-    addEffect: (trackId, type, plugin) => mutateProject((project) => {
-      project.tracks.find((track) => track.id === trackId)?.effects.push({ id: crypto.randomUUID(), type, bypassed: false, params: effectDefaults(type), plugin })
-    }),
+    addEffect: (trackId, type, plugin) => {
+      const id = crypto.randomUUID()
+      mutateProject((project) => {
+        project.tracks.find((track) => track.id === trackId)?.effects.push({ id, type, bypassed: false, params: effectDefaults(type), plugin })
+      })
+      set({ focusedEffectId: id, rackTarget: { kind: 'track', id: trackId }, lowerTab: 'effects', lowerPanelCollapsed: false })
+    },
     removeEffect: (trackId, effectId) => mutateProject((project) => {
       const track = project.tracks.find((candidate) => candidate.id === trackId)
       if (track) {
@@ -1102,7 +1132,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const effects = track.effects.slice()
       effects[effectIndex] = { ...effects[effectIndex]!, params: { ...effects[effectIndex]!.params, ...params } }
       const tracks = current.tracks.slice()
-      tracks[trackIndex] = { ...track, effects }
+      tracks[trackIndex] = Object.entries(params).reduce<Track>((updated, [parameterId, value]) => recordArmedAutomation(updated, get().playheadSec, 'effect', effectId, parameterId, value, current.transport.isPlaying), { ...track, effects })
       commitProject(current, { ...current, tracks }, key)
     },
     updateInstrument: (trackId, params) => {
@@ -1111,7 +1141,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const source = index < 0 ? null : current.tracks[index]!
       if (!source?.instrument) return
       const tracks = current.tracks.slice()
-      tracks[index] = { ...source, instrument: { ...source.instrument, params: { ...source.instrument.params, ...params } } }
+      tracks[index] = Object.entries(params).reduce<Track>((updated, [parameterId, value]) => recordArmedAutomation(updated, get().playheadSec, 'instrument', trackId, parameterId, value, current.transport.isPlaying), { ...source, instrument: { ...source.instrument, params: { ...source.instrument.params, ...params } } })
       commitProject(current, { ...current, tracks }, `instrument:${trackId}:${Object.keys(params).sort().join(',')}`)
     },
     toggleInstrumentBypass: (trackId) => mutateProject((project) => {
@@ -1128,9 +1158,33 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const effect = targetEffects(project, target)?.find((item) => item.id === effectId)
       if (effect) effect.bypassed = !effect.bypassed
     }),
-    addTargetEffect: (target, type, plugin) => mutateProject((project) => {
-      targetEffects(project, target)?.push({ id: crypto.randomUUID(), type, bypassed: false, params: effectDefaults(type), plugin })
-    }),
+    addTargetEffect: (target, type, plugin) => {
+      const id = crypto.randomUUID()
+      mutateProject((project) => {
+        targetEffects(project, target)?.push({ id, type, bypassed: false, params: effectDefaults(type), plugin })
+      })
+      set({ focusedEffectId: id, rackTarget: target, lowerTab: 'effects', lowerPanelCollapsed: false })
+    },
+    duplicateTargetEffect: (target, effectId) => {
+      const id = crypto.randomUUID()
+      let duplicated = false
+      mutateProject((project) => {
+        const effects = targetEffects(project, target)
+        const index = effects?.findIndex((effect) => effect.id === effectId) ?? -1
+        if (!effects || index < 0) return
+        const source = effects[index]!
+        effects.splice(index + 1, 0, {
+          ...source,
+          id,
+          params: { ...source.params },
+          plugin: source.plugin ? { ...source.plugin, parameters: source.plugin.parameters?.map((parameter) => ({ ...parameter })), state: source.plugin.state?.slice() } : undefined,
+          sidechain: source.sidechain ? { ...source.sidechain } : undefined,
+        })
+        duplicated = true
+      })
+      if (duplicated) set({ focusedEffectId: id, rackTarget: target, lowerTab: 'effects', lowerPanelCollapsed: false })
+    },
+    clearFocusedEffect: () => set({ focusedEffectId: null }),
     removeTargetEffect: (target, effectId) => mutateProject((project) => {
       const effects = targetEffects(project, target)
       if (!effects) return
@@ -1205,10 +1259,18 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     toggleSnap: () => set((state) => ({ snapEnabled: !state.snapEnabled })),
     setGridTicks: (ticks) => set({ gridTicks: Math.max(1, Math.round(ticks)) }),
     toggleFollowPlayhead: () => set((state) => ({ followPlayhead: !state.followPlayhead })),
-    setLowerPanelHeight: (value) => set({ lowerPanelHeight: Math.max(315, Math.min(720, value)), lowerPanelCollapsed: false }),
+    setLowerPanelHeight: (value) => set((state) => {
+      const height = state.lowerTab === 'effects'
+        ? Math.max(30, Math.min(350, value))
+        : Math.max(120, value)
+      return state.lowerTab === 'effects'
+        ? { lowerPanelHeight: height, effectsPanelHeight: height, lowerPanelCollapsed: false }
+        : { lowerPanelHeight: height, mixerPanelHeight: height, lowerPanelCollapsed: false }
+    }),
     toggleLowerPanel: () => set((state) => ({ lowerPanelCollapsed: !state.lowerPanelCollapsed })),
     setLowerTab: (tab) => set((state) => ({
       lowerTab: tab,
+      lowerPanelHeight: (tab === 'effects' ? state.effectsPanelHeight : state.mixerPanelHeight) ?? state.lowerPanelHeight,
       lowerPanelCollapsed: false,
       rackTarget: tab === 'effects' && state.selectedTrackId && state.project.tracks.some((track) => track.id === state.selectedTrackId)
         ? { kind: 'track' as const, id: state.selectedTrackId }
@@ -1273,7 +1335,7 @@ export function effectDefaults(type: EffectInstance['type']): Record<string, num
   if (type === 'builtin:eq8') return { ...eqDefaults([30, 100, 300, 800, 2500, 6000, 12000, 16000], [3, 0, 0, 0, 0, 0, 0, 2], [1, 0, 0, 0, 0, 0, 0, 0]), adaptiveQ: 1, scale: 1, outputDb: 0 }
   if (type === 'builtin:compressor') return { threshold: -18, ratio: 3, attack: 0.01, release: 0.2, knee: 12, makeupDb: 0 }
   if (type === 'builtin:multiband-compressor') return { splitLow: 150, splitHigh: 2500, lowThreshold: -24, lowRatio: 3, lowAttack: 0.03, lowRelease: 0.25, lowMakeupDb: 0, midThreshold: -20, midRatio: 2.5, midAttack: 0.015, midRelease: 0.18, midMakeupDb: 0, highThreshold: -18, highRatio: 2, highAttack: 0.006, highRelease: 0.12, highMakeupDb: 0, knee: 8, outputDb: 0, mix: 1 }
-  if (type === 'builtin:distortion') return { splitLow: 180, splitHigh: 4500, lowMode: 1, lowGainDb: 0, lowDriveDb: 6, lowMix: .75, midMode: 2, midGainDb: 0, midDriveDb: 6, midMix: .75, highMode: 4, highGainDb: 0, highDriveDb: 6, highMix: .6 }
+  if (type === 'builtin:distortion') return { splitLow: 180, splitHigh: 4500, oversample: 4, lowEnabled: 1, lowMode: 1, lowGainDb: 0, lowDriveDb: 6, lowMix: .75, midEnabled: 1, midMode: 2, midGainDb: 0, midDriveDb: 6, midMix: .75, highEnabled: 1, highMode: 4, highGainDb: 0, highDriveDb: 6, highMix: .6 }
   if (type === 'builtin:disperser') return { frequency: 3050, amount: .25, pinch: .45 }
   if (type === 'builtin:mastering-limiter') return { algorithm: 0, inputDb: 0, outputDb: -1, releaseMs: 120, stereoLink: 1, truePeak: 1 }
   if (type === 'builtin:vocoder') return { source: 3, bands: 16, pitchHz: 110, attackMs: 5, releaseMs: 90, formantShift: 0, bandwidth: 1, mix: 1, outputDb: 0 }
@@ -1307,31 +1369,56 @@ function automationRange(id: string, value: number): Pick<AutomationOption, 'min
   return { min: 0, max: 1, defaultValue: value }
 }
 
+function recordArmedAutomation(track: Track, playheadSec: number, targetKind: AutomationLane['targetKind'], targetId: string, parameterId: string, value: number, playing: boolean): Track {
+  if (!playing) return track
+  const normalized = parameterId.replace(/^param:/, '')
+  const laneIndex = (track.automationLanes ?? []).findIndex((lane) => {
+    const mode = lane.mode ?? 'read'
+    return (mode === 'write' || mode === 'latch') && lane.targetKind === targetKind && lane.targetId === targetId && lane.parameterId.replace(/^param:/, '') === normalized
+  })
+  if (laneIndex < 0) return track
+  const lanes = (track.automationLanes ?? []).slice()
+  const lane = lanes[laneIndex]!
+  const points = lane.points.slice()
+  const clipped = Math.max(lane.min, Math.min(lane.max, value))
+  const tolerance = 1 / 30
+  const nearby = points.findIndex((point) => Math.abs(point.timeSec - playheadSec) <= tolerance)
+  if (nearby >= 0) points[nearby] = { ...points[nearby]!, timeSec: playheadSec, value: clipped }
+  else points.push({ id: crypto.randomUUID(), timeSec: Math.max(0, playheadSec), value: clipped })
+  points.sort((left, right) => left.timeSec - right.timeSec)
+  lanes[laneIndex] = { ...lane, points }
+  return { ...track, automationLanes: lanes }
+}
+
 /** Builds the categorized, stable automation menu for a track and its device chain. */
 export function automationOptionsForTrack(track: Track): AutomationOption[] {
   const options: AutomationOption[] = [
-    { targetKind: 'track', targetId: track.id, parameterId: 'volumeDb', category: 'MIXER', label: 'Volume', min: -60, max: 12, defaultValue: track.volumeDb },
-    { targetKind: 'track', targetId: track.id, parameterId: 'pan', category: 'MIXER', label: 'Pan', min: -1, max: 1, defaultValue: track.pan },
+    { targetKind: 'track', targetId: track.id, parameterId: 'volumeDb', category: 'INSERT', label: 'Volume', min: -60, max: 12, defaultValue: track.volumeDb },
+    { targetKind: 'track', targetId: track.id, parameterId: 'pan', category: 'INSERT', label: 'Pan', min: -1, max: 1, defaultValue: track.pan },
   ]
   const addParams = (targetKind: AutomationOption['targetKind'], targetId: string, category: string, params: Record<string, number>) => {
     for (const [parameterId, value] of Object.entries(params).sort(([left], [right]) => left.localeCompare(right))) {
       options.push({ targetKind, targetId, parameterId, category, label: titleParameter(parameterId), ...automationRange(parameterId, value) })
     }
   }
+  for (const [index, send] of track.sends.entries()) {
+    options.push({ targetKind: 'send', targetId: send.id, parameterId: 'gainDb', category: 'SEND', label: `Send ${index + 1} · Level`, min: -60, max: 12, defaultValue: send.gainDb })
+  }
   if (track.instrument) {
     const name = track.instrument.plugin?.name ?? track.instrument.type.replace('builtin:', '')
     const params = { ...track.instrument.params }
     const pluginParams = track.instrument.plugin?.parameters ?? []
-    addParams('instrument', track.id, `INSTRUMENT · ${name}`, params)
-    for (const parameter of pluginParams) options.push({ targetKind: 'instrument', targetId: track.id, parameterId: `param:${parameter.id}`, category: `INSTRUMENT · ${name}${parameter.module ? ` · ${parameter.module}` : ''}`, label: parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
+    addParams('instrument', track.id, name, params)
+    for (const parameter of pluginParams) options.push({ targetKind: 'instrument', targetId: track.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
   }
   for (const effect of track.effects) {
     const name = effect.plugin?.name ?? effect.type.replace('builtin:', '')
     const params = { ...effectDefaults(effect.type), ...effect.params }
-    addParams('effect', effect.id, `FX · ${name}`, params)
-    for (const parameter of effect.plugin?.parameters ?? []) options.push({ targetKind: 'effect', targetId: effect.id, parameterId: `param:${parameter.id}`, category: `FX · ${name}${parameter.module ? ` · ${parameter.module}` : ''}`, label: parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
+    addParams('effect', effect.id, name, params)
+    options.push({ targetKind: 'effect', targetId: effect.id, parameterId: '__bypass', category: name, label: 'Bypass', min: 0, max: 1, defaultValue: effect.bypassed ? 1 : 0 })
+    for (const parameter of effect.plugin?.parameters ?? []) options.push({ targetKind: 'effect', targetId: effect.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
   }
-  return options.sort((left, right) => left.category.localeCompare(right.category) || left.label.localeCompare(right.label))
+  return options
 }
 
 function eqDefaults(frequencies: number[], shapes: number[], enabled = frequencies.map(() => 1)): Record<string, number> {

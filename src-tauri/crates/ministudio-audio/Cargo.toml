@@ -1,0 +1,26 @@
+[package]
+name = "ministudio-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Native audio engine, graph, scheduling, and asset IO for MiniStudio"
+
+[features]
+default = []
+asio = ["cpal/asio"]
+
+[dependencies]
+cpal = "0.16"
+crossbeam-queue = "0.3"
+hound = "3.5"
+midir = "0.10"
+ministudio-contracts = { path = "../ministudio-contracts" }
+ministudio-dsp = { path = "../ministudio-dsp" }
+ministudio-plugin = { path = "../ministudio-plugin" }
+mp3lame-encoder = "0.2.4"
+rubato = "0.16"
+rtrb = "0.3"
+serde = { version = "1", features = ["derive"] }
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+symphonia = { version = "0.5", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
+thiserror = "2"
+triple_buffer = "8"

@@ -1,5 +1,5 @@
 // Typed Tauri IPC surface for the native audio control plane and phase-three stubs.
-mod audio;
+use ministudio_audio::audio;
 
 use audio::{
     engine::NativeEngine,
@@ -16,7 +16,8 @@ use specta::Type;
 use specta_typescript::Typescript;
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,7 +26,7 @@ use std::{
 };
 use tauri::{
     ipc::{Channel, Response},
-    State,
+    AppHandle, Manager, State,
 };
 #[cfg(feature = "desktop")]
 use tauri::{plugin::TauriPlugin, Runtime};
@@ -47,6 +48,38 @@ struct NativeEngineState {
     engine: Arc<Mutex<NativeEngine>>,
     export_cancelled: Arc<AtomicBool>,
 }
+
+#[derive(Default)]
+struct PluginRegistryState {
+    paths: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PluginFingerprint {
+    bytes: u64,
+    files: u64,
+    modified_millis: u128,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginCacheEntry {
+    format: String,
+    path: String,
+    fingerprint: PluginFingerprint,
+    descriptors: Vec<PluginDescriptor>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginCacheFile {
+    version: u32,
+    entries: Vec<PluginCacheEntry>,
+}
+
+const PLUGIN_CACHE_VERSION: u32 = 2;
+const PLUGIN_CACHE_FILE: &str = "plugin-scan-cache-v2.json";
 
 impl Default for NativeEngineState {
     fn default() -> Self {
@@ -112,6 +145,9 @@ fn list_media_directory(path: String) -> Result<Vec<MediaDirectoryEntry>, Engine
         EngineError::Asset(format!("cannot read media directory {path}: {error}"))
     })?;
     for entry in entries.flatten() {
+        if is_hidden_media_entry(&entry) {
+            continue;
+        }
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -141,6 +177,102 @@ fn list_media_directory(path: String) -> Result<Vec<MediaDirectoryEntry>, Engine
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     Ok(result)
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn search_media_directory(
+    path: String,
+    query: String,
+) -> Result<Vec<MediaDirectoryEntry>, EngineError> {
+    tauri::async_runtime::spawn_blocking(move || search_media_directory_blocking(&path, &query))
+        .await
+        .map_err(|error| EngineError::Internal(error.to_string()))?
+}
+
+fn search_media_directory_blocking(
+    path: &str,
+    query: &str,
+) -> Result<Vec<MediaDirectoryEntry>, EngineError> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    let mut pending = vec![PathBuf::from(path)];
+    let mut visited = 0_usize;
+    while let Some(folder) = pending.pop() {
+        visited += 1;
+        if visited > 20_000 || result.len() >= 500 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if is_hidden_media_entry(&entry) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_type.is_file()
+                && is_supported_audio_name(&name)
+                && name.to_lowercase().contains(&needle)
+            {
+                result.push(MediaDirectoryEntry {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    name,
+                    is_directory: false,
+                });
+                if result.len() >= 500 {
+                    break;
+                }
+            }
+        }
+    }
+    result.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(result)
+}
+
+fn is_supported_audio_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, extension)| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "wav" | "mp3" | "flac" | "ogg" | "m4a" | "aac"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_hidden_media_entry(entry: &std::fs::DirEntry) -> bool {
+    if entry.file_name().to_string_lossy().starts_with('.') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if entry
+            .metadata()
+            .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[tauri::command]
@@ -195,10 +327,50 @@ fn engine_unload_asset(
 #[tauri::command]
 #[specta::specta]
 fn engine_sync_graph(
-    snapshot: GraphSnapshot,
+    mut snapshot: GraphSnapshot,
     state: State<'_, NativeEngineState>,
+    plugins: State<'_, PluginRegistryState>,
 ) -> Result<(), EngineError> {
+    resolve_plugin_paths(&mut snapshot, &plugins);
     with_engine(&state, |engine| engine.sync_graph(snapshot))
+}
+
+fn resolve_plugin_paths(snapshot: &mut GraphSnapshot, registry: &PluginRegistryState) {
+    let paths = registry
+        .paths
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let resolve = |reference: &mut audio::types::ExternalPluginRef| {
+        if let Some(path) = paths.get(&format!("{}:{}", reference.format, reference.uid)) {
+            reference.path.clone_from(path);
+        }
+    };
+    for track in &mut snapshot.tracks {
+        if let Some(reference) = track
+            .instrument
+            .as_mut()
+            .and_then(|instrument| instrument.plugin.as_mut())
+        {
+            resolve(reference);
+        }
+        for effect in &mut track.effects {
+            if let Some(reference) = effect.plugin.as_mut() {
+                resolve(reference);
+            }
+        }
+    }
+    for bus in &mut snapshot.buses {
+        for effect in &mut bus.effects {
+            if let Some(reference) = effect.plugin.as_mut() {
+                resolve(reference);
+            }
+        }
+    }
+    for effect in &mut snapshot.master.effects {
+        if let Some(reference) = effect.plugin.as_mut() {
+            resolve(reference);
+        }
+    }
 }
 
 #[tauri::command]
@@ -307,6 +479,18 @@ fn engine_set_effect_param(
 ) -> Result<(), EngineError> {
     with_engine(&state, |engine| {
         engine.set_effect(&effect_id, &param_id, value)
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_set_effect_bypass(
+    effect_id: String,
+    bypassed: bool,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    with_engine(&state, |engine| {
+        engine.set_effect_bypassed(&effect_id, bypassed)
     })
 }
 
@@ -462,6 +646,79 @@ fn engine_eq_response(
     })
 }
 
+fn validate_plugin_target_kind(kind: &str) -> Result<(), String> {
+    match kind {
+        "effect" | "instrument" => Ok(()),
+        _ => Err(format!("unknown plug-in target kind: {kind}")),
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_open_plugin_editor(
+    target_kind: String,
+    target_id: String,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    with_engine(&state, |engine| {
+        validate_plugin_target_kind(&target_kind)?;
+        engine.open_plugin_editor(&target_id)
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_close_plugin_editor(
+    target_kind: String,
+    target_id: String,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    with_engine(&state, |engine| {
+        validate_plugin_target_kind(&target_kind)?;
+        engine.close_plugin_editor(&target_id)
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_plugin_editor_is_open(
+    target_kind: String,
+    target_id: String,
+    state: State<'_, NativeEngineState>,
+) -> Result<bool, EngineError> {
+    with_engine(&state, |engine| {
+        validate_plugin_target_kind(&target_kind)?;
+        Ok(engine.plugin_editor_is_open(&target_id))
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_save_plugin_state(
+    target_kind: String,
+    target_id: String,
+    state: State<'_, NativeEngineState>,
+) -> Result<Vec<u8>, EngineError> {
+    with_engine(&state, |engine| {
+        validate_plugin_target_kind(&target_kind)?;
+        engine.save_plugin_state(&target_id)
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_load_plugin_state(
+    target_kind: String,
+    target_id: String,
+    plugin_state: Vec<u8>,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    with_engine(&state, |engine| {
+        validate_plugin_target_kind(&target_kind)?;
+        engine.load_plugin_state(&target_id, plugin_state)
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineRenderRequest {
@@ -482,43 +739,101 @@ pub struct OfflineRenderResult {
 
 #[tauri::command]
 #[specta::specta]
-async fn scan_vst3_plugins(paths: Vec<String>) -> Result<Vec<PluginDescriptor>, EngineError> {
-    tauri::async_runtime::spawn_blocking(move || scan_plugins_isolated(&paths))
-        .await
-        .map_err(|error| EngineError::Internal(error.to_string()))?
+async fn cached_vst3_plugins(
+    app: AppHandle<AppRuntime>,
+    registry: State<'_, PluginRegistryState>,
+) -> Result<Vec<PluginDescriptor>, EngineError> {
+    let cache = read_plugin_cache(&plugin_cache_path(&app)?);
+    update_plugin_registry(&registry, &cache);
+    Ok(cache_descriptors(&cache))
 }
 
-fn scan_plugins_isolated(paths: &[String]) -> Result<Vec<PluginDescriptor>, EngineError> {
+#[tauri::command]
+#[specta::specta]
+async fn scan_vst3_plugins(
+    paths: Vec<String>,
+    force: bool,
+    app: AppHandle<AppRuntime>,
+    registry: State<'_, PluginRegistryState>,
+) -> Result<Vec<PluginDescriptor>, EngineError> {
+    let cache_path = plugin_cache_path(&app)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        scan_plugins_incremental(&paths, &cache_path, force)
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))??;
+    update_plugin_registry(&registry, &result.1);
+    Ok(result.0)
+}
+
+fn scan_plugins_incremental(
+    paths: &[String],
+    cache_path: &Path,
+    force: bool,
+) -> Result<(Vec<PluginDescriptor>, PluginCacheFile), EngineError> {
     let executable =
         std::env::current_exe().map_err(|error| EngineError::Internal(error.to_string()))?;
-    let binaries = Arc::new(audio::plugin::collect_plugin_binaries(paths));
+    let previous = read_plugin_cache(cache_path);
+    let previous = previous
+        .entries
+        .into_iter()
+        .map(|entry| ((entry.format.clone(), entry.path.clone()), entry))
+        .collect::<HashMap<_, _>>();
+    let binaries = audio::plugin::collect_plugin_binaries(paths);
+    let mut entries = Vec::with_capacity(binaries.len());
+    let mut changed = Vec::new();
+    for (format, path) in binaries {
+        let path_text = path.to_string_lossy().into_owned();
+        let fingerprint = plugin_fingerprint(&path);
+        let key = (format.clone(), path_text.clone());
+        if !force {
+            if let Some(entry) = previous.get(&key) {
+                if entry.fingerprint == fingerprint {
+                    entries.push(entry.clone());
+                    continue;
+                }
+            }
+        }
+        changed.push((format, path, path_text, fingerprint));
+    }
+    let changed = Arc::new(changed);
     let worker_count = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2)
-        .min(4)
-        .min(binaries.len().max(1));
+        .min(8)
+        .min(changed.len().max(1));
     let cursor = Arc::new(AtomicUsize::new(0));
     let (sender, receiver) = std::sync::mpsc::channel();
-    let mut plugins = Vec::new();
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
-            let binaries = Arc::clone(&binaries);
+            let changed = Arc::clone(&changed);
             let cursor = Arc::clone(&cursor);
             let sender = sender.clone();
             let executable = executable.clone();
             scope.spawn(move || loop {
                 let index = cursor.fetch_add(1, Ordering::Relaxed);
-                let Some((format, path)) = binaries.get(index) else {
+                let Some((format, path, path_text, fingerprint)) = changed.get(index) else {
                     break;
                 };
-                let _ = sender.send(probe_plugin_isolated(&executable, format, path));
+                let descriptors = probe_plugin_isolated(&executable, format, path, true);
+                let _ = sender.send(PluginCacheEntry {
+                    format: format.clone(),
+                    path: path_text.clone(),
+                    fingerprint: fingerprint.clone(),
+                    descriptors,
+                });
             });
         }
         drop(sender);
-        for mut descriptors in receiver {
-            plugins.append(&mut descriptors);
-        }
+        entries.extend(receiver);
     });
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.format.cmp(&b.format)));
+    let cache = PluginCacheFile {
+        version: PLUGIN_CACHE_VERSION,
+        entries,
+    };
+    write_plugin_cache(cache_path, &cache)?;
+    let mut plugins = cache_descriptors(&cache);
     plugins.sort_by(|a, b| {
         a.name
             .to_ascii_lowercase()
@@ -526,18 +841,118 @@ fn scan_plugins_isolated(paths: &[String]) -> Result<Vec<PluginDescriptor>, Engi
             .then_with(|| a.uid.cmp(&b.uid))
     });
     plugins.dedup_by(|a, b| a.format == b.format && a.uid == b.uid && a.path == b.path);
-    Ok(plugins)
+    Ok((plugins, cache))
+}
+
+fn plugin_cache_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, EngineError> {
+    app.path()
+        .app_cache_dir()
+        .map(|directory| directory.join(PLUGIN_CACHE_FILE))
+        .map_err(|error| EngineError::Internal(error.to_string()))
+}
+
+fn read_plugin_cache(path: &Path) -> PluginCacheFile {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PluginCacheFile>(&bytes).ok())
+        .filter(|cache| cache.version == PLUGIN_CACHE_VERSION)
+        .unwrap_or_default()
+}
+
+fn write_plugin_cache(path: &Path, cache: &PluginCacheFile) -> Result<(), EngineError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| EngineError::Internal("invalid plug-in cache path".into()))?;
+    fs::create_dir_all(parent).map_err(|error| EngineError::Internal(error.to_string()))?;
+    let temporary = path.with_extension("json.tmp");
+    let bytes =
+        serde_json::to_vec(cache).map_err(|error| EngineError::Internal(error.to_string()))?;
+    fs::write(&temporary, bytes).map_err(|error| EngineError::Internal(error.to_string()))?;
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+    fs::rename(temporary, path).map_err(|error| EngineError::Internal(error.to_string()))
+}
+
+fn cache_descriptors(cache: &PluginCacheFile) -> Vec<PluginDescriptor> {
+    let mut descriptors = cache
+        .entries
+        .iter()
+        .flat_map(|entry| entry.descriptors.clone())
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.format.cmp(&b.format))
+            .then_with(|| a.uid.cmp(&b.uid))
+    });
+    descriptors.dedup_by(|a, b| a.format == b.format && a.uid == b.uid && a.path == b.path);
+    descriptors
+}
+
+fn update_plugin_registry(registry: &PluginRegistryState, cache: &PluginCacheFile) {
+    let mut paths = registry
+        .paths
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    paths.clear();
+    for descriptor in cache.entries.iter().flat_map(|entry| &entry.descriptors) {
+        paths.insert(
+            format!("{}:{}", descriptor.format, descriptor.uid),
+            descriptor.path.clone(),
+        );
+    }
+}
+
+fn plugin_fingerprint(path: &Path) -> PluginFingerprint {
+    fn visit(path: &Path, result: &mut PluginFingerprint, depth: usize) {
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.is_file() {
+            result.files += 1;
+            result.bytes = result.bytes.saturating_add(metadata.len());
+            if let Ok(modified) = metadata.modified().and_then(|time| {
+                time.duration_since(std::time::UNIX_EPOCH)
+                    .map_err(std::io::Error::other)
+            }) {
+                result.modified_millis = result.modified_millis.max(modified.as_millis());
+            }
+        } else if metadata.is_dir() && depth < 4 {
+            if let Ok(children) = fs::read_dir(path) {
+                for child in children.flatten() {
+                    let child_path = child.path();
+                    // VST3 bundles often contain thousands of presets and artwork files.
+                    // Only code/metadata directories affect host compatibility; ignoring
+                    // Resources keeps an unchanged startup scan effectively O(plug-ins).
+                    if child_path
+                        .file_name()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Resources"))
+                    {
+                        continue;
+                    }
+                    visit(&child_path, result, depth + 1);
+                }
+            }
+        }
+    }
+    let mut result = PluginFingerprint::default();
+    visit(path, &mut result, 0);
+    result
 }
 
 fn probe_plugin_isolated(
     executable: &std::path::Path,
     format: &str,
     path: &std::path::Path,
+    catalog_only: bool,
 ) -> Vec<PluginDescriptor> {
     let mut child = match Command::new(executable)
         .arg("--minidaw-plugin-probe")
         .arg(format)
         .arg(path)
+        .arg(if catalog_only { "catalog" } else { "full" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -546,20 +961,8 @@ fn probe_plugin_isolated(
         Ok(child) => child,
         Err(_) => return Vec::new(),
     };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let completed = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
+    let timeout = if catalog_only { 8 } else { 30 };
+    let completed = wait_for_probe_child(&mut child, std::time::Duration::from_secs(timeout));
     if !completed {
         return Vec::new();
     }
@@ -569,6 +972,85 @@ fn probe_plugin_isolated(
         }
     }
     Vec::new()
+}
+
+#[tauri::command]
+#[specta::specta]
+fn engine_asset_peaks(
+    asset_id: String,
+    lod: u8,
+    state: State<'_, NativeEngineState>,
+) -> Result<Vec<f32>, EngineError> {
+    with_engine(&state, |engine| {
+        engine.asset_peaks(&asset_id, lod).map(ToOwned::to_owned)
+    })
+}
+
+fn wait_for_probe_child(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod plugin_probe_tests {
+    use super::*;
+
+    #[test]
+    fn hanging_plugin_probe_is_killed_at_the_deadline() {
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "ping 127.0.0.1 -n 20 > nul"])
+            .spawn()
+            .expect("spawn timeout fixture");
+        #[cfg(not(windows))]
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 20"])
+            .spawn()
+            .expect("spawn timeout fixture");
+        let started = std::time::Instant::now();
+        assert!(!wait_for_probe_child(
+            &mut child,
+            std::time::Duration::from_millis(40)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn missing_plugin_probe_executable_fails_closed() {
+        let result = probe_plugin_isolated(
+            std::path::Path::new("definitely-missing-ministudio-probe"),
+            "vst3",
+            std::path::Path::new("missing.vst3"),
+            true,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn plugin_fingerprint_changes_with_bundle_contents() {
+        let root =
+            std::env::temp_dir().join(format!("ministudio-plugin-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create fingerprint fixture");
+        let binary = root.join("plugin.bin");
+        fs::write(&binary, b"first").expect("write initial fixture");
+        let first = plugin_fingerprint(&root);
+        fs::write(&binary, b"a larger replacement").expect("change fixture");
+        let second = plugin_fingerprint(&root);
+        assert_ne!(first, second);
+        fs::remove_dir_all(root).expect("remove fingerprint fixture");
+    }
 }
 
 /// Runs the disposable native-plugin probe mode and returns true when normal Tauri startup must stop.
@@ -582,12 +1064,65 @@ pub fn run_plugin_probe_from_args() -> bool {
         return true;
     };
     let Some(path) = args.next() else { return true };
-    if let Ok(descriptors) = audio::plugin::probe_plugin(&format, std::path::Path::new(&path)) {
+    let catalog_only = args.next().as_deref() == Some(std::ffi::OsStr::new("catalog"));
+    let result = if catalog_only {
+        audio::plugin::probe_plugin_catalog(&format, std::path::Path::new(&path))
+    } else {
+        audio::plugin::probe_plugin(&format, std::path::Path::new(&path))
+    };
+    if let Ok(descriptors) = result {
         if let Ok(json) = serde_json::to_string(&descriptors) {
             println!("{json}");
         }
     }
     true
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn inspect_plugin_metadata(
+    format: String,
+    path: String,
+    uid: String,
+    app: AppHandle<AppRuntime>,
+    registry: State<'_, PluginRegistryState>,
+) -> Result<PluginDescriptor, EngineError> {
+    let executable =
+        std::env::current_exe().map_err(|error| EngineError::Internal(error.to_string()))?;
+    let format_for_probe = format.clone();
+    let path_for_probe = path.clone();
+    let descriptors = tauri::async_runtime::spawn_blocking(move || {
+        probe_plugin_isolated(
+            &executable,
+            &format_for_probe,
+            Path::new(&path_for_probe),
+            false,
+        )
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    let descriptor = descriptors
+        .into_iter()
+        .find(|item| item.uid == uid)
+        .ok_or_else(|| {
+            EngineError::Internal(format!("plug-in metadata unavailable: {format}:{uid}"))
+        })?;
+    let cache_path = plugin_cache_path(&app)?;
+    let mut cache = read_plugin_cache(&cache_path);
+    if let Some(entry) = cache
+        .entries
+        .iter_mut()
+        .find(|entry| entry.format == format && entry.path == path)
+    {
+        if let Some(existing) = entry.descriptors.iter_mut().find(|item| item.uid == uid) {
+            *existing = descriptor.clone();
+        } else {
+            entry.descriptors.push(descriptor.clone());
+        }
+        write_plugin_cache(&cache_path, &cache)?;
+        update_plugin_registry(&registry, &cache);
+    }
+    Ok(descriptor)
 }
 
 #[tauri::command]
@@ -636,10 +1171,12 @@ fn specta_builder() -> Builder<AppRuntime> {
         .commands(collect_commands![
             list_storage_roots,
             list_media_directory,
+            search_media_directory,
             engine_init,
             engine_dispose,
             engine_load_audio_file,
             engine_unload_asset,
+            engine_asset_peaks,
             engine_sync_graph,
             engine_play,
             engine_pause,
@@ -653,6 +1190,7 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_set_bus_volume,
             engine_set_master_volume,
             engine_set_effect_param,
+            engine_set_effect_bypass,
             engine_set_instrument_param,
             engine_midi_note,
             engine_midi_all_notes_off,
@@ -667,7 +1205,14 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_export_project,
             engine_cancel_export,
             engine_eq_response,
+            engine_open_plugin_editor,
+            engine_close_plugin_editor,
+            engine_plugin_editor_is_open,
+            engine_save_plugin_state,
+            engine_load_plugin_state,
+            cached_vst3_plugins,
             scan_vst3_plugins,
+            inspect_plugin_metadata,
             render_offline_effect,
         ])
 }
@@ -700,6 +1245,14 @@ pub fn run() {
     let invoke_handler = builder.invoke_handler();
     let result = tauri::Builder::default()
         .manage(NativeEngineState::default())
+        .manage(PluginRegistryState::default())
+        .setup(|app| {
+            if let Ok(path) = app.path().app_cache_dir() {
+                let cache = read_plugin_cache(&path.join(PLUGIN_CACHE_FILE));
+                update_plugin_registry(app.state::<PluginRegistryState>().inner(), &cache);
+            }
+            Ok(())
+        })
         .plugin(binary_plugin())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())

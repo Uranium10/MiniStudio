@@ -39,26 +39,47 @@ export async function importAudio(engine: IAudioEngine): Promise<void> {
   }
 }
 
-export async function openProjectFile(engine: IAudioEngine): Promise<void> {
+export async function openProjectFile(engine: IAudioEngine): Promise<boolean> {
   try {
     const result = await openProject()
-    if (!result) return
+    if (!result) return false
     const hydrated = await hydrateProjectAudio(engine, result.project)
     store().setProject(hydrated.project)
     store().setMissingAssets(hydrated.missing)
     store().showToast('프로젝트를 열었습니다')
+    return true
   } catch {
     store().showToast('프로젝트 파일을 열 수 없습니다')
+    return false
   }
 }
 
-export async function saveProjectFile(): Promise<void> {
+export async function saveProjectFile(engine: IAudioEngine): Promise<void> {
   try {
-    await saveProject(getProjectSnapshot())
+    await saveProject(await snapshotWithPluginStates(engine, getProjectSnapshot()))
     store().showToast('프로젝트를 저장했습니다')
   } catch {
     store().showToast('데스크톱 앱에서 저장할 수 있습니다')
   }
+}
+
+async function snapshotWithPluginStates(engine: IAudioEngine, source: ReturnType<typeof getProjectSnapshot>): Promise<ReturnType<typeof getProjectSnapshot>> {
+  const project = structuredClone(source)
+  for (const track of project.tracks) {
+    if (track.instrument?.plugin) {
+      try { track.instrument.plugin.state = await engine.savePluginState('instrument', track.id) } catch { /* Preserve the previous state when the plug-in declines snapshots. */ }
+    }
+    for (const effect of track.effects) if (effect.plugin) {
+      try { effect.plugin.state = await engine.savePluginState('effect', effect.id) } catch { /* Optional state extension. */ }
+    }
+  }
+  for (const bus of project.buses) for (const effect of bus.effects) if (effect.plugin) {
+    try { effect.plugin.state = await engine.savePluginState('effect', effect.id) } catch { /* Optional state extension. */ }
+  }
+  for (const effect of project.master.effects) if (effect.plugin) {
+    try { effect.plugin.state = await engine.savePluginState('effect', effect.id) } catch { /* Optional state extension. */ }
+  }
+  return project
 }
 
 export async function exportMasterWav(engine: IAudioEngine): Promise<void> {

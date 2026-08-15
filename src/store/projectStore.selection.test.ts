@@ -5,7 +5,7 @@ import { automationOptionsForTrack, effectDefaults, useProjectStore } from './pr
 describe('multi-track selection and routing', () => {
   beforeEach(() => {
     const project = createDemoProject()
-    useProjectStore.setState({ project, selectedTrackId: project.tracks[0]!.id, selectedTrackIds: [project.tracks[0]!.id], rackTarget: { kind: 'track', id: project.tracks[0]!.id }, past: [], future: [], history: [], futureHistory: [] })
+    useProjectStore.setState({ project, selectedTrackId: project.tracks[0]!.id, selectedTrackIds: [project.tracks[0]!.id], rackTarget: { kind: 'track', id: project.tracks[0]!.id }, lowerTab: 'mixer', lowerPanelHeight: 350, mixerPanelHeight: 350, effectsPanelHeight: 350, focusedEffectId: null, past: [], future: [], history: [], futureHistory: [] })
   })
 
   it('selects the inclusive ordered range with Shift semantics', () => {
@@ -132,5 +132,72 @@ describe('multi-track selection and routing', () => {
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)?.midiClips.map((clip) => clip.id)).toEqual(clipIds)
     useProjectStore.getState().undo()
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)?.instrument?.type).toBe(originalType)
+  })
+
+  it('focuses every inserted effect and duplicates its complete state next to the source', () => {
+    const track = useProjectStore.getState().project.tracks[0]!
+    useProjectStore.getState().addEffect(track.id, 'builtin:distortion')
+    let state = useProjectStore.getState()
+    const source = state.project.tracks[0]!.effects.at(-1)!
+    expect(state.focusedEffectId).toBe(source.id)
+    expect(state.lowerTab).toBe('effects')
+    state.updateTargetEffect({ kind: 'track', id: track.id }, source.id, { lowDriveDb: 17 })
+    state.duplicateTargetEffect({ kind: 'track', id: track.id }, source.id)
+    state = useProjectStore.getState()
+    const sourceIndex = state.project.tracks[0]!.effects.findIndex((effect) => effect.id === source.id)
+    const duplicate = state.project.tracks[0]!.effects[sourceIndex + 1]!
+    expect(duplicate.id).toBe(state.focusedEffectId)
+    expect(duplicate.params.lowDriveDb).toBe(17)
+    expect(duplicate.params).not.toBe(state.project.tracks[0]!.effects[sourceIndex]!.params)
+  })
+
+  it('publishes bypass as an automatable effect parameter', () => {
+    const track = useProjectStore.getState().project.tracks[0]!
+    useProjectStore.getState().addEffect(track.id, 'builtin:compressor')
+    const effect = useProjectStore.getState().project.tracks[0]!.effects.at(-1)!
+    expect(automationOptionsForTrack(useProjectStore.getState().project.tracks[0]!).find((option) => option.targetId === effect.id && option.parameterId === '__bypass')).toMatchObject({ min: 0, max: 1, label: 'Bypass' })
+  })
+
+  it('groups automation as INSERT, SEND, then individual devices', () => {
+    const track = useProjectStore.getState().project.tracks[0]!
+    const options = automationOptionsForTrack(track)
+    expect(options.filter((option) => option.targetKind === 'track').every((option) => option.category === 'INSERT')).toBe(true)
+    expect(options.filter((option) => option.targetKind === 'send').every((option) => option.category === 'SEND')).toBe(true)
+    expect(options.some((option) => option.category.startsWith('INSTRUMENT ·') || option.category.startsWith('FX ·'))).toBe(false)
+  })
+
+  it('records armed write automation while transport is running', () => {
+    const track = useProjectStore.getState().project.tracks[0]!
+    const volume = automationOptionsForTrack(track).find((option) => option.parameterId === 'volumeDb')!
+    useProjectStore.getState().addAutomationLane(track.id, volume)
+    const lane = useProjectStore.getState().project.tracks[0]!.automationLanes![0]!
+    useProjectStore.getState().setAutomationLaneMode(track.id, lane.id, 'write')
+    useProjectStore.getState().setPlayhead(1.25)
+    useProjectStore.getState().setPlaying(true)
+    useProjectStore.getState().updateTrack(track.id, { volumeDb: -7 })
+    expect(useProjectStore.getState().project.tracks[0]!.automationLanes![0]!.points).toEqual([expect.objectContaining({ timeSec: 1.25, value: -7 })])
+  })
+
+  it('remembers independent mixer and fixed-height effects panel sizes', () => {
+    const store = useProjectStore.getState()
+    store.setLowerTab('mixer')
+    store.setLowerPanelHeight(610)
+    store.setLowerTab('effects')
+    store.setLowerPanelHeight(999)
+    expect(useProjectStore.getState().effectsPanelHeight).toBe(350)
+    store.setLowerPanelHeight(40)
+    store.setLowerTab('mixer')
+    expect(useProjectStore.getState().mixerPanelHeight).toBe(610)
+    expect(useProjectStore.getState().lowerPanelHeight).toBe(610)
+  })
+
+  it('inserts a browser instrument at the requested track boundary and undoes it', () => {
+    const before = useProjectStore.getState().project.tracks.map((track) => track.id)
+    const id = useProjectStore.getState().addInstrumentTrack({ format: 'vst3', uid: 'drop-test', name: 'Dropped Synth', vendor: 'Mini', path: 'drop.vst3' }, 2)
+    const after = useProjectStore.getState().project.tracks
+    expect(after[2]).toMatchObject({ id, kind: 'instrument', name: 'Dropped Synth' })
+    expect(after.filter((track) => track.id !== id).map((track) => track.id)).toEqual(before)
+    useProjectStore.getState().undo()
+    expect(useProjectStore.getState().project.tracks.map((track) => track.id)).toEqual(before)
   })
 })

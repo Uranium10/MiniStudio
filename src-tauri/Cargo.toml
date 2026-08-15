@@ -1,5 +1,20 @@
+[workspace]
+members = [
+  ".",
+  "crates/ministudio-audio",
+  "crates/ministudio-contracts",
+  "crates/ministudio-dsp",
+  "crates/ministudio-plugin",
+]
+resolver = "2"
+
+[patch.crates-io]
+# Keep VST3 loading tolerant of vendor bundles whose optional compatibility
+# table references a retired/non-audio class (notably Spitfire BBC SO).
+vst3-host = { path = "vendor/vst3-host" }
+
 [package]
-name = "minidaw"
+name = "ministudio-app"
 version = "0.2.0"
 description = "A compact native-audio digital audio workstation"
 authors = ["MiniDAW contributors"]
@@ -21,43 +36,29 @@ bench = false
 default = ["desktop"]
 desktop = ["tauri/wry"]
 # Enabling cpal/asio pulls the Steinberg ASIO SDK and makes that build GPLv3.
-asio = ["cpal/asio"]
+asio = ["ministudio-audio/asio"]
 
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
 bytemuck = "1.24"
-crossbeam-queue = "0.3"
-cpal = "0.16"
-hound = "3.5"
-mp3lame-encoder = "0.2.4"
-clack-host = "0.1.1"
-clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "state", "tail", "thread-check"] }
-midir = "0.10"
-rubato = "0.16"
-rustfft = "6.4"
-rtrb = "0.3"
+ministudio-audio = { path = "crates/ministudio-audio" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 specta = { version = "=2.0.0-rc.25", features = ["derive", "function"] }
 specta-typescript = "=0.0.12"
-symphonia = { version = "0.5", features = ["aac", "flac", "isomp4", "mp3", "ogg", "vorbis", "wav"] }
 tauri = { version = "2.11", default-features = false, features = ["specta", "test"] }
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-thiserror = "2"
-triple_buffer = "8"
-vst3-host = { version = "0.9.0", default-features = false }
 
 [profile.dev]
 opt-level = 0
 debug = 1
-# MiniDAW's dependency graph makes incremental object caches much larger than
-# the time they save on this Windows workspace. Keep artifacts deterministic
-# and compact; `run.bat` still uses the optimized `dev-dsp` profile below.
-incremental = false
+# Keep local edit/rebuild cycles fast. If the cache is ever corrupted, clear it
+# once and check antivirus/indexer exclusions instead of disabling incrementals.
+incremental = true
 
 [profile.dev.package."*"]
 debug = false
@@ -65,7 +66,7 @@ debug = false
 [profile.test]
 opt-level = 0
 debug = 1
-incremental = false
+incremental = true
 
 [profile.test.package."*"]
 debug = false
@@ -76,9 +77,8 @@ debug = false
 inherits = "dev"
 opt-level = 2
 debug = 1
-# Windows indexers/antivirus have repeatedly left incompatible incremental
-# codegen objects in this external cache, producing LNK2019/LNK1120 at launch.
-incremental = false
+# `run.bat` keeps this profile's cache outside the repository.
+incremental = true
 
 [profile.dev-dsp.package."*"]
 opt-level = 0
@@ -90,5 +90,5 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
-# External plug-in hosting uses the MIT-licensed VST3 SDK bindings through
-# vst3-host and the MIT/Apache Clack wrappers for the CLAP ABI.
+# The application package remains at the src-tauri root because Tauri resolves
+# its manifest, build script, capabilities, and configuration from this path.

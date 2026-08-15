@@ -1,7 +1,8 @@
 // Shared DAW knobs and level meters with fine-drag and reset behavior.
 /* oxlint-disable react/only-export-components */
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { useEngine } from '../hooks/useEngine'
+import { MenuPanel, type MenuItem } from './Menu'
 
 // Pointer capture keeps a knob gesture alive outside the element and outside the
 // window. preventDefault on pointerdown stops any ancestor from starting a native
@@ -9,9 +10,21 @@ import { useEngine } from '../hooks/useEngine'
 type KnobDrag = { pointerId: number; anchorY: number; anchorValue: number; fine: boolean; moved: boolean }
 type KnobScale = 'linear' | 'log'
 
-export function Knob({ value, min, max, step, scale = 'linear', label, format = (current) => current.toFixed(1), defaultValue, onChange }: { value: number; min: number; max: number; step: number; scale?: KnobScale; label: string; format?: (value: number) => string; defaultValue: number; onChange(value: number): void }) {
+type ParameterAutomationContextValue = {
+  add(parameterId: string | undefined, label: string, value: number): void
+}
+
+const ParameterAutomationContext = createContext<ParameterAutomationContextValue | null>(null)
+
+export function ParameterAutomationProvider({ add, children }: { add: ParameterAutomationContextValue['add']; children: ReactNode }) {
+  return <ParameterAutomationContext.Provider value={{ add }}>{children}</ParameterAutomationContext.Provider>
+}
+
+export function Knob({ value, min, max, step, scale = 'linear', label, format = (current) => current.toFixed(1), defaultValue, onChange, parameterId }: { value: number; min: number; max: number; step: number; scale?: KnobScale; label: string; format?: (value: number) => string; defaultValue: number; onChange(value: number): void; parameterId?: string }) {
   const dragRef = useRef<KnobDrag | null>(null)
   const elementRef = useRef<HTMLButtonElement>(null)
+  const automation = useContext(ParameterAutomationContext)
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const normalized = controlNormalized(value, min, max, scale)
   const angle = -135 + normalized * 270
 
@@ -83,10 +96,12 @@ export function Knob({ value, min, max, step, scale = 'linear', label, format = 
         onDragStart={(event) => event.preventDefault()}
         onKeyDown={onKeyDown}
         onDoubleClick={() => onChange(defaultValue)}
+        onContextMenu={automation ? (event) => { event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY }) } : undefined}
         title="세로 드래그 · Shift 미세 조절 · 더블클릭/Home 리셋 · 방향키 조절"
       ><i /></button>
       <EditableNumber value={value} min={min} max={max} step={step} onChange={onChange} format={format} ariaLabel={`${label} 값`} />
       <span>{label}</span>
+      {menu && <MenuPanel items={[{ kind: 'item', label: `${label} 오토메이션 추가`, run: () => automation?.add(parameterId, label, value) } satisfies MenuItem]} anchor={menu} onClose={() => setMenu(null)} className="parameter-context-menu" />}
     </div>
   )
 }
@@ -182,15 +197,23 @@ export function SignalBar({ trackId, kind }: { trackId: string; kind: 'audio' | 
 
 type MeterFrameTask = (time: number) => void
 const meterFrameTasks = new Set<MeterFrameTask>()
+const analyzerFrameTasks = new Set<MeterFrameTask>()
 let meterAnimationFrame = 0
 let lastMeterFrame = 0
+let lastAnalyzerFrame = 0
 
 function runMeterFrames(time: number): void {
   if (time - lastMeterFrame >= 1000 / 30) {
     for (const task of meterFrameTasks) task(time)
     lastMeterFrame = time
   }
-  if (meterFrameTasks.size) meterAnimationFrame = requestAnimationFrame(runMeterFrames)
+  // Analyzer canvases are imperative: a faster visual refresh never enters
+  // React and therefore cannot invalidate the rack, cards, knobs, or layout.
+  if (time - lastAnalyzerFrame >= 1000 / 60) {
+    for (const task of analyzerFrameTasks) task(time)
+    lastAnalyzerFrame = time
+  }
+  if (meterFrameTasks.size || analyzerFrameTasks.size) meterAnimationFrame = requestAnimationFrame(runMeterFrames)
   else meterAnimationFrame = 0
 }
 
@@ -199,7 +222,19 @@ export function subscribeMeterFrame(task: MeterFrameTask): () => void {
   if (!meterAnimationFrame) meterAnimationFrame = requestAnimationFrame(runMeterFrames)
   return () => {
     meterFrameTasks.delete(task)
-    if (!meterFrameTasks.size && meterAnimationFrame) {
+    if (!meterFrameTasks.size && !analyzerFrameTasks.size && meterAnimationFrame) {
+      cancelAnimationFrame(meterAnimationFrame)
+      meterAnimationFrame = 0
+    }
+  }
+}
+
+export function subscribeAnalyzerFrame(task: MeterFrameTask): () => void {
+  analyzerFrameTasks.add(task)
+  if (!meterAnimationFrame) meterAnimationFrame = requestAnimationFrame(runMeterFrames)
+  return () => {
+    analyzerFrameTasks.delete(task)
+    if (!meterFrameTasks.size && !analyzerFrameTasks.size && meterAnimationFrame) {
       cancelAnimationFrame(meterAnimationFrame)
       meterAnimationFrame = 0
     }

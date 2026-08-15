@@ -16,6 +16,12 @@ import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { MenuPanel, type MenuItem } from './Menu'
 import { TrackAddDialog } from './TrackAddDialog'
 
+const OPEN_TRACK_ADD_DIALOG_EVENT = 'ministudio:open-track-add-dialog'
+
+function requestTrackAddDialog(): void {
+  window.dispatchEvent(new Event(OPEN_TRACK_ADD_DIALOG_EVENT))
+}
+
 export function MenuBar() {
   const projectName = useProjectStore((state) => state.project.meta.name)
   const [open, setOpen] = useState<string | null>(null)
@@ -83,7 +89,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
         }, { keys: 'Ctrl+N' }),
         separator,
         item('프로젝트 열기…', () => void openProjectFile(engine), { keys: 'Ctrl+O' }),
-        item('프로젝트 저장', () => void saveProjectFile(), { keys: 'Ctrl+S' }),
+        item('프로젝트 저장', () => void saveProjectFile(engine), { keys: 'Ctrl+S' }),
         separator,
         item('오디오 가져오기…', () => void importAudio(engine)),
         item('내보내기…', () => store.setExportDialogOpen(true), { keys: 'Ctrl+Shift+E' }),
@@ -112,8 +118,7 @@ function useMenuDefinitions(): Array<{ title: string; items: MenuItem[] }> {
     {
       title: '트랙',
       items: [
-        item('오디오 트랙 추가', store.addTrack),
-        item('인스트루먼트 트랙 추가', store.addInstrumentTrack),
+        item('트랙 추가…', requestTrackAddDialog),
         separator,
         item('선택 트랙 복제', () => store.selectedTrackId && store.duplicateTrack(store.selectedTrackId), { disabled: !store.selectedTrackId }),
         item('선택 트랙 삭제', store.removeSelectedTrack, { disabled: !store.selectedTrackId, danger: true }),
@@ -191,22 +196,27 @@ export function ToolBar() {
   const store = useProjectStore.getState()
   const engine = useEngine()
 
+  useEffect(() => {
+    const openDialog = () => setTrackAddOpen(true)
+    window.addEventListener(OPEN_TRACK_ADD_DIALOG_EVENT, openDialog)
+    return () => window.removeEventListener(OPEN_TRACK_ADD_DIALOG_EVENT, openDialog)
+  }, [])
+
   return (
     <div className="tool-bar">
       <TrackAddDialog open={trackAddOpen} onClose={() => setTrackAddOpen(false)} />
       <div className="toolbar-group file-tools">
-        <button className="icon-button add-track-button" title="트랙 추가" onClick={() => setTrackAddOpen(true)}><Plus size={17} /></button>
+        <button className="icon-button add-track-button" title="트랙 추가" onClick={requestTrackAddDialog}><Plus size={17} /></button>
         <button className="icon-button" title="프로젝트 열기 (Ctrl+O)" onClick={() => void openProjectFile(engine)}><FolderOpen size={16} /></button>
-        <button className="icon-button" title="저장 (Ctrl+S)" onClick={() => void saveProjectFile()}><Save size={16} /></button>
+        <button className="icon-button" title="저장 (Ctrl+S)" onClick={() => void saveProjectFile(engine)}><Save size={16} /></button>
         <button className="icon-button" title="내보내기 (Ctrl+Shift+E)" onClick={() => store.setExportDialogOpen(true)}><Download size={16} /></button>
         <button className="icon-button" title="실행취소 (Ctrl+Z)" disabled={!canUndo} onClick={store.undo}><Undo2 size={16} /></button>
         <button className="icon-button" title="다시 실행 (Ctrl+Shift+Z)" disabled={!canRedo} onClick={store.redo}><Redo2 size={16} /></button>
       </div>
       <div className="toolbar-group tool-picker" aria-label={`현재 도구: ${effective}`}>
         {tools.map(({ id, label, icon: Icon }, index) => (
-          <button key={id} className={`tool-button ${toolState.activeTool === id ? 'active' : ''} ${effective === id && toolState.activeTool !== id ? 'temporary' : ''}`} title={`${index + 1} · ${label}`} onClick={() => toolState.chooseTool(id)}>
+          <button key={id} className={`tool-button ${toolState.activeTool === id ? 'active' : ''} ${toolState.activeTool === 'arrow' && toolState.subTool === id ? 'subtool-selected' : ''} ${effective === id && toolState.activeTool !== id ? 'temporary' : ''}`} title={`${index + 1} · ${label}${toolState.activeTool === 'arrow' && toolState.subTool === id ? ' · 1번 서브툴' : ''}`} onClick={() => toolState.chooseTool(id)}>
             <Icon size={16} /><kbd>{index + 1}</kbd>
-            {id === 'arrow' && toolState.subTool !== 'none' && <span className="subtool-badge">{toolState.subTool.slice(0, 1).toUpperCase()}</span>}
           </button>
         ))}
       </div>

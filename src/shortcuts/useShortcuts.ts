@@ -66,7 +66,7 @@ export function useShortcuts(): void {
         case 'follow': store.toggleFollowPlayhead(); store.showToast(store.followPlayhead ? '플레이헤드 따라가기 해제' : '플레이헤드 따라가기'); break
         case 'panel': store.toggleLowerPanel(); break
         case 'tab': store.setLowerTab(store.lowerTab === 'mixer' ? 'effects' : 'mixer'); break
-        case 'save': void saveProjectFile(); break
+        case 'save': void saveProjectFile(engine); break
         case 'new': if (window.confirm('현재 프로젝트를 닫고 새 프로젝트를 시작할까요? 저장하지 않은 변경은 사라집니다.')) { void engine.stop(); store.newProject() }; break
         case 'open': void openProjectFile(engine); break
         case 'export': store.setExportDialogOpen(true); break
@@ -153,7 +153,11 @@ function keyToCommand(event: KeyboardEvent): Command | null {
 }
 
 function isEditable(target: EventTarget | null): boolean {
-  return target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  if (target instanceof HTMLInputElement) return !target.readOnly && !target.disabled
+  if (target instanceof HTMLTextAreaElement) return !target.readOnly && !target.disabled
+  return target instanceof HTMLSelectElement && !target.disabled
 }
 
 function toolLabel(tool: string): string {

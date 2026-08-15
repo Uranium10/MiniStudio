@@ -31,6 +31,8 @@ export type ExternalPluginRef = {
   audioInputBuses?: number
   audioOutputBuses?: number
   supportsSidechain?: boolean
+  hasEditor?: boolean
+  state?: number[]
   paramCount?: number
   parameters?: PluginParameterDescriptor[]
 }
@@ -89,7 +91,7 @@ export type EffectInstance = {
 export type AutomationPoint = { id: string; timeSec: number; value: number; /** Outgoing segment bend, -1…1. */ curve?: number }
 export type AutomationLane = {
   id: string
-  targetKind: 'track' | 'instrument' | 'effect'
+  targetKind: 'track' | 'send' | 'instrument' | 'effect'
   targetId: string
   parameterId: string
   category: string
@@ -98,6 +100,8 @@ export type AutomationLane = {
   max: number
   defaultValue: number
   points: AutomationPoint[]
+  /** Host automation mode. Older projects without this field load as read. */
+  mode?: 'off' | 'write' | 'read' | 'latch'
   /** Arrangement-only lane height in CSS pixels. */
   height?: number
 }
@@ -288,7 +292,7 @@ export type AudioDeviceInfo = {
   channels: number
 }
 export type AudioSettings = { backendId: string; deviceId: string; sampleRate: number; bufferSize: number }
-export type MidiInputPortInfo = { id: string; name: string; connected: boolean }
+export type MidiInputPortInfo = { id: string; name: string; connected: boolean; targetTrackId?: string | null }
 export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number }
 export type EqFrequencyResponse = { frequencies: number[]; combinedDb: number[]; bandsDb: number[][] }
 export type ExportProgress = { stage: string; renderedFrames: number; totalFrames: number; fraction: number }

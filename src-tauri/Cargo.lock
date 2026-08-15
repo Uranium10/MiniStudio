@@ -1966,40 +1966,78 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "minidaw"
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "ministudio-app"
 version = "0.2.0"
 dependencies = [
  "bytemuck",
- "clack-extensions",
- "clack-host",
- "cpal",
- "crossbeam-queue",
- "hound",
- "midir",
- "mp3lame-encoder",
- "rtrb",
- "rubato",
- "rustfft",
+ "ministudio-audio",
  "serde",
  "serde_json",
  "specta",
  "specta-typescript",
- "symphonia",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "tauri-specta",
- "thiserror 2.0.20",
- "triple_buffer",
- "vst3-host",
 ]
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+name = "ministudio-audio"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "crossbeam-queue",
+ "hound",
+ "midir",
+ "ministudio-contracts",
+ "ministudio-dsp",
+ "ministudio-plugin",
+ "mp3lame-encoder",
+ "rtrb",
+ "rubato",
+ "serde",
+ "specta",
+ "symphonia",
+ "thiserror 2.0.20",
+ "triple_buffer",
+]
+
+[[package]]
+name = "ministudio-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "specta",
+]
+
+[[package]]
+name = "ministudio-dsp"
+version = "0.1.0"
+dependencies = [
+ "ministudio-contracts",
+ "rustfft",
+]
+
+[[package]]
+name = "ministudio-plugin"
+version = "0.1.0"
+dependencies = [
+ "clack-extensions",
+ "clack-host",
+ "ministudio-contracts",
+ "ministudio-dsp",
+ "serde",
+ "specta",
+ "vst3-host",
+ "winapi",
+]
 
 [[package]]
 name = "miniz_oxide"
@@ -4483,8 +4521,6 @@ dependencies = [
 [[package]]
 name = "vst3-host"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ec579d54bd13b83c60c1fd8bb756cf234e36ccbfb4833ff756b417e64db7fea"
 dependencies = [
  "core-foundation",
  "crossbeam-queue",

@@ -44,6 +44,7 @@ export interface IAudioEngine {
   setBusVolume(busId: string, gainDb: number): void
   setMasterVolume(gainDb: number): void
   setEffectParam(effectId: string, paramId: string, value: number): void
+  setEffectBypass(effectId: string, bypassed: boolean): void
   /** Measured EQ magnitude response, or null when the engine cannot supply one. */
   getEqResponse(effectId: string, points: number): Promise<EqFrequencyResponse | null>
   setInstrumentParam(trackId: string, paramId: string, value: number): void
@@ -66,7 +67,14 @@ export interface IAudioEngine {
   connectMidiInput(portId: string, trackId: string): Promise<void>
   disconnectMidiInput(portId: string): Promise<void>
   getStreamStatus(): StreamStatus
-  scanPlugins(): Promise<PluginDescriptor[]>
+  cachedPlugins(): Promise<PluginDescriptor[]>
+  scanPlugins(force?: boolean): Promise<PluginDescriptor[]>
+  inspectPlugin(plugin: PluginDescriptor): Promise<PluginDescriptor>
+  openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void>
+  closePluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void>
+  isPluginEditorOpen(targetKind: 'effect' | 'instrument', targetId: string): Promise<boolean>
+  savePluginState(targetKind: 'effect' | 'instrument', targetId: string): Promise<number[]>
+  loadPluginState(targetKind: 'effect' | 'instrument', targetId: string, state: number[]): Promise<void>
   renderOffline(req: OfflineRenderRequest): Promise<OfflineRenderResult>
   capabilities(): EngineCapabilities
 }

@@ -1,0 +1,16 @@
+include!("eq.rs");
+include!("compressor.rs");
+include!("multiband.rs");
+include!("utility.rs");
+include!("delay.rs");
+include!("reverb.rs");
+include!("waveshaper.rs");
+include!("distortion.rs");
+include!("disperser.rs");
+include!("limiter.rs");
+include!("vocoder.rs");
+include!("tremolo.rs");
+include!("clipper.rs");
+include!("upward.rs");
+include!("roboter.rs");
+include!("colorizer.rs");

@@ -3,6 +3,14 @@ import { secondsPerBar, secondsPerBeat, type TimeSignature } from '../engine'
 
 export type RulerTick = { sec: number; label: string | null; strong: boolean }
 
+/** Coarsen only the painted subdivision; editing continues to use the exact snap value. */
+export function adaptiveGridStepSec(baseStepSec: number, pixelsPerSecond: number, minimumPixels = 8): number {
+  if (!(baseStepSec > 0) || !(pixelsPerSecond > 0)) return 0
+  let step = baseStepSec
+  while (step * pixelsPerSecond < minimumPixels) step *= 2
+  return step
+}
+
 /** Minimum on-screen spacing before beat ticks collapse back to bar ticks. */
 const MIN_BEAT_SPACING_PX = 18
 /** Minimum on-screen spacing between two printed labels. */

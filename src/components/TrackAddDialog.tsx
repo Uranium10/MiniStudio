@@ -2,7 +2,7 @@ import { AudioLines, LoaderCircle, Piano, Plus, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import type { ExternalPluginRef, PluginDescriptor } from '../engine'
 import { useEngine } from '../hooks/useEngine'
-import { scanPluginsOnce } from '../plugins/scan'
+import { hydratePlugin, scanPluginsOnce } from '../plugins/scan'
 import { useProjectStore } from '../store/projectStore'
 
 type TrackChoice = 'audio' | 'instrument'
@@ -58,7 +58,7 @@ export function TrackAddDialog({ open, onClose }: { open: boolean; onClose(): vo
         <label className="track-instrument-search"><Search size={13} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="악기 검색" /></label>
         <div className="track-instrument-list">
           <button className={!selected ? 'selected' : ''} onClick={() => setSelected(undefined)} onDoubleClick={() => addInstrument(undefined)}><Piano size={16} /><span><strong>DefaultSynth</strong><small>BUILT-IN · POLY SYNTH</small></span><b>{!selected ? '선택됨' : ''}</b></button>
-          {visible.map((plugin) => { const ref = pluginRef(plugin); const active = selected?.format === ref.format && selected.uid === ref.uid && selected.path === ref.path; return <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} className={active ? 'selected' : ''} onClick={() => setSelected(ref)} onDoubleClick={() => addInstrument(ref)}><Piano size={16} /><span><strong>{plugin.name}</strong><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category || 'Unknown'}</small></span><b>{active ? '선택됨' : ''}</b></button> })}
+          {visible.map((plugin) => { const ref = pluginRef(plugin); const active = selected?.format === ref.format && selected.uid === ref.uid && selected.path === ref.path; return <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} className={active ? 'selected' : ''} onClick={() => { setSelected(ref); void hydratePlugin(engine, plugin) }} onDoubleClick={() => { void hydratePlugin(engine, plugin); addInstrument(ref) }}><Piano size={16} /><span><strong>{plugin.name}</strong><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category || 'Unknown'}</small></span><b>{active ? '선택됨' : ''}</b></button> })}
           {loading && <div className="track-add-state"><LoaderCircle className="spin" size={18} /> 플러그인 검색 중…</div>}
           {!loading && error && <div className="track-add-state error">플러그인 검색 실패 · {error}</div>}
           {!loading && !error && !visible.length && query && <div className="track-add-state">검색 결과가 없습니다.</div>}
@@ -70,5 +70,5 @@ export function TrackAddDialog({ open, onClose }: { open: boolean; onClose(): vo
 }
 
 function pluginRef(plugin: PluginDescriptor): ExternalPluginRef {
-  return { format: plugin.format, uid: plugin.uid, name: plugin.name, vendor: plugin.vendor, path: plugin.path, audioInputBuses: plugin.audioInputBuses, audioOutputBuses: plugin.audioOutputBuses, supportsSidechain: plugin.supportsSidechain, paramCount: plugin.paramCount, parameters: plugin.parameters }
+  return { format: plugin.format, uid: plugin.uid, name: plugin.name, vendor: plugin.vendor, path: plugin.path, audioInputBuses: plugin.audioInputBuses, audioOutputBuses: plugin.audioOutputBuses, supportsSidechain: plugin.supportsSidechain, hasEditor: plugin.hasEditor, paramCount: plugin.paramCount, parameters: plugin.parameters }
 }

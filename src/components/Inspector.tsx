@@ -1,12 +1,13 @@
 // Selected-track inspector modeled after Studio One's left channel pane.
 import { ChevronDown, CirclePower, Plus, Radio, SlidersHorizontal, Trash2 } from 'lucide-react'
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { EffectInstance, EffectType } from '../engine'
 import { COLORIZER_NAME } from '../effects/builtinEffects'
 import { useEngine } from '../hooks/useEngine'
 import { useProjectStore } from '../store/projectStore'
 import { EditableNumber } from './controls'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
+import { subscribeBrowserDrag } from './browserPayload'
 
 export function Inspector() {
   const selectedId = useProjectStore((state) => state.selectedTrackId)
@@ -23,10 +24,22 @@ export function Inspector() {
   const engine = useEngine()
   const [effectPicker, setEffectPicker] = useState(false)
   const [effectMenu, setEffectMenu] = useState<{ x: number; y: number; effect: EffectInstance } | null>(null)
+  const [insertDropActive, setInsertDropActive] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const nameRef = useRef<HTMLInputElement>(null)
   const effectPickerButtonRef = useRef<HTMLButtonElement>(null)
+  const insertListRef = useRef<HTMLDivElement>(null)
   const getEffectPickerAnchor = useCallback(() => effectPickerButtonRef.current, [])
+  useEffect(() => subscribeBrowserDrag((state) => {
+    if (!track || state.payload.kind !== 'effect') return
+    const inside = state.type !== 'cancel' && !!insertListRef.current?.contains(document.elementFromPoint(state.x, state.y))
+    setInsertDropActive(inside)
+    if (state.type === 'drop' && inside) {
+      addEffect(track.id, state.payload.type, state.payload.plugin)
+      useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id })
+      setLowerTab('effects')
+    }
+  }), [addEffect, setLowerTab, track])
   const effectMenuItems: MenuItem[] = effectMenu && track ? [
     { kind: 'item', label: '이펙트 체인에서 열기', run: () => useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id }) },
     { kind: 'item', label: effectMenu.effect.bypassed ? '바이패스 해제' : '바이패스', checked: effectMenu.effect.bypassed, run: () => toggleEffect(track.id, effectMenu.effect.id) },
@@ -53,7 +66,7 @@ export function Inspector() {
         </div>
       </Section>
       <Section title="인서트">
-        <div className="inspector-list">
+        <div ref={insertListRef} className={`inspector-list ${insertDropActive ? 'insert-drop-active' : ''}`}>
           {track.effects.map((effect) => <button key={effect.id} onClick={() => useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id })} onContextMenu={(event) => { event.preventDefault(); setEffectMenu({ x: event.clientX, y: event.clientY, effect }) }}><CirclePower size={12} className={effect.bypassed ? 'off' : ''} /><span>{effect.plugin?.name ?? effectName(effect.type)}</span><ChevronDown size={12} /></button>)}
           <button ref={effectPickerButtonRef} className="add-row" aria-haspopup="dialog" aria-expanded={effectPicker} onClick={() => setEffectPicker(!effectPicker)}><Plus size={12} />이펙트 추가</button>
           {effectPicker && <FloatingPanel getAnchorElement={getEffectPickerAnchor} onClose={() => setEffectPicker(false)} className="inspector-effect-picker">{EFFECTS.map((effect) => <button key={effect.type} onClick={() => { addEffect(track.id, effect.type); setEffectPicker(false); setLowerTab('effects') }}><strong>{effect.name}</strong><small>{effect.description}</small></button>)}</FloatingPanel>}

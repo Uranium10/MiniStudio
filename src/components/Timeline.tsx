@@ -8,9 +8,9 @@ import { automationOptionsForTrack, clipSourceStep, snapSeconds, useProjectStore
 import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { SignalBar } from './controls'
-import { buildRulerTicks } from './rulerMath'
+import { adaptiveGridStepSec, buildRulerTicks } from './rulerMath'
 import { beginPointerReorder } from './pointerReorder'
-import { BROWSER_DRAG_TYPE, readBrowserDrag } from './browserPayload'
+import { subscribeBrowserDrag } from './browserPayload'
 import { CLIP_GAIN_CURVE_MID_DB, clipFadeAt, createForwardClipGainSampler, dbToLinearFast, prepareClipGainNodes, sampleClipGainDb, type ClipGainNode } from './clipEnvelopeMath'
 
 const HEADER_WIDTH = 188
@@ -34,6 +34,7 @@ type Gesture = {
 type ClipEnvelopeHit = { kind: 'gain-base' | 'gain-point' | 'gain-curve' | 'fade-in-curve' | 'fade-out-curve'; clip: Clip; pointId?: string }
 
 type AudioDropPreview = { startSec: number; left: number; top: number; height: number; targetTrackId?: string; insertIndex?: number; lineTop?: number; name: string }
+type InstrumentDropPreview = { name: string; targetTrackId?: string; insertIndex?: number; top?: number; height?: number; lineTop?: number; invalid?: boolean }
 
 export function Timeline() {
   const engine = useEngine()
@@ -42,13 +43,13 @@ export function Timeline() {
   const trackHeight = useProjectStore((state) => state.trackHeight)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
-  const addTrack = useProjectStore((state) => state.addTrack)
-  const addInstrumentTrack = useProjectStore((state) => state.addInstrumentTrack)
   const focused = useProjectStore((state) => state.editFocus === 'arrangement')
   const setEditFocus = useProjectStore((state) => state.setEditFocus)
   const selectTrack = useProjectStore((state) => state.selectTrack)
   const [browserDragOver, setBrowserDragOver] = useState(false)
   const [audioDropPreview, setAudioDropPreview] = useState<AudioDropPreview | null>(null)
+  const [instrumentDropPreview, setInstrumentDropPreview] = useState<InstrumentDropPreview | null>(null)
+  const [arrangementMenu, setArrangementMenu] = useState<{ x: number; y: number } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const maxEnd = Math.max(180, ...tracks.flatMap((track) => [...track.clips, ...track.midiClips].map((clip) => clip.startSec + clip.durationSec + 12)))
   const timelineWidth = Math.ceil(maxEnd * pixelsPerSecond)
@@ -77,47 +78,80 @@ export function Timeline() {
     return () => window.removeEventListener('minidaw-native-audio-drag', handleNativeDrag)
   }, [engine, gridTicks, pixelsPerSecond, tracks])
 
-  const onBrowserDrop = (event: ReactDragEvent<HTMLElement>) => {
-    const payload = readBrowserDrag(event.dataTransfer)
-    setBrowserDragOver(false)
-    setAudioDropPreview(null)
-    if (!payload) return
-    event.preventDefault()
+  useEffect(() => subscribeBrowserDrag((state) => {
+    const hit = document.elementFromPoint(state.x, state.y)
+    const inArrangement = state.type !== 'cancel' && hit?.closest('.arrangement')
+    if (!inArrangement) { setBrowserDragOver(false); setAudioDropPreview(null); setInstrumentDropPreview(null); return }
     const store = useProjectStore.getState()
-    if (payload.kind === 'instrument') {
-      const trackId = store.addInstrumentTrack(payload.plugin)
+    const target = hit as Element
+
+    if (state.payload.kind === 'media') {
+      const media = state.payload
+      const placement = resolveAudioDrop({ clientX: state.x, clientY: state.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, media.name)
+      setInstrumentDropPreview(null)
+      setAudioDropPreview(placement)
+      setBrowserDragOver(true)
+      if (state.type !== 'drop') return
+      setBrowserDragOver(false)
+      setAudioDropPreview(null)
+      void engine.loadAudioFile(media.path).then((asset) => store.insertAudioAsset(asset, placement.startSec, placement.targetTrackId, placement.insertIndex)).catch((error) => store.showToast(`${media.name}을 불러오지 못했습니다: ${String(error)}`))
+      return
+    }
+
+    if (state.payload.kind === 'instrument') {
+      const instrument = state.payload
+      const placement = resolveInstrumentDrop({ clientY: state.y, target }, tracks, scrollRef.current, instrument.plugin?.name ?? 'DefaultSynth')
+      setAudioDropPreview(null)
+      setInstrumentDropPreview(placement)
+      setBrowserDragOver(true)
+      if (state.type !== 'drop') return
+      setBrowserDragOver(false)
+      setInstrumentDropPreview(null)
+      if (placement.invalid) { store.showToast('오디오 트랙에는 악기를 넣을 수 없습니다. 트랙 사이 또는 인스트루먼트 트랙에 놓아주세요.'); return }
+      if (placement.targetTrackId) {
+        store.replaceTrackInstrument(placement.targetTrackId, instrument.plugin)
+        store.selectTrack(placement.targetTrackId)
+        store.setRackTarget({ kind: 'track', id: placement.targetTrackId })
+        store.showToast(`${instrument.plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
+        return
+      }
+      const trackId = store.addInstrumentTrack(instrument.plugin, placement.insertIndex)
       store.setRackTarget({ kind: 'track', id: trackId })
-      store.showToast(`${payload.plugin?.name ?? 'DefaultSynth'} 트랙을 추가했습니다.`)
+      store.showToast(`${instrument.plugin?.name ?? 'DefaultSynth'} 트랙을 추가했습니다.`)
       return
     }
-    if (payload.kind === 'media') {
-      const placement = audioDropPreview ?? resolveAudioDrop(event, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, payload.name)
-      void engine.loadAudioFile(payload.path).then((asset) => store.insertAudioAsset(asset, placement.startSec, placement.targetTrackId, placement.insertIndex)).catch((error) => store.showToast(`${payload.name}을 불러오지 못했습니다: ${String(error)}`))
-      return
-    }
-    const element = event.target instanceof Element ? event.target : null
-    const targetId = element?.closest<HTMLElement>('[data-track-id]')?.dataset.trackId ?? store.selectedTrackId
+
+    // Effects have no arrangement-space preview of their own; they land on whichever
+    // track lane is under the pointer, same as before.
+    setBrowserDragOver(true)
+    if (state.type !== 'drop') return
+    setBrowserDragOver(false)
+    const effect = state.payload
+    const targetId = target.closest<HTMLElement>('[data-track-id]')?.dataset.trackId ?? store.selectedTrackId
     if (!targetId) { store.showToast('이펙트를 놓을 트랙을 먼저 선택하세요.'); return }
     store.selectTrack(targetId)
-    store.addEffect(targetId, payload.type, payload.plugin)
+    store.addEffect(targetId, effect.type, effect.plugin)
     store.setRackTarget({ kind: 'track', id: targetId })
-  }
+  }), [engine, gridTicks, pixelsPerSecond, tracks])
 
   return (
     <section
       className={`arrangement ${focused ? 'edit-focused' : ''} ${browserDragOver ? 'browser-drop-active' : ''}`}
       aria-label="Arrangement timeline"
       onPointerDownCapture={(event) => { setEditFocus('arrangement'); if (event.target instanceof Element && !event.target.closest('.track-stack')) selectTrack(null) }}
-      onDragEnter={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) setBrowserDragOver(true) }}
-      onDragOver={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; const payload = readBrowserDrag(event.dataTransfer); if (payload?.kind === 'media') setAudioDropPreview(resolveAudioDrop(event, tracks, scrollRef.current, pixelsPerSecond, gridTicks, useProjectStore.getState().project.transport.bpm, payload.name)) } }}
-      onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) { setBrowserDragOver(false); setAudioDropPreview(null) } }}
-      onDrop={onBrowserDrop}
+      onContextMenu={(event) => {
+        const target = event.target instanceof Element ? event.target : null
+        if (target?.closest('.track-stack,.ruler,.loop-lane,.menu-panel')) return
+        event.preventDefault()
+        setArrangementMenu({ x: event.clientX, y: event.clientY })
+      }}
     >
+      {arrangementMenu && <MenuPanel anchor={arrangementMenu} onClose={() => setArrangementMenu(null)} items={[{ kind: 'item', label: '트랙 추가…', run: () => window.dispatchEvent(new Event('ministudio:open-track-add-dialog')) }]} />}
       <div className="arrangement-topline"><span>ARRANGEMENT</span><div><span className="legend-grid" />그리드 {gridLabel(gridTicks)}{snapEnabled ? '' : ' (스냅 꺼짐)'} <span className="legend-loop" />Ctrl+룰러: 루프 시작 · Alt+룰러: 루프 끝 · Ctrl+휠 줌</div></div>
       <div className="timeline-scroll" ref={scrollRef}>
         <div className="timeline-content" style={{ width: HEADER_WIDTH + timelineWidth }}>
           <div className="ruler-row">
-            <div className="track-list-heading"><span>트랙</span><button onClick={addTrack} title="오디오 트랙 추가"><Plus size={14} /></button><button onClick={() => addInstrumentTrack()} title="인스트루먼트 트랙 추가"><Piano size={13} /></button></div>
+            <div className="track-list-heading"><span>트랙</span><button title="트랙 추가" onClick={() => window.dispatchEvent(new Event('ministudio:open-track-add-dialog'))}><Plus size={14} /></button></div>
             <Ruler width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />
           </div>
           <LoopStrip width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />
@@ -130,8 +164,8 @@ export function Timeline() {
             {track.automationOpen && <AutomationSection track={track} width={timelineWidth} pixelsPerSecond={pixelsPerSecond} />}
           </div>})}
           {audioDropPreview && <><div className="audio-drop-preview" style={{ left: audioDropPreview.left, top: audioDropPreview.top, width: 128, height: audioDropPreview.height }}><span>{audioDropPreview.name}</span></div>{audioDropPreview.lineTop !== undefined && <div className="audio-drop-insert-line" style={{ top: audioDropPreview.lineTop }} />}</>}
+          {instrumentDropPreview && <><div className={`instrument-drop-preview ${instrumentDropPreview.invalid ? 'invalid' : ''} ${instrumentDropPreview.targetTrackId ? 'replace' : ''}`} style={{ left: HEADER_WIDTH, top: instrumentDropPreview.top, width: Math.max(120, Math.min(260, timelineWidth)), height: instrumentDropPreview.height }}><Piano size={13} /><span>{instrumentDropPreview.invalid ? '오디오 트랙에는 삽입할 수 없음' : instrumentDropPreview.targetTrackId ? `${instrumentDropPreview.name}로 악기 교체` : `${instrumentDropPreview.name} 트랙 추가`}</span></div>{instrumentDropPreview.lineTop !== undefined && <div className="instrument-drop-insert-line" style={{ top: instrumentDropPreview.lineTop }} />}</>}
           <Playhead pixelsPerSecond={pixelsPerSecond} />
-          <button className="add-track-row" onClick={addTrack}><Plus size={14} /> 오디오 트랙 추가 · 상단 건반 버튼으로 인스트루먼트 추가</button>
         </div>
       </div>
     </section>
@@ -159,6 +193,29 @@ function resolveAudioDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientX' | '
   }
   const bottom = contentRect ? Math.max(64, event.clientY - contentRect.top - 20) : 64
   return { startSec, left, top: bottom, height: 54, insertIndex: tracks.length, lineTop: bottom, name }
+}
+
+function resolveInstrumentDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientY' | 'target'>, tracks: Track[], scroll: HTMLDivElement | null, name: string): InstrumentDropPreview {
+  const content = scroll?.querySelector<HTMLElement>('.timeline-content')
+  const contentRect = content?.getBoundingClientRect()
+  const element = event.target instanceof Element ? event.target : null
+  const stack = element?.closest<HTMLElement>('.track-stack')
+  if (stack && contentRect) {
+    const rect = stack.getBoundingClientRect()
+    const index = tracks.findIndex((track) => track.id === stack.dataset.trackId)
+    if (index >= 0) {
+      const edge = Math.min(11, rect.height * .2)
+      if (event.clientY <= rect.top + edge) return { name, insertIndex: index, lineTop: rect.top - contentRect.top }
+      if (event.clientY >= rect.bottom - edge) return { name, insertIndex: index + 1, lineTop: rect.bottom - contentRect.top }
+      const track = tracks[index]!
+      return { name, targetTrackId: track.kind === 'instrument' ? track.id : undefined, top: rect.top - contentRect.top, height: rect.height, invalid: track.kind !== 'instrument' }
+    }
+  }
+  const stacks = [...(content?.querySelectorAll<HTMLElement>('.track-stack') ?? [])]
+  const first = stacks[0]?.getBoundingClientRect()
+  const last = stacks.at(-1)?.getBoundingClientRect()
+  if (contentRect && first && event.clientY < first.top) return { name, insertIndex: 0, lineTop: first.top - contentRect.top }
+  return { name, insertIndex: tracks.length, lineTop: contentRect && last ? last.bottom - contentRect.top : 48 }
 }
 
 /** One scroll listener for the arrangement; vertical-only motion does no canvas work. */
@@ -250,10 +307,20 @@ function LoopStrip({ width, pixelsPerSecond }: { width: number; pixelsPerSecond:
     event.stopPropagation()
     const lane = event.currentTarget.closest('.loop-lane') as HTMLElement | null
     if (!lane) return
-    lane.setPointerCapture(event.pointerId)
     const laneLeft = lane.getBoundingClientRect().left
     const originSec = Math.max(0, (event.clientX - laneLeft) / pixelsPerSecond)
     const { startSec, endSec } = loop
+    const step = snapSeconds(gridTicks, bpm)
+    const pointedSec = snap(originSec, event.shiftKey)
+    if (event.ctrlKey || event.metaKey || useToolStore.getState().isModifierHeld) {
+      setLoopRange(pointedSec, Math.max(endSec, pointedSec + step))
+      return
+    }
+    if (event.altKey) {
+      setLoopRange(Math.min(startSec, Math.max(0, pointedSec - step)), pointedSec)
+      return
+    }
+    lane.setPointerCapture(event.pointerId)
     const move = (pointer: PointerEvent) => {
       const sec = Math.max(0, (pointer.clientX - laneLeft) / pixelsPerSecond)
       if (mode === 'start') setLoopRange(snap(sec, pointer.shiftKey), endSec)
@@ -300,7 +367,7 @@ function Ruler({ width, pixelsPerSecond }: { width: number; pixelsPerSecond: num
     const rawSec = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left) / pixelsPerSecond)
     const step = snapSeconds(gridTicks, bpm)
     const sec = Math.round(rawSec / step) * step
-    if (event.ctrlKey || event.metaKey) { event.preventDefault(); useProjectStore.getState().setLoopRange(sec, Math.max(loop.endSec, sec + step)); return }
+    if (event.ctrlKey || event.metaKey || useToolStore.getState().isModifierHeld) { event.preventDefault(); event.stopPropagation(); useProjectStore.getState().setLoopRange(sec, Math.max(loop.endSec, sec + step)); return }
     if (event.altKey) { event.preventDefault(); useProjectStore.getState().setLoopRange(Math.min(loop.startSec, Math.max(0, sec - step)), sec); return }
     seekTo(engine, rawSec)
   }
@@ -366,13 +433,13 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
       <span className="drag-handle" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '.track-header[data-track-index]', indexAttribute: 'data-track-index', axis: 'vertical', scrollSelector: '.timeline-scroll', onCommit: reorder })} title="드래그하여 트랙 순서 변경"><GripVertical size={13} /></span>
       <div className="track-header-main">
         <div className="track-number">{String(index + 1).padStart(2, '0')}</div>
-        <input ref={nameRef} value={renaming ? nameDraft : track.name} readOnly={!renaming} aria-label={`${track.name} 트랙 이름`} onChange={(event) => setNameDraft(event.target.value)} onDoubleClick={(event) => { event.stopPropagation(); beginRename() }} onBlur={finishRename} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); else if (event.key === 'Escape') { setNameDraft(track.name); setRenaming(false); event.currentTarget.blur() } }} onClick={(event) => event.stopPropagation()} />
+        <input ref={nameRef} value={renaming ? nameDraft : track.name} readOnly={!renaming} aria-label={`${track.name} 트랙 이름`} onChange={(event) => setNameDraft(event.target.value)} onDoubleClick={(event) => { event.stopPropagation(); selectTrack(track.id); beginRename() }} onBlur={finishRename} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); else if (event.key === 'Escape') { setNameDraft(track.name); setRenaming(false); event.currentTarget.blur() } }} onClick={(event) => { event.stopPropagation(); selectTrack(track.id, event.shiftKey) }} />
         <button title="트랙 메뉴" aria-haspopup="menu" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); setMenu({ x: rect.left, y: rect.bottom + 2 }) }}><MoreHorizontal size={13} /></button>
         {menu && <MenuPanel items={menuItems()} anchor={menu} onClose={() => setMenu(null)} />}
       </div>
       <div className="track-header-controls">
         <button className={`automation-toggle ${track.automationOpen ? 'active' : ''}`} title="오토메이션 레인 토글" onClick={(event) => { event.stopPropagation(); const store = useProjectStore.getState(); if (!track.automationOpen && !(track.automationLanes?.length)) { const volume = automationOptionsForTrack(track).find((option) => option.parameterId === 'volumeDb'); if (volume) store.addAutomationLane(track.id, volume) } setAutomationOpen(track.id, !track.automationOpen) }}><ChevronDown size={10} /></button>
-        {track.kind === 'instrument' && <button className="instrument-button" title={`${track.instrument?.type ?? 'VST / Instrument'} 설정 열기`} onClick={(event) => { event.stopPropagation(); selectTrack(track.id); useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id }) }}><Piano size={11} /></button>}
+        {track.kind === 'instrument' && <button className="instrument-button" title={`${track.instrument?.type ?? 'VST / Instrument'} 악기 창 열기`} onClick={(event) => { event.stopPropagation(); selectTrack(track.id); const store = useProjectStore.getState(); store.setRackTarget({ kind: 'track', id: track.id }); if (track.instrument?.plugin && track.instrument.plugin.hasEditor !== false) void engine.openPluginEditor('instrument', track.id).catch((error) => store.showToast(`${track.instrument!.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`)) }}><Piano size={11} /></button>}
         <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
         <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
         <button className={track.armed ? 'active arm' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { armed: !track.armed }) }}><Radio size={10} /></button>
@@ -411,12 +478,15 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
   const lanes = useMemo(() => track.automationLanes ?? [], [track.automationLanes])
   const addLane = useProjectStore((state) => state.addAutomationLane)
   const removeLane = useProjectStore((state) => state.removeAutomationLane)
+  const replaceLane = useProjectStore((state) => state.replaceAutomationLane)
+  const setLaneMode = useProjectStore((state) => state.setAutomationLaneMode)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [query, setQuery] = useState('')
   const addButton = useRef<HTMLButtonElement>(null)
   const getAnchor = useCallback(() => addButton.current, [])
   const existing = useMemo(() => new Set(lanes.map((lane) => `${lane.targetKind}:${lane.targetId}:${lane.parameterId}`)), [lanes])
-  const options = useMemo(() => automationOptionsForTrack(track).filter((option) => !existing.has(`${option.targetKind}:${option.targetId}:${option.parameterId}`) && `${option.category} ${option.label}`.toLowerCase().includes(query.toLowerCase())), [existing, query, track])
+  const allOptions = useMemo(() => automationOptionsForTrack(track), [track])
+  const options = useMemo(() => allOptions.filter((option) => !existing.has(`${option.targetKind}:${option.targetId}:${option.parameterId}`) && `${option.category} ${option.label}`.toLowerCase().includes(query.toLowerCase())), [allOptions, existing, query])
   const categories = useMemo(() => options.reduce((groups, option) => {
     const items = groups.get(option.category) ?? []
     items.push(option)
@@ -428,8 +498,9 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
     {lanes.map((lane, index) => { const laneHeight = lane.height ?? AUTOMATION_HEIGHT; return <div className="automation-row" key={lane.id} style={{ height: laneHeight }}>
       <div className="automation-lane-header">
         <span className="automation-color" style={{ background: track.color }} />
-        <div><small>{lane.category}</small><strong>{lane.label}</strong></div>
+        <label className="automation-lane-title" title="클릭하여 자동화 파라미터 변경"><small>{lane.category}</small><select value={`${lane.targetKind}:${lane.targetId}:${lane.parameterId}`} onChange={(event) => { const option = allOptions.find((candidate) => `${candidate.targetKind}:${candidate.targetId}:${candidate.parameterId}` === event.target.value); if (option) replaceLane(track.id, lane.id, option) }}>{allOptions.map((option) => <option key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} value={`${option.targetKind}:${option.targetId}:${option.parameterId}`}>{option.category} · {option.label}</option>)}</select></label>
         {index === 0 && <button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button>}
+        <div className="automation-mode-grid" role="group" aria-label="오토메이션 모드">{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${(lane.mode ?? 'read') === mode ? 'active' : ''}`} title={{ off: '끄기', write: '쓰기', read: '읽기', latch: '래치' }[mode]} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => setLaneMode(track.id, lane.id, mode)} />)}</div>
         <button className="automation-remove" title="오토메이션 레인 제거" onClick={() => removeLane(track.id, lane.id)}><span>×</span></button>
       </div>
       <AutomationCurve trackId={track.id} lane={lane} width={width} height={laneHeight} pixelsPerSecond={pixelsPerSecond} />
@@ -574,6 +645,18 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   useEffect(() => {
     requestDraw()
   }, [track, assets, selectedClipIds, selectedClipGainPoint, pixelsPerSecond, bpm, signature, gridTicks, width, height, scrollRef, requestDraw])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    // The workspace grid can settle after the lane's first React commit. Keep
+    // the backing bitmap synchronized with its real CSS box so startup never
+    // leaves clips invisible until a scroll or zoom happens.
+    const observer = new ResizeObserver(requestDraw)
+    observer.observe(canvas)
+    requestDraw()
+    return () => observer.disconnect()
+  }, [requestDraw])
 
   useEffect(() => {
     horizontalCanvasDraws.add(requestDraw)
@@ -831,6 +914,10 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   return (
     <div className="track-lane" data-track-id={track.id} style={{ width, height }}>
       <canvas ref={canvasRef} width={Math.min(width, MAX_CANVAS_WIDTH)} height={height} style={{ width, height, cursor }} onDoubleClick={onCanvasDoubleClick} onContextMenu={onCanvasContextMenu} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} />
+      <div className="arrangement-clip-layer" aria-hidden="true">
+        {track.clips.map((clip) => <span key={clip.id} className={`arrangement-clip-dom audio ${clip.muted ? 'muted' : ''} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': track.color } as React.CSSProperties}><b>{clip.name ?? assets[clip.assetId]?.name ?? 'Audio clip'}</b></span>)}
+        {track.midiClips.map((clip) => <span key={clip.id} className={`arrangement-clip-dom midi ${clip.muted ? 'muted' : ''} ${selectedClipIds.includes(clip.id) ? 'selected' : ''}`} style={{ left: clip.startSec * pixelsPerSecond, width: Math.max(3, clip.durationSec * pixelsPerSecond), '--clip-color': clip.color ?? track.color } as React.CSSProperties}><b>{clip.name}</b><i>{clip.notes.slice(0, 96).map((note) => <em key={note.id} style={{ left: `${note.startTicks / Math.max(1, clip.loopLengthTicks) * 100}%`, width: `${Math.max(.4, note.lengthTicks / Math.max(1, clip.loopLengthTicks) * 100)}%`, top: `${10 + (127 - note.pitch) / 127 * 70}%` }} />)}</i></span>)}
+      </div>
       {overlay && <div className={`gesture-overlay ${overlay.kind}`} style={{ left: Math.min(overlay.start, overlay.end), width: Math.abs(overlay.end - overlay.start) }} />}
       {track.armed && <span className="input-monitor"><Headphones size={10} /> IN</span>}
       {contextMenu && <MenuPanel items={contextItems} anchor={{ x: contextMenu.x, y: contextMenu.y }} onClose={() => setContextMenu(null)} />}
@@ -890,7 +977,7 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
   context.fillRect(visibleStart, 0, visibleEnd - visibleStart, height)
   // Grid lines follow the shared musical grid, with bar lines drawn brightest.
   const barWidth = secondsPerBar(bpm, signature) * pps
-  const gridStep = Math.max(3, gridTicks / 960 * secondsPerBeat(bpm) * pps)
+  const gridStep = adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pps) * pps
   for (let x = Math.floor(visibleStart / gridStep) * gridStep; x < visibleEnd; x += gridStep) {
     const onBar = barWidth > 0 && Math.abs(x / barWidth - Math.round(x / barWidth)) < 1e-6
     context.fillStyle = onBar ? '#3a4552' : '#232b35'

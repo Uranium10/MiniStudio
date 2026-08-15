@@ -7,19 +7,37 @@ type StoredProject = Omit<ProjectState, 'assets'> & {
   assets: Record<string, Omit<ProjectState['assets'][string], 'peaks'> & { peaks: number[] }>
 }
 
-function toStoredProject(project: ProjectState): StoredProject {
+export function toStoredProject(project: ProjectState): StoredProject {
+  const portable = structuredClone(project)
+  // Installation locations belong to the per-user scan cache, never to a portable project.
+  for (const track of portable.tracks) {
+    if (track.instrument?.plugin) track.instrument.plugin.path = ''
+    for (const effect of track.effects) if (effect.plugin) effect.plugin.path = ''
+  }
+  for (const bus of portable.buses) for (const effect of bus.effects) if (effect.plugin) effect.plugin.path = ''
+  for (const effect of portable.master.effects) if (effect.plugin) effect.plugin.path = ''
   return {
-    ...project,
-    assets: Object.fromEntries(Object.entries(project.assets).map(([id, asset]) => [id, { ...asset, peaks: Array.from(asset.peaks) }])),
+    ...portable,
+    assets: Object.fromEntries(Object.entries(portable.assets).map(([id, asset]) => [id, { ...asset, peaks: Array.from(asset.peaks) }])),
   }
 }
 
-function fromStoredProject(stored: StoredProject): ProjectState {
+export function fromStoredProject(stored: StoredProject): ProjectState {
   const project = {
     ...stored,
     assets: Object.fromEntries(Object.entries(stored.assets).map(([id, asset]) => [id, { ...asset, peaks: new Float32Array(asset.peaks) }])),
   } as ProjectState
   return migrateProject(project)
+}
+
+export function serializeProject(project: ProjectState): string {
+  return JSON.stringify(toStoredProject(project))
+}
+
+export function deserializeProject(json: string): ProjectState {
+  const value: unknown = JSON.parse(json)
+  if (!isStoredProject(value)) throw new Error('올바른 MiniDAW 프로젝트가 아닙니다.')
+  return fromStoredProject(value)
 }
 
 export function migrateProject(source: ProjectState | (Omit<ProjectState, 'formatVersion'> & { formatVersion?: number })): ProjectState {

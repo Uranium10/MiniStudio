@@ -1,14 +1,14 @@
 // Resizable Ableton-inspired mixer, device rack, and phase-two plug-in pane.
-import { ChevronDown, CirclePower, Copy, GripVertical, Layers3, Plus, Power, Trash2, X } from 'lucide-react'
+import { ChevronDown, CirclePower, Copy, GripVertical, Layers3, Minus, Piano, Plus, Power, Trash2, X } from 'lucide-react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Bus, EffectInstance, EffectType, ExternalPluginRef, PluginDescriptor, Track } from '../engine'
-import { effectiveMasterGainDb, MUTE_GAIN_DB } from '../engine'
+import { describeEngineError, effectiveMasterGainDb, MUTE_GAIN_DB } from '../engine'
 import { COLORIZER_NAME } from '../effects/builtinEffects'
 import { useEngine } from '../hooks/useEngine'
-import { scanPluginsOnce } from '../plugins/scan'
-import { useProjectStore, type LowerTab, type RackTarget } from '../store/projectStore'
-import { EditableNumber, Knob, LevelMeter, subscribeMeterFrame } from './controls'
-import { BROWSER_DRAG_TYPE, readBrowserDrag } from './browserPayload'
+import { hydratePlugin, scanPluginsOnce } from '../plugins/scan'
+import { automationOptionsForTrack, useProjectStore, type LowerTab, type RackTarget } from '../store/projectStore'
+import { EditableNumber, Knob, LevelMeter, ParameterAutomationProvider, subscribeAnalyzerFrame, subscribeMeterFrame } from './controls'
+import { subscribeBrowserDrag } from './browserPayload'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { beginPointerReorder } from './pointerReorder'
 import { displayFrequencyAtX, FREQUENCY_TICKS, frequencyToX, parameterFrequencyAtX, spectrumFrequencyAtIndex } from './frequencyScale'
@@ -109,7 +109,7 @@ function TrackStripView({ track, index }: { track: Track; index: number }) {
   return (
     <article className={`channel-strip ${selected ? 'selected' : ''}`} onClick={(event) => selectTrack(track.id, event.shiftKey)} onContextMenu={(event) => { event.preventDefault(); if (!selected) selectTrack(track.id); setMenu({ x: event.clientX, y: event.clientY }) }}>
       <div className="channel-color" style={{ background: track.color }} />
-      <div className="channel-title"><span>{String(index + 1).padStart(2, '0')}</span><input ref={nameRef} value={renaming ? nameDraft : track.name} readOnly={!renaming} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); beginRename() }} onChange={(event) => setNameDraft(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); else if (event.key === 'Escape') { setNameDraft(track.name); setRenaming(false); event.currentTarget.blur() } }} /><button className="channel-fx-button" title="이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); openFx() }}>FX</button></div>
+      <div className="channel-title"><span>{String(index + 1).padStart(2, '0')}</span><input ref={nameRef} value={renaming ? nameDraft : track.name} readOnly={!renaming} onClick={(event) => { event.stopPropagation(); selectTrack(track.id, event.shiftKey) }} onDoubleClick={(event) => { event.stopPropagation(); selectTrack(track.id); beginRename() }} onChange={(event) => setNameDraft(event.target.value)} onBlur={finishRename} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); else if (event.key === 'Escape') { setNameDraft(track.name); setRenaming(false); event.currentTarget.blur() } }} /><button className="channel-fx-button" title="이펙트 체인 열기" onClick={(event) => { event.stopPropagation(); openFx() }}>FX</button></div>
       <div className="channel-buttons">
         <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); focusSingle(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
         <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); focusSingle(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
@@ -191,7 +191,28 @@ function DeviceRack() {
   const removeEffect = useProjectStore((state) => state.removeTargetEffect)
   const toggleBypass = useProjectStore((state) => state.toggleTargetEffect)
   const reorder = useProjectStore((state) => state.reorderTargetEffect)
+  const duplicateEffect = useProjectStore((state) => state.duplicateTargetEffect)
+  const focusedEffectId = useProjectStore((state) => state.focusedEffectId)
+  const clearFocusedEffect = useProjectStore((state) => state.clearFocusedEffect)
   const [menu, setMenu] = useState<{ x: number; y: number; effect: EffectInstance } | null>(null)
+  const [chainDropActive, setChainDropActive] = useState(false)
+  const chainRef = useRef<HTMLDivElement>(null)
+  useEffect(() => subscribeBrowserDrag((state) => {
+    if (state.payload.kind !== 'effect') return
+    const inside = state.type !== 'cancel' && !!chainRef.current?.contains(document.elementFromPoint(state.x, state.y))
+    setChainDropActive(inside)
+    if (state.type === 'drop' && inside) addEffect(target, state.payload.type, state.payload.plugin)
+  }), [addEffect, target])
+  useEffect(() => {
+    if (!focusedEffectId) return
+    const frame = window.requestAnimationFrame(() => {
+      const card = chainRef.current?.querySelector<HTMLElement>(`[data-effect-id="${focusedEffectId}"]`)
+      card?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+      card?.focus({ preventScroll: true })
+    })
+    const clear = window.setTimeout(clearFocusedEffect, 900)
+    return () => { window.cancelAnimationFrame(frame); window.clearTimeout(clear) }
+  }, [clearFocusedEffect, focusedEffectId])
   const effects = target.kind === 'track' ? tracks.find((item) => item.id === target.id)?.effects : target.kind === 'bus' ? buses.find((item) => item.id === target.id)?.effects : master.effects
   const targetTrack = target.kind === 'track' ? tracks.find((item) => item.id === target.id) : undefined
   if (!effects) return <div className="rack-empty">믹서 채널을 선택하면 디바이스 체인이 표시됩니다.</div>
@@ -199,14 +220,14 @@ function DeviceRack() {
   const color = target.kind === 'track' ? tracks.find((item) => item.id === target.id)?.color ?? '#55a7ff' : target.kind === 'bus' ? '#c7954c' : '#5ac8e8'
   const contextItems: MenuItem[] = menu ? [
     { kind: 'item', label: '바이패스', icon: <Power size={13} />, run: () => toggleBypass(target, menu.effect.id) },
-    { kind: 'item', label: '복제', icon: <Copy size={13} />, run: () => addEffect(target, menu.effect.type, menu.effect.plugin) },
+    { kind: 'item', label: '복제', icon: <Copy size={13} />, run: () => duplicateEffect(target, menu.effect.id) },
     { kind: 'separator' },
     { kind: 'item', label: '삭제', icon: <Trash2 size={13} />, danger: true, run: () => target.kind === 'track' ? useProjectStore.getState().removeEffect(target.id, menu.effect.id) : removeEffect(target, menu.effect.id) },
   ] : []
   return (
     <div className="device-rack" onClick={() => setMenu(null)}>
       <div className={`rack-track ${target.kind === 'master' ? 'master-rack-target' : ''}`}><span style={{ background: color }} /><strong>{name}</strong><small>{target.kind === 'master' ? 'Master insert chain' : target.kind === 'bus' ? 'Return bus effects' : 'Audio effects'}</small></div>
-      <div className="device-chain">
+      <div ref={chainRef} className={`device-chain ${chainDropActive ? 'rack-drop-active' : ''}`} onWheel={(event) => { if (!event.deltaX && !event.deltaY) return; event.preventDefault(); event.currentTarget.scrollLeft += Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX }}>
         {targetTrack?.kind === 'instrument' && targetTrack.instrument && <InstrumentCard track={targetTrack} />}
         {effects.map((effect, index) => <DeviceCard key={effect.id} effect={effect} target={target} index={index} onReorder={(from, to) => reorder(target, from, to)} onContextMenu={(event) => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY, effect }) }} />)}
         <AddDevice onAdd={(type, plugin) => addEffect(target, type, plugin)} />
@@ -220,18 +241,46 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
   const [collapsed, setCollapsed] = useState(false)
   const update = useProjectStore((state) => state.updateTargetEffect)
   const toggle = useProjectStore((state) => state.toggleTargetEffect)
+  const remove = useProjectStore((state) => state.removeTargetEffect)
   const showToast = useProjectStore((state) => state.showToast)
+  const addAutomationLane = useProjectStore((state) => state.addAutomationLane)
+  const focused = useProjectStore((state) => state.focusedEffectId === effect.id)
+  const [bypassMenu, setBypassMenu] = useState<{ x: number; y: number } | null>(null)
   const engine = useEngine()
   const setParam = (param: string, value: number) => { update(target, effect.id, { [param]: value }); engine.setEffectParam(effect.id, param, value) }
+  const toggleEffect = () => {
+    const bypassed = !effect.bypassed
+    toggle(target, effect.id)
+    engine.setEffectBypass(effect.id, bypassed)
+  }
+  const addAutomation = useCallback((parameterId: string | undefined, label: string, value: number) => {
+    if (target.kind !== 'track') { showToast('오토메이션 레인은 트랙 이펙트에서 추가할 수 있습니다.'); return }
+    const track = useProjectStore.getState().project.tracks.find((candidate) => candidate.id === target.id)
+    if (!track) return
+    const options = automationOptionsForTrack(track).filter((option) => option.targetKind === 'effect' && option.targetId === effect.id)
+    const normalizedLabel = normalizeParameterLabel(label)
+    const candidates = parameterId
+      ? options.filter((option) => option.parameterId === parameterId)
+      : options.filter((option) => parameterLabelsMatch(normalizedLabel, normalizeParameterLabel(option.label)))
+    const option = candidates.length <= 1 ? candidates[0] : candidates.reduce((closest, candidate) => Math.abs(candidate.defaultValue - value) < Math.abs(closest.defaultValue - value) ? candidate : closest)
+    if (!option) { showToast(`${label} 파라미터를 오토메이션 목록에서 찾지 못했습니다.`); return }
+    addAutomationLane(track.id, option)
+    showToast(`${label} 오토메이션을 추가했습니다.`)
+  }, [addAutomationLane, effect.id, showToast, target])
+  const openEditor = () => {
+    if (!effect.plugin) return
+    void engine.openPluginEditor('effect', effect.id).catch((error) => showToast(`${effect.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`))
+  }
+  const hasSidechain = effect.type === 'builtin:compressor' || (effect.type === 'builtin:vocoder' && Math.round(effect.params.source ?? 3) === 0) || effect.plugin?.supportsSidechain || (effect.plugin?.audioInputBuses ?? 0) > 1
   if (collapsed) return <div className={`device-collapsed ${effect.bypassed ? 'bypassed' : ''}`} data-effect-index={index}><button className="collapsed-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={12} /></button><button className="collapsed-open" onClick={() => setCollapsed(false)} title="펼치기"><span>{deviceName(effect.type, effect.plugin)}</span></button></div>
   return (
     // Only the grip starts reordering. Window-level pointer tracking keeps the
     // gesture alive outside this card and avoids Tauri's native file-drag path.
-    <article className={`device-card ${effect.type === 'builtin:multiband-compressor' ? 'multiband-card' : ''} ${effect.type === 'builtin:eq8' ? 'eq8-card' : ''} ${effect.type === 'builtin:mastering-limiter' ? 'limiter-card' : ''} ${effect.type === 'builtin:vocoder' ? 'vocoder-card' : ''} ${effect.type === 'builtin:clipper' ? 'clipper-card' : ''} ${effect.type === 'builtin:upward-compressor' ? 'upward-card' : ''} ${effect.type === 'builtin:roboter' ? 'roboter-card' : ''} ${effect.type === 'builtin:resonator' ? 'colorizer-card' : ''} ${effect.bypassed ? 'bypassed' : ''}`} data-effect-index={index} onDoubleClick={() => { if (effect.plugin) showToast(`${effect.plugin.name}: 네이티브 편집기 창 연결은 다음 호스팅 단계에서 제공됩니다.`) }} onContextMenu={onContextMenu}>
-      <header><span className="device-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={13} /></span><button className={effect.bypassed ? '' : 'powered'} title={effect.bypassed ? '바이패스 해제' : '바이패스'} onClick={() => toggle(target, effect.id)}><CirclePower size={14} /></button><strong>{deviceName(effect.type, effect.plugin)}</strong><span>{effect.plugin?.format.toUpperCase() ?? effect.type.replace('builtin:', '').toUpperCase()}</span><button onClick={() => setCollapsed(true)} title="접기"><ChevronDown size={13} /></button></header>
+    <ParameterAutomationProvider add={addAutomation}>
+    <article className={`device-card ${effect.type === 'builtin:multiband-compressor' ? 'multiband-card' : ''} ${effect.type === 'builtin:eq8' ? 'eq8-card' : ''} ${effect.type === 'builtin:mastering-limiter' ? 'limiter-card' : ''} ${effect.type === 'builtin:vocoder' ? 'vocoder-card' : ''} ${effect.type === 'builtin:clipper' ? 'clipper-card' : ''} ${effect.type === 'builtin:upward-compressor' ? 'upward-card' : ''} ${effect.type === 'builtin:roboter' ? 'roboter-card' : ''} ${effect.type === 'builtin:resonator' ? 'colorizer-card' : ''} ${effect.bypassed ? 'bypassed' : ''} ${focused ? 'effect-focused' : ''}`} data-effect-index={index} data-effect-id={effect.id} tabIndex={-1} onContextMenu={onContextMenu}>
+      <header className="device-card-header"><div className="device-header-main"><span className="device-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={13} /></span><button className={effect.bypassed ? '' : 'powered'} title={effect.bypassed ? '전원 켜기' : '전원 끄기'} onClick={toggleEffect}><CirclePower size={13} /></button><strong title={effect.plugin ? '더블클릭하여 플러그인 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (effect.plugin) openEditor() }}>{deviceName(effect.type, effect.plugin)}</strong><span>{effect.plugin?.format.toUpperCase() ?? effect.type.replace('builtin:', '').toUpperCase()}</span><div className="device-header-actions"><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button><button className="device-close" onClick={() => remove(target, effect.id)} title="이펙트 제거"><X size={13} /></button></div></div><div className="device-header-sub"><button className={`device-bypass ${effect.bypassed ? 'active' : ''}`} onClick={toggleEffect} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setBypassMenu({ x: event.clientX, y: event.clientY }) }}>BYPASS {effect.bypassed ? 'ON' : 'OFF'}</button>{hasSidechain && <SidechainControl effect={effect} target={target} />}{effect.plugin && effect.plugin.hasEditor !== false && <button className="device-editor-button" title="플러그인 창 열기" onClick={openEditor}><Piano size={12} /><span>OPEN</span></button>}</div></header>
       <div className="device-body">
         {(effect.type === 'builtin:eq' || effect.type === 'builtin:eq8') && <EqPanel effectId={effect.id} params={effect.params} bypassed={effect.bypassed} bandCount={effect.type === 'builtin:eq8' ? 8 : 4} setParam={setParam} />}
-        {(effect.type === 'builtin:compressor' || (effect.type === 'builtin:vocoder' && Math.round(effect.params.source ?? 3) === 0) || effect.plugin?.supportsSidechain || (effect.plugin?.audioInputBuses ?? 0) > 1) && <SidechainControl effect={effect} target={target} />}
         {effect.type === 'builtin:compressor' && <><div className="parameter-row"><Knob value={effect.params.threshold ?? -18} min={-60} max={0} step={0.1} defaultValue={-18} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={effect.params.ratio ?? 3} min={1} max={20} step={0.1} defaultValue={3} label="RATIO" format={(v) => `${v.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={(effect.params.attack ?? .01) * 1000} min={1} max={500} step={1} defaultValue={10} label="ATTACK" format={msFormat} onChange={(value) => setParam('attack', value / 1000)} /><Knob value={(effect.params.release ?? .2) * 1000} min={10} max={1000} step={1} defaultValue={200} label="RELEASE" format={msFormat} onChange={(value) => setParam('release', value / 1000)} /></div><div className="parameter-row"><Knob value={effect.params.knee ?? 12} min={0} max={24} step={0.5} defaultValue={12} label="KNEE" format={dbFormat} onChange={(value) => setParam('knee', value)} /><Knob value={effect.params.makeupDb ?? 0} min={-12} max={24} step={0.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam('makeupDb', value)} /></div></>}
         {effect.type === 'builtin:multiband-compressor' && <MultibandCompressorPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:utility' && <UtilityPanel params={effect.params} setParam={setParam} />}
@@ -247,14 +296,31 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
         {effect.type === 'builtin:delay' && <><div className="delay-display"><i /><i /><i /><i /><i /></div><div className="parameter-row"><Knob value={effect.params.time ?? .25} min={.01} max={2} step={.01} defaultValue={.25} label="TIME" format={(v) => `${v.toFixed(2)} s`} onChange={(value) => setParam('time', value)} /><Knob value={effect.params.feedback ?? .3} min={0} max={.95} step={.01} defaultValue={.3} label="FEEDBACK" format={percentFormat} onChange={(value) => setParam('feedback', value)} /><Knob value={effect.params.damping ?? .35} min={.01} max={1} step={.01} defaultValue={.35} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div><ToggleRow label="PING PONG" on={(effect.params.pingPong ?? 0) >= 0.5} onToggle={(on) => setParam('pingPong', on ? 1 : 0)} /></>}
         {effect.type === 'builtin:reverb' && <><div className="reverb-display"><span /><span /><span /><span /></div><div className="parameter-row"><Knob value={effect.params.decaySec ?? 2.4} min={.1} max={20} step={.1} defaultValue={2.4} label="DECAY" format={(v) => `${v.toFixed(1)} s`} onChange={(value) => setParam('decaySec', value)} /><Knob value={effect.params.damping ?? .4} min={0} max={1} step={.01} defaultValue={.4} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.width ?? .8} min={0} max={1} step={.01} defaultValue={.8} label="WIDTH" format={percentFormat} onChange={(value) => setParam('width', value)} /><Knob value={effect.params.diffusion ?? .7} min={0} max={.92} step={.01} defaultValue={.7} label="DIFFUSE" format={percentFormat} onChange={(value) => setParam('diffusion', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="DRY / WET" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div></>}
         {effect.type === 'builtin:waveshaper' && <><ShaperDisplay params={effect.params} bypassed={effect.bypassed} onCurve={(curve) => setParam('curve', curve)} /><div className="parameter-row shaper-controls"><Knob value={effect.params.driveDb ?? 6} min={0} max={36} step={.1} defaultValue={6} label="DRIVE" format={dbFormat} onChange={(value) => setParam('driveDb', value)} /><Knob value={effect.params.mix ?? 1} min={0} max={1} step={.01} defaultValue={1} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div><div className="shaper-quality">4× OVERSAMPLING <span>·</span> DC FILTER</div></>}
-        {effect.plugin && <div className="plugin-device-placeholder"><Power size={24} /><strong>{effect.plugin.name}</strong><span>{effect.plugin.format.toUpperCase()} · {effect.plugin.audioInputBuses || 0} IN BUS / {effect.plugin.audioOutputBuses || 0} OUT BUS · {effect.plugin.vendor || 'Unknown vendor'}</span></div>}
+        {effect.plugin && <ExternalPluginParameters plugin={effect.plugin} values={effect.params} setParam={setParam} />}
       </div>
+      {bypassMenu && <MenuPanel items={[{ kind: 'item', label: '바이패스 오토메이션 추가', run: () => addAutomation('__bypass', '바이패스', effect.bypassed ? 1 : 0) }]} anchor={bypassMenu} onClose={() => setBypassMenu(null)} className="parameter-context-menu" />}
     </article>
+    </ParameterAutomationProvider>
   )
 }
 
 function ToggleRow({ label, on, onToggle }: { label: string; on: boolean; onToggle(on: boolean): void }) {
   return <div className="toggle-row"><button className={on ? 'active' : ''} role="switch" aria-checked={on} onClick={() => onToggle(!on)}><i />{label}</button></div>
+}
+
+function ExternalPluginParameters({ plugin, values, setParam }: { plugin: ExternalPluginRef; values: Record<string, number>; setParam(id: string, value: number): void }) {
+  const parameters = plugin.parameters ?? []
+  const visible = rackParameters(parameters)
+  if (!visible.length) return <PluginIdentitySurface plugin={plugin} />
+  return <div className="external-instrument-editor"><div className="external-instrument-heading"><strong>{plugin.name}</strong><span>{parameters.length < 12 ? 'ALL PARAMETERS' : `${visible.length} MACROS`}</span></div><PluginParameterGrid parameters={visible} values={values} setParam={setParam} /></div>
+}
+
+function PluginParameterGrid({ parameters, values, setParam }: { parameters: NonNullable<ExternalPluginRef['parameters']>; values: Record<string, number>; setParam(id: string, value: number): void }) {
+  return <div className="external-parameter-grid macro-grid">{parameters.map((parameter) => { const min = Number.isFinite(parameter.min) ? parameter.min : 0; const max = Number.isFinite(parameter.max) && parameter.max > min ? parameter.max : 1; const value = values[parameter.id] ?? parameter.defaultValue; const step = Math.max(.0001, (max - min) / 1000); return <label key={parameter.id} title={`${parameter.module} · ${parameter.id}`}><span>{parameter.name}</span><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => setParam(parameter.id, Number(event.target.value))} /><EditableNumber value={value} min={min} max={max} step={step} onChange={(next) => setParam(parameter.id, next)} format={(next) => next.toFixed(Math.abs(next) < 10 ? 3 : 1)} /></label> })}</div>
+}
+
+function PluginIdentitySurface({ plugin }: { plugin: ExternalPluginRef }) {
+  return <div className="plugin-identity-surface"><div className="plugin-identity-mark"><i /><i /><i /><i /><span>{plugin.format.toUpperCase()}</span></div><strong>{plugin.name}</strong><small>{plugin.vendor || 'EXTERNAL DEVICE'}</small></div>
 }
 
 const LIMITER_MODES = [
@@ -327,7 +393,7 @@ function ClipperFlowDisplay({ effectId }: { effectId: string }) {
     context.strokeStyle = '#d9edf7'; context.lineWidth = 1; context.setLineDash([5, 4]); for (const y of [center - limit, center + limit]) { context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke() } context.setLineDash([])
     context.fillStyle = '#8da2af'; context.font = '7px monospace'; context.textAlign = 'right'; context.fillText('0 dBFS', width - 6, center - limit - 4)
   }, [effectId, engine])
-  useEffect(() => { draw(); return subscribeMeterFrame(draw) }, [draw])
+  useEffect(() => { draw(); return subscribeAnalyzerFrame(draw) }, [draw])
   return <canvas ref={ref} className="clipper-flow" width="340" height="116" />
 }
 
@@ -375,7 +441,7 @@ function ColorizerPanel({ effectId, params, setParam }: { effectId: string; para
   }
   useEffect(() => {
     const draw = () => drawColorizerSpectrum(canvasRef.current, engine.getEffectSpectrum(effectId))
-    draw(); return subscribeMeterFrame(draw)
+    draw(); return subscribeAnalyzerFrame(draw)
   }, [effectId, engine])
   return <div className="colorizer-panel">
     <div className="colorizer-spectrum"><canvas ref={canvasRef} /><span>40</span><span>120</span><span>500</span><span>2k</span><span>12k</span><b>HARMONIC MASK</b></div>
@@ -457,17 +523,20 @@ const DISTORTION_BANDS: Array<{ id: DistortionBandName; color: string }> = [
 function DistortionPanel({ effectId, params, bypassed, setParam }: { effectId: string; params: Record<string, number>; bypassed: boolean; setParam(param: string, value: number): void }) {
   const [selected, setSelected] = useState<DistortionBandName>('mid')
   const color = DISTORTION_BANDS.find((band) => band.id === selected)!.color
+  const enabled = (params[`${selected}Enabled`] ?? 1) >= .5
   return <div className="distortion-panel" style={{ '--distortion-color': color } as React.CSSProperties}>
     <DistortionDisplay effectId={effectId} params={params} bypassed={bypassed} selected={selected} onSelect={setSelected} onParam={setParam} />
     <div className="distortion-controls">
+      <button className={enabled ? 'eq-enable active' : 'eq-enable'} onClick={() => setParam(`${selected}Enabled`, enabled ? 0 : 1)}>{enabled ? 'ON' : 'OFF'}</button>
       <label>MODEL<select value={Math.round(params[`${selected}Mode`] ?? 0)} onChange={(event) => setParam(`${selected}Mode`, Number(event.target.value))}>{DISTORTION_MODES.map((mode, index) => <option key={mode} value={index}>{mode}</option>)}</select></label>
-      <Knob value={params[`${selected}GainDb`] ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`${selected}GainDb`, value)} />
-      <Knob value={params[`${selected}DriveDb`] ?? 6} min={0} max={36} step={.1} defaultValue={6} label="DRIVE" format={dbFormat} onChange={(value) => setParam(`${selected}DriveDb`, value)} />
-      <Knob value={params.splitLow ?? 180} min={20} max={Math.max(21, (params.splitHigh ?? 4500) / 1.05)} step={1} scale="log" defaultValue={180} label="LOW FREQ" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
-      <Knob value={params.splitHigh ?? 4500} min={Math.min(19_999, (params.splitLow ?? 180) * 1.05)} max={20_000} step={10} scale="log" defaultValue={4500} label="HIGH FREQ" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
-      <Knob value={params[`${selected}Mix`] ?? .75} min={0} max={1} step={.01} defaultValue={.75} label="MIX" format={percentFormat} onChange={(value) => setParam(`${selected}Mix`, value)} />
+      <Knob parameterId={`${selected}GainDb`} value={params[`${selected}GainDb`] ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`${selected}GainDb`, value)} />
+      <Knob parameterId={`${selected}DriveDb`} value={params[`${selected}DriveDb`] ?? 6} min={0} max={36} step={.1} defaultValue={6} label="DRIVE" format={dbFormat} onChange={(value) => setParam(`${selected}DriveDb`, value)} />
+      <Knob parameterId="splitLow" value={params.splitLow ?? 180} min={20} max={Math.max(21, (params.splitHigh ?? 4500) / 1.05)} step={1} scale="log" defaultValue={180} label="LOW FREQ" format={hzFormat} onChange={(value) => setParam('splitLow', value)} />
+      <Knob parameterId="splitHigh" value={params.splitHigh ?? 4500} min={Math.min(19_999, (params.splitLow ?? 180) * 1.05)} max={20_000} step={10} scale="log" defaultValue={4500} label="HIGH FREQ" format={hzFormat} onChange={(value) => setParam('splitHigh', value)} />
+      <Knob parameterId={`${selected}Mix`} value={params[`${selected}Mix`] ?? .75} min={0} max={1} step={.01} defaultValue={.75} label="MIX" format={percentFormat} onChange={(value) => setParam(`${selected}Mix`, value)} />
+      <label>OVERSAMPLE<select value={params.oversample ?? 4} onChange={(event) => setParam('oversample', Number(event.target.value))}><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
     </div>
-    <div className="distortion-tabs">{DISTORTION_BANDS.map((band) => <button key={band.id} className={selected === band.id ? 'active' : ''} style={{ '--band-color': band.color } as React.CSSProperties} onClick={() => setSelected(band.id)}><b>{band.id.toUpperCase()}</b><span>{DISTORTION_MODES[Math.round(params[`${band.id}Mode`] ?? 0)]}</span></button>)}</div>
+    <div className="distortion-tabs">{DISTORTION_BANDS.map((band) => { const on = (params[`${band.id}Enabled`] ?? 1) >= .5; return <button key={band.id} className={`${selected === band.id ? 'active' : ''} ${on ? '' : 'disabled'}`} style={{ '--band-color': band.color } as React.CSSProperties} onClick={() => setSelected(band.id)}><b>{band.id.toUpperCase()}</b><span>{on ? DISTORTION_MODES[Math.round(params[`${band.id}Mode`] ?? 0)] : 'BYPASS'}</span></button> })}</div>
   </div>
 }
 
@@ -494,7 +563,7 @@ function DistortionDisplay({ effectId, params, bypassed, selected, onSelect, onP
     for (const [frequency, color] of [[low, '#f0ca62'], [high, '#ed916e']] as Array<[number, string]>) { const x = xFor(frequency); context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.strokeStyle = color; context.lineWidth = 2; context.stroke(); context.fillStyle = color; context.fillRect(x - 3, height / 2 - 10, 6, 20) }
     context.fillStyle = '#8b9aa4'; context.font = '7px monospace'; context.textAlign = 'left'; context.fillText(low <= 20.5 ? 'LOW OFF' : hzFormat(low), 5, height - 15); context.textAlign = 'right'; context.fillText(high >= 19_950 ? 'HIGH OFF' : hzFormat(high), width - 5, height - 15)
   }, [bypassed, effectId, engine, gain, high, low, selected])
-  useEffect(() => { draw(); return subscribeMeterFrame(draw) }, [draw])
+  useEffect(() => { draw(); return subscribeAnalyzerFrame(draw) }, [draw])
   const point = (event: React.PointerEvent<HTMLCanvasElement>) => { const bounds = event.currentTarget.getBoundingClientRect(); return { x: (event.clientX - bounds.left) * event.currentTarget.width / bounds.width, y: (event.clientY - bounds.top) * event.currentTarget.height / bounds.height } }
   const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const target = dragging.current; if (!target) return; const p = point(event); const { width, height } = event.currentTarget; if (target === 'splitLow' || target === 'splitHigh') { let frequency = parameterFrequencyAtX(p.x, width); if (target === 'splitLow') { if (p.x < 5) frequency = 20; frequency = Math.min(frequency, high / 1.05) } else { if (p.x > width - 5) frequency = 20_000; frequency = Math.max(frequency, low * 1.05) } onParam(target, Math.round(frequency)); return } const value = (height / 2 - p.y) / (height * .4) * 24; onParam(`${target}GainDb`, Math.round(Math.max(-24, Math.min(24, value)) * 10) / 10) }
   const down = (event: React.PointerEvent<HTMLCanvasElement>) => { const p = point(event); const width = event.currentTarget.width; const lowX = frequencyToX(low, width); const highX = frequencyToX(high, width); if (Math.abs(p.x - lowX) <= 9) dragging.current = 'splitLow'; else if (Math.abs(p.x - highX) <= 9) dragging.current = 'splitHigh'; else { const band: DistortionBandName = p.x < lowX ? 'low' : p.x < highX ? 'mid' : 'high'; onSelect(band); dragging.current = band } event.currentTarget.setPointerCapture(event.pointerId); update(event) }
@@ -541,11 +610,11 @@ function MultibandCompressorPanel({ effectId, params, setParam }: { effectId: st
     </div>
     <div className="multiband-band-controls">
       <strong style={{ '--band-color': bands.find((band) => band.id === selected)?.color } as React.CSSProperties}>{selected.toUpperCase()}</strong>
-      <Knob value={threshold} min={-60} max={0} step={.1} defaultValue={-20} label="THRESH" format={dbFormat} onChange={(value) => setParam(`${prefix}Threshold`, value)} />
-      <Knob value={ratio} min={1} max={20} step={.1} defaultValue={2} label="RATIO" format={(value) => `${value.toFixed(1)}:1`} onChange={(value) => setParam(`${prefix}Ratio`, value)} />
-      <Knob value={attack * 1000} min={1} max={500} step={1} defaultValue={15} label="ATTACK" format={msFormat} onChange={(value) => setParam(`${prefix}Attack`, value / 1000)} />
-      <Knob value={release * 1000} min={10} max={1000} step={1} defaultValue={180} label="RELEASE" format={msFormat} onChange={(value) => setParam(`${prefix}Release`, value / 1000)} />
-      <Knob value={makeup} min={-12} max={24} step={.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam(`${prefix}MakeupDb`, value)} />
+      <Knob parameterId={`${prefix}Threshold`} value={threshold} min={-60} max={0} step={.1} defaultValue={-20} label="THRESH" format={dbFormat} onChange={(value) => setParam(`${prefix}Threshold`, value)} />
+      <Knob parameterId={`${prefix}Ratio`} value={ratio} min={1} max={20} step={.1} defaultValue={2} label="RATIO" format={(value) => `${value.toFixed(1)}:1`} onChange={(value) => setParam(`${prefix}Ratio`, value)} />
+      <Knob parameterId={`${prefix}Attack`} value={attack * 1000} min={1} max={500} step={1} defaultValue={15} label="ATTACK" format={msFormat} onChange={(value) => setParam(`${prefix}Attack`, value / 1000)} />
+      <Knob parameterId={`${prefix}Release`} value={release * 1000} min={10} max={1000} step={1} defaultValue={180} label="RELEASE" format={msFormat} onChange={(value) => setParam(`${prefix}Release`, value / 1000)} />
+      <Knob parameterId={`${prefix}MakeupDb`} value={makeup} min={-12} max={24} step={.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam(`${prefix}MakeupDb`, value)} />
       <Knob value={params.knee ?? 8} min={0} max={24} step={.5} defaultValue={8} label="KNEE" format={dbFormat} onChange={(value) => setParam('knee', value)} />
     </div>
   </div>
@@ -597,15 +666,28 @@ function InstrumentCard({ track }: { track: Track }) {
   const toggleBypass = useProjectStore((state) => state.toggleInstrumentBypass)
   const setPlugin = useProjectStore((state) => state.setTrackInstrumentPlugin)
   const replaceInstrument = useProjectStore((state) => state.replaceTrackInstrument)
+  const addAutomationLane = useProjectStore((state) => state.addAutomationLane)
   const engine = useEngine()
   const [voices, setVoices] = useState(0)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([])
   const [loading, setLoading] = useState(false)
   const [dropActive, setDropActive] = useState(false)
+  const [collapsed, setCollapsed] = useState(false)
   const pickerRef = useRef<HTMLButtonElement>(null)
+  const cardRef = useRef<HTMLElement>(null)
   const getPickerAnchor = useCallback(() => pickerRef.current, [])
   useEffect(() => { const timer = window.setInterval(() => setVoices(engine.getActiveVoiceCount(track.id)), 250); return () => window.clearInterval(timer) }, [engine, track.id])
+  useEffect(() => subscribeBrowserDrag((state) => {
+    if (state.payload.kind !== 'instrument') return
+    const inside = state.type !== 'cancel' && !!cardRef.current?.contains(document.elementFromPoint(state.x, state.y))
+    setDropActive(inside)
+    if (state.type === 'drop' && inside) {
+      replaceInstrument(track.id, state.payload.plugin)
+      useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id })
+      useProjectStore.getState().showToast(`${state.payload.plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`)
+    }
+  }), [replaceInstrument, track.id])
   useEffect(() => {
     if (!pickerOpen || plugins.length || loading) return
     let cancelled = false
@@ -614,14 +696,28 @@ function InstrumentCard({ track }: { track: Track }) {
     return () => { cancelled = true }
   }, [engine, loading, pickerOpen, plugins.length])
   const setParam = (id: string, value: number) => { update(track.id, { [id]: value }); engine.setInstrumentParam(track.id, id, value) }
-  return <article
+  const addAutomation = useCallback((parameterId: string | undefined, label: string, value: number) => {
+    const options = automationOptionsForTrack(useProjectStore.getState().project.tracks.find((candidate) => candidate.id === track.id) ?? track)
+      .filter((option) => option.targetKind === 'instrument' && option.targetId === track.id)
+    const normalizedLabel = normalizeParameterLabel(label)
+    const candidates = parameterId
+      ? options.filter((option) => option.parameterId === parameterId)
+      : options.filter((option) => parameterLabelsMatch(normalizedLabel, normalizeParameterLabel(option.label)))
+    const option = candidates.length <= 1 ? candidates[0] : candidates.reduce((closest, candidate) => Math.abs(candidate.defaultValue - value) < Math.abs(closest.defaultValue - value) ? candidate : closest)
+    if (!option) { useProjectStore.getState().showToast(`${label} 파라미터를 오토메이션 목록에서 찾지 못했습니다.`); return }
+    addAutomationLane(track.id, option)
+    useProjectStore.getState().showToast(`${label} 오토메이션을 추가했습니다.`)
+  }, [addAutomationLane, track])
+  const openEditor = () => {
+    if (!instrument.plugin) return
+    void engine.openPluginEditor('instrument', track.id).catch((error) => useProjectStore.getState().showToast(`${instrument.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`))
+  }
+  if (collapsed) return <div className={`device-collapsed ${instrument.bypassed ? 'bypassed' : ''}`}><button className="collapsed-open" onClick={() => setCollapsed(false)} title="악기 펼치기"><span>{instrument.plugin?.name ?? 'Test Tone'}</span></button></div>
+  return <ParameterAutomationProvider add={addAutomation}><article
+    ref={cardRef}
     className={`device-card instrument-card ${instrument.bypassed ? 'bypassed' : ''} ${dropActive ? 'instrument-drop-active' : ''}`}
-    onDragEnter={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) setDropActive(true) }}
-    onDragOver={(event) => { if (event.dataTransfer.types.includes(BROWSER_DRAG_TYPE)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }}
-    onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropActive(false) }}
-    onDrop={(event) => { const payload = readBrowserDrag(event.dataTransfer); setDropActive(false); if (payload?.kind !== 'instrument') return; event.preventDefault(); event.stopPropagation(); replaceInstrument(track.id, payload.plugin); useProjectStore.getState().setRackTarget({ kind: 'track', id: track.id }); useProjectStore.getState().showToast(`${payload.plugin?.name ?? 'DefaultSynth'}로 악기를 교체했습니다.`) }}
   >
-    <header><span className="device-grip">♪</span><button className={instrument.bypassed ? '' : 'powered'} title={instrument.bypassed ? '인스트루먼트 켜기' : '인스트루먼트 바이패스'} onClick={() => toggleBypass(track.id)}><CirclePower size={14} /></button><strong>{instrument.plugin?.name ?? 'Test Tone'}</strong><span>{instrument.plugin?.format.toUpperCase() ?? `${voices} / ${Math.round(instrument.params.polyphony ?? 16)} voices`}</span><button ref={pickerRef} onClick={() => setPickerOpen((open) => !open)} title="인스트루먼트 선택">▾</button></header>
+    <header className="device-card-header"><div className="device-header-main"><span className="device-grip">♪</span><button className={instrument.bypassed ? '' : 'powered'} title={instrument.bypassed ? '인스트루먼트 켜기' : '인스트루먼트 끄기'} onClick={() => toggleBypass(track.id)}><CirclePower size={13} /></button><strong title={instrument.plugin ? '더블클릭하여 악기 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (instrument.plugin) openEditor() }}>{instrument.plugin?.name ?? 'Test Tone'}</strong><span>{instrument.plugin?.format.toUpperCase() ?? `${voices} / ${Math.round(instrument.params.polyphony ?? 16)} voices`}</span><div className="device-header-actions"><button ref={pickerRef} onClick={() => setPickerOpen((open) => !open)} title="인스트루먼트 선택">▾</button><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button>{instrument.plugin && <button className="device-close" title="악기 제거" onClick={() => replaceInstrument(track.id)}><X size={13} /></button>}</div></div><div className="device-header-sub"><button className={`device-bypass ${instrument.bypassed ? 'active' : ''}`} onClick={() => toggleBypass(track.id)}>BYPASS {instrument.bypassed ? 'ON' : 'OFF'}</button>{instrument.plugin && instrument.plugin.hasEditor !== false && <button className="device-editor-button" title="악기 창 열기" onClick={openEditor}><Piano size={12} /><span>OPEN</span></button>}</div></header>
     <div className="device-body">
       {instrument.plugin && <ExternalInstrumentEditor track={track} setParam={setParam} />}
       {!instrument.plugin && <>
@@ -639,24 +735,27 @@ function InstrumentCard({ track }: { track: Track }) {
       </div>
       </>}
     </div>
-    {pickerOpen && <FloatingPanel getAnchorElement={getPickerAnchor} onClose={() => setPickerOpen(false)} className="device-picker"><strong>VST3 / CLAP INSTRUMENTS</strong>{loading && <small>플러그인을 검색하는 중…</small>}{plugins.map((plugin) => <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} onClick={() => { setPlugin(track.id, pluginRef(plugin)); setPickerOpen(false) }}><span>{plugin.name}</span><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category}</small></button>)}{!loading && plugins.length === 0 && <small>설치된 인스트루먼트를 찾지 못했습니다.</small>}</FloatingPanel>}
-  </article>
+    {pickerOpen && <FloatingPanel getAnchorElement={getPickerAnchor} onClose={() => setPickerOpen(false)} className="device-picker"><strong>VST3 / CLAP INSTRUMENTS</strong>{loading && <small>플러그인을 검색하는 중…</small>}{plugins.map((plugin) => <button key={`${plugin.format}:${plugin.uid}:${plugin.path}`} onClick={() => { void hydratePlugin(engine, plugin); setPlugin(track.id, pluginRef(plugin)); setPickerOpen(false) }}><span>{plugin.name}</span><small>{plugin.format.toUpperCase()} · {plugin.vendor || plugin.category}</small></button>)}{!loading && plugins.length === 0 && <small>설치된 인스트루먼트를 찾지 못했습니다.</small>}</FloatingPanel>}
+  </article></ParameterAutomationProvider>
 }
 
 function ExternalInstrumentEditor({ track, setParam }: { track: Track; setParam(id: string, value: number): void }) {
   const plugin = track.instrument!.plugin!
   const parameters = plugin.parameters ?? []
-  if (!parameters.length) return <div className="plugin-device-placeholder"><Power size={24} /><strong>{plugin.name}</strong><span>{plugin.vendor || 'External instrument'} · MIDI IN / Stereo OUT</span><small>이 플러그인은 호스트에 편집 가능한 파라미터를 보고하지 않았습니다.</small></div>
+  const visible = rackParameters(parameters)
+  if (!visible.length) return <PluginIdentitySurface plugin={plugin} />
   return <div className="external-instrument-editor">
-    <div className="external-instrument-heading"><strong>{plugin.name}</strong><span>{plugin.vendor || 'External instrument'} · {parameters.length} parameters</span></div>
-    <div className="external-parameter-grid">{parameters.map((parameter) => {
-      const min = Number.isFinite(parameter.min) ? parameter.min : 0
-      const max = Number.isFinite(parameter.max) && parameter.max > min ? parameter.max : 1
-      const value = track.instrument!.params[parameter.id] ?? parameter.defaultValue
-      const step = Math.max(.0001, (max - min) / 1000)
-      return <label key={parameter.id} title={`${parameter.module} · ${parameter.id}`}><span>{parameter.name}</span><input type="range" min={min} max={max} step={step} value={value} onChange={(event) => setParam(parameter.id, Number(event.target.value))} /><EditableNumber value={value} min={min} max={max} step={step} onChange={(next) => setParam(parameter.id, next)} format={(next) => next.toFixed(Math.abs(next) < 10 ? 3 : 1)} /></label>
-    })}</div>
+    <div className="external-instrument-heading"><strong>{plugin.name}</strong><span>{parameters.length < 12 ? 'ALL PARAMETERS' : `${visible.length} MACROS`}</span></div>
+    <PluginParameterGrid parameters={visible} values={track.instrument!.params} setParam={setParam} />
   </div>
+}
+
+function macroParameters(parameters: NonNullable<ExternalPluginRef['parameters']>) {
+  return parameters.filter((parameter) => `${parameter.module} ${parameter.name}`.toLocaleLowerCase().includes('macro')).slice(0, 32)
+}
+
+function rackParameters(parameters: NonNullable<ExternalPluginRef['parameters']>) {
+  return parameters.length < 12 ? parameters : macroParameters(parameters)
 }
 
 const EQ_RANGE_DB = 18
@@ -684,9 +783,9 @@ function EqPanel({ effectId, params, bypassed, bandCount, setParam }: { effectId
     <div className="eq-band-tabs">{bands.map((item) => <button key={item.index} aria-pressed={item.enabled} className={`${selected === item.index ? 'active' : ''} ${item.enabled ? 'enabled' : 'disabled'}`} style={{ '--eq-color': item.color } as React.CSSProperties} onClick={() => setSelected(item.index)} onDoubleClick={() => setParam(`band${item.index}.enabled`, item.enabled ? 0 : 1)} title={`Band ${item.index + 1} · double-click to ${item.enabled ? 'disable' : 'enable'}`}><i /><span>{item.index + 1}</span></button>)}</div>
     <div className="eq-selected-controls" style={{ '--eq-color': band.enabled ? band.color : '#697681' } as React.CSSProperties}>
       <button className={band.enabled ? 'eq-enable active' : 'eq-enable'} aria-pressed={band.enabled} onClick={() => setParam(`band${band.index}.enabled`, band.enabled ? 0 : 1)}><CirclePower size={14} /><span>{band.enabled ? 'ON' : 'OFF'}</span></button>
-      <Knob value={band.q} min={.2} max={12} step={.01} defaultValue={.71} label="Q" format={(value) => value.toFixed(2)} onChange={(value) => setParam(`band${band.index}.q`, value)} />
-      <Knob value={band.gain} min={-18} max={18} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`band${band.index}.gain`, value)} />
-      <Knob value={band.frequency} min={20} max={20000} step={1} scale="log" defaultValue={defaults[band.index]!} label="FREQ" format={hzFormat} onChange={(value) => setParam(`band${band.index}.freq`, value)} />
+      <Knob parameterId={`band${band.index}.q`} value={band.q} min={.2} max={12} step={.01} defaultValue={.71} label="Q" format={(value) => value.toFixed(2)} onChange={(value) => setParam(`band${band.index}.q`, value)} />
+      <Knob parameterId={`band${band.index}.gain`} value={band.gain} min={-18} max={18} step={.1} defaultValue={0} label="GAIN" format={dbFormat} onChange={(value) => setParam(`band${band.index}.gain`, value)} />
+      <Knob parameterId={`band${band.index}.freq`} value={band.frequency} min={20} max={20000} step={1} scale="log" defaultValue={defaults[band.index]!} label="FREQ" format={hzFormat} onChange={(value) => setParam(`band${band.index}.freq`, value)} />
       <div className="eq-filter-selects"><label>SHAPE<select value={band.shape} onChange={(event) => { const shape = Number(event.target.value); setParam(`band${band.index}.type`, shape); if (shape === 3 || shape === 4) setParam(`band${band.index}.slope`, band.slope) }}>{shapes.map((shape) => <option key={shape.value} value={shape.value}>{shape.name}</option>)}</select></label>{(band.shape === 3 || band.shape === 4) && <label>SLOPE<select value={band.slope} onChange={(event) => setParam(`band${band.index}.slope`, Number(event.target.value))}>{[12, 24, 36, 48].map((slope) => <option key={slope} value={slope}>{slope} dB/oct</option>)}</select></label>}</div>
     </div>
     {bandCount === 8 && <div className="eq8-global"><strong>STEREO · 8 BAND</strong><button className={(params.adaptiveQ ?? 1) >= .5 ? 'active' : ''} onClick={() => setParam('adaptiveQ', (params.adaptiveQ ?? 1) >= .5 ? 0 : 1)}>ADAPT Q</button><Knob value={(params.scale ?? 1) * 100} min={0} max={200} step={1} defaultValue={100} label="SCALE" format={(value) => `${Math.round(value)}%`} onChange={(value) => setParam('scale', value / 100)} /><Knob value={params.outputDb ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="OUTPUT" format={dbFormat} onChange={(value) => setParam('outputDb', value)} /></div>}
@@ -697,6 +796,7 @@ function InteractiveEqDisplay({ effectId, bands, selected, bypassed, scale, adap
   const ref = useRef<HTMLCanvasElement>(null)
   const dragging = useRef<number | null>(null)
   const dragPreview = useRef<{ index: number; frequency: number; gain: number } | null>(null)
+  const lastDragValues = useRef<{ frequency: number; gain: number } | null>(null)
   const engine = useEngine()
   const draw = useCallback(() => {
     const canvas = ref.current; const context = canvas?.getContext('2d'); if (!canvas || !context) return
@@ -710,20 +810,23 @@ function InteractiveEqDisplay({ effectId, bands, selected, bypassed, scale, adap
     const preview = dragPreview.current
     const visibleBands = preview ? bands.map((band) => band.index === preview.index ? { ...band, frequency: preview.frequency, gain: preview.gain } : band) : bands
     context.beginPath(); context.strokeStyle = bypassed ? '#56636d' : '#62d6fa'; context.lineWidth = 2
+    let pathVisible = false
     for (let x = 0; x < width; x += 1) {
       const hz = displayFrequencyAtX(x, width)
       const value = visibleBands.reduce((sum, band) => sum + previewEqBand(band, hz, scale, adaptiveQ), 0)
-      if (x === 0) context.moveTo(x, toY(value)); else context.lineTo(x, toY(value))
+      const outsideCut = value <= -EQ_RANGE_DB + .05 && visibleBands.some((band) => band.enabled && ((band.shape === 3 && hz < band.frequency) || (band.shape === 4 && hz > band.frequency)))
+      if (outsideCut) { pathVisible = false; continue }
+      if (!pathVisible) { context.moveTo(x, toY(value)); pathVisible = true } else context.lineTo(x, toY(value))
     }
     context.stroke()
     for (const band of visibleBands.filter((item) => item.enabled)) { const x = frequencyToX(band.frequency, width); const y = toY(band.gain); context.beginPath(); context.arc(x, y, band.index === selected ? 6 : 5, 0, Math.PI * 2); context.fillStyle = bypassed ? '#64717a' : band.color; context.fill(); context.strokeStyle = band.index === selected ? '#fff' : '#10171c'; context.lineWidth = band.index === selected ? 1.5 : 1; context.stroke(); context.fillStyle = '#10171c'; context.font = 'bold 6px sans-serif'; context.textAlign = 'center'; context.textBaseline = 'middle'; context.fillText(String(band.index + 1), x, y) }
   }, [adaptiveQ, bands, bypassed, effectId, engine, scale, selected])
-  useEffect(() => { draw(); const observer = new ResizeObserver(draw); if (ref.current) observer.observe(ref.current); const unsubscribe = subscribeMeterFrame(draw); return () => { observer.disconnect(); unsubscribe() } }, [draw])
+  useEffect(() => { draw(); const observer = new ResizeObserver(draw); if (ref.current) observer.observe(ref.current); const unsubscribe = subscribeAnalyzerFrame(draw); return () => { observer.disconnect(); unsubscribe() } }, [draw])
   const point = (event: React.PointerEvent<HTMLCanvasElement>) => { const bounds = event.currentTarget.getBoundingClientRect(); return { x: (event.clientX - bounds.left) * event.currentTarget.width / bounds.width, y: (event.clientY - bounds.top) * event.currentTarget.height / bounds.height } }
-  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const index = dragging.current; if (index === null) return; const p = point(event); const frequency = Math.round(parameterFrequencyAtX(p.x, event.currentTarget.width)); const gain = Math.round(Math.max(-18, Math.min(18, (event.currentTarget.height / 2 - p.y) / (event.currentTarget.height * .46) * EQ_RANGE_DB)) * 10) / 10; dragPreview.current = { index, frequency, gain }; draw(); onParam(`band${index}.freq`, frequency); onParam(`band${index}.gain`, gain) }
+  const update = (event: React.PointerEvent<HTMLCanvasElement>) => { const index = dragging.current; if (index === null) return; const p = point(event); const frequency = Math.round(parameterFrequencyAtX(p.x, event.currentTarget.width)); const gain = Math.round(Math.max(-18, Math.min(18, (event.currentTarget.height / 2 - p.y) / (event.currentTarget.height * .46) * EQ_RANGE_DB)) * 10) / 10; dragPreview.current = { index, frequency, gain }; draw(); const last = lastDragValues.current; if (last?.frequency === frequency && last.gain === gain) return; lastDragValues.current = { frequency, gain }; onParam(`band${index}.freq`, frequency); onParam(`band${index}.gain`, gain) }
   const closestEnabled = (event: React.PointerEvent<HTMLCanvasElement> | React.WheelEvent<HTMLCanvasElement>) => { const p = point(event as React.PointerEvent<HTMLCanvasElement>); return bands.filter((band) => band.enabled).map((band) => ({ band, distance: Math.hypot(frequencyToX(band.frequency, event.currentTarget.width) - p.x, event.currentTarget.height / 2 - band.gain / EQ_RANGE_DB * event.currentTarget.height * .46 - p.y) })).sort((a, b) => a.distance - b.distance)[0] }
-  const down = (event: React.PointerEvent<HTMLCanvasElement>) => { const closest = closestEnabled(event); if (!closest || closest.distance > 16) return; dragging.current = closest.band.index; onSelect(closest.band.index); event.currentTarget.setPointerCapture(event.pointerId); update(event) }
-  const up = (event: React.PointerEvent<HTMLCanvasElement>) => { dragging.current = null; dragPreview.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
+  const down = (event: React.PointerEvent<HTMLCanvasElement>) => { const closest = closestEnabled(event); if (!closest || closest.distance > 16) return; dragging.current = closest.band.index; lastDragValues.current = null; onSelect(closest.band.index); event.currentTarget.setPointerCapture(event.pointerId); update(event) }
+  const up = (event: React.PointerEvent<HTMLCanvasElement>) => { dragging.current = null; dragPreview.current = null; lastDragValues.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
   const wheel = (event: React.WheelEvent<HTMLCanvasElement>) => { const closest = closestEnabled(event); if (!closest || closest.distance > 18) return; event.preventDefault(); onSelect(closest.band.index); onParam(`band${closest.band.index}.q`, Math.max(.2, Math.min(12, Math.round((closest.band.q * (event.deltaY < 0 ? 1.08 : 1 / 1.08)) * 100) / 100))) }
   return <canvas className="eq-display interactive" ref={ref} width="450" height="48" onPointerDown={down} onPointerMove={update} onPointerUp={up} onPointerCancel={up} onWheel={wheel} title="포인트 드래그: 주파수/게인 · 포인트 위 휠: Q" />
 }
@@ -960,7 +1063,7 @@ function DisperserDisplay({ effectId, frequency, amount, pinch, bypassed, onFreq
     context.fillText(`${stages} STAGES`, width - 7, height - 5)
     }
     draw()
-    return subscribeMeterFrame(draw)
+    return subscribeAnalyzerFrame(draw)
   }, [amount, bypassed, effectId, engine, frequency, pinch])
 
   const updateFrequency = (event: React.PointerEvent<HTMLCanvasElement>) => {
@@ -1090,7 +1193,7 @@ function shaperPreview(curve: number, input: number): number {
   return Math.tanh(input)
 }
 
-const pluginRef = (plugin: PluginDescriptor): ExternalPluginRef => ({ format: plugin.format, uid: plugin.uid, name: plugin.name, vendor: plugin.vendor, path: plugin.path, audioInputBuses: plugin.audioInputBuses, audioOutputBuses: plugin.audioOutputBuses, supportsSidechain: plugin.supportsSidechain, paramCount: plugin.paramCount, parameters: plugin.parameters })
+const pluginRef = (plugin: PluginDescriptor): ExternalPluginRef => ({ format: plugin.format, uid: plugin.uid, name: plugin.name, vendor: plugin.vendor, path: plugin.path, audioInputBuses: plugin.audioInputBuses, audioOutputBuses: plugin.audioOutputBuses, supportsSidechain: plugin.supportsSidechain, hasEditor: plugin.hasEditor, paramCount: plugin.paramCount, parameters: plugin.parameters })
 
 type EffectCatalogEntry = { type: EffectType; description: string; category: string }
 type PickerEffect = { key: string; name: string; detail: string; category: string; type: EffectType; plugin?: ExternalPluginRef }
@@ -1131,6 +1234,22 @@ function pluginEffectCategory(plugin: PluginDescriptor): string {
   if (/distort|saturat|drive|color|excite/.test(value)) return 'Color & Drive'
   if (/pitch|tune|vocal|vocoder/.test(value)) return 'Pitch & Vocal'
   return 'Utility & Other'
+}
+
+function normalizeParameterLabel(label: string): string {
+  return label.toLocaleLowerCase().replace(/[^a-z0-9]/g, '')
+    .replace('thresh', 'threshold')
+    .replace('freq', 'frequency')
+    .replace('lowsplit', 'splitlow')
+    .replace('highsplit', 'splithigh')
+    .replace('velcurve', 'velocitycurve')
+    .replace('ingain', 'inputdb')
+    .replace('outgain', 'outputdb')
+    .replace('drywet', 'mix')
+}
+
+function parameterLabelsMatch(control: string, option: string): boolean {
+  return control === option || option.startsWith(control) || control.startsWith(option) || option.includes(control)
 }
 
 const dbFormat = (value: number) => `${value > 0 ? '+' : ''}${value.toFixed(1)} dB`

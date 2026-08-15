@@ -9,7 +9,7 @@ import type {
 } from '../types'
 import { NotSupportedError } from '../types'
 import { commands } from './bindings'
-import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot } from './bindings'
+import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot, PluginDescriptor as NativePluginDescriptor } from './bindings'
 import { getAssetPeaks } from './binary'
 
 const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0 }
@@ -82,7 +82,10 @@ export class RustEngine implements IAudioEngine {
     const progress = new Channel<DecodeProgress>()
     progress.onmessage = () => undefined
     const asset = await unwrapCommand(commands.engineLoadAudioFile(path, progress))
-    const peaks = await getAssetPeaks(asset.id, 0)
+    const peaks = await getAssetPeaks(asset.id, 0).catch(async () => {
+      const values = await unwrapCommand(commands.engineAssetPeaks(asset.id, 0)).catch(() => [])
+      return Float32Array.from(values)
+    })
     return { ...asset, durationSec: finite(asset.durationSec), peaks }
   }
 
@@ -162,6 +165,7 @@ export class RustEngine implements IAudioEngine {
   setBusVolume(busId: string, gainDb: number): void { this.queueRealtime(`bus:${busId}`, () => commands.engineSetBusVolume(busId, gainDb)) }
   setMasterVolume(gainDb: number): void { this.queueRealtime('master', () => commands.engineSetMasterVolume(gainDb)) }
   setEffectParam(effectId: string, paramId: string, value: number): void { this.queueRealtime(`effect:${effectId}:${paramId}`, () => commands.engineSetEffectParam(effectId, paramId, value)) }
+  setEffectBypass(effectId: string, bypassed: boolean): void { this.send(commands.engineSetEffectBypass(effectId, bypassed)) }
 
   async getEqResponse(effectId: string, points: number): Promise<EqFrequencyResponse | null> {
     if (!isTauriRuntime()) return null
@@ -200,16 +204,41 @@ export class RustEngine implements IAudioEngine {
   async connectMidiInput(portId: string, trackId: string): Promise<void> { await unwrapCommand(commands.engineConnectMidiInput(portId, trackId)) }
   async disconnectMidiInput(portId: string): Promise<void> { await unwrapCommand(commands.engineDisconnectMidiInput(portId)) }
   getStreamStatus(): StreamStatus { return this.streamStatus }
-  async scanPlugins(): Promise<PluginDescriptor[]> {
-    const plugins = await unwrapCommand(commands.scanVst3Plugins([]))
-    return plugins
-      .filter((plugin) => plugin.format === 'vst3' || plugin.format === 'clap')
-      .map((plugin) => ({ ...plugin, format: plugin.format === 'clap' ? 'clap' : 'vst3', parameters: plugin.parameters.map((parameter) => ({ ...parameter, min: finite(parameter.min), max: finite(parameter.max, 1), defaultValue: finite(parameter.defaultValue) })) }))
+  async cachedPlugins(): Promise<PluginDescriptor[]> {
+    return this.normalizePlugins(await unwrapCommand(commands.cachedVst3Plugins()))
+  }
+  async scanPlugins(force = false): Promise<PluginDescriptor[]> {
+    return this.normalizePlugins(await unwrapCommand(commands.scanVst3Plugins([], force)))
+  }
+  async inspectPlugin(plugin: PluginDescriptor): Promise<PluginDescriptor> {
+    return this.normalizePlugins([await unwrapCommand(commands.inspectPluginMetadata(plugin.format, plugin.path, plugin.uid))])[0] ?? plugin
+  }
+  async openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void> {
+    await this.init()
+    if (isTauriRuntime()) await unwrapCommand(commands.engineOpenPluginEditor(targetKind, targetId))
+  }
+  async closePluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void> {
+    if (isTauriRuntime()) await unwrapCommand(commands.engineClosePluginEditor(targetKind, targetId))
+  }
+  async isPluginEditorOpen(targetKind: 'effect' | 'instrument', targetId: string): Promise<boolean> {
+    return isTauriRuntime() ? unwrapCommand(commands.enginePluginEditorIsOpen(targetKind, targetId)) : false
+  }
+  async savePluginState(targetKind: 'effect' | 'instrument', targetId: string): Promise<number[]> {
+    return isTauriRuntime() ? unwrapCommand(commands.engineSavePluginState(targetKind, targetId)) : []
+  }
+  async loadPluginState(targetKind: 'effect' | 'instrument', targetId: string, state: number[]): Promise<void> {
+    if (isTauriRuntime()) await unwrapCommand(commands.engineLoadPluginState(targetKind, targetId, state))
   }
   async renderOffline(_req: OfflineRenderRequest): Promise<OfflineRenderResult> { throw new NotSupportedError('VST3 rendering is available in phase three.') }
 
   capabilities(): EngineCapabilities {
     return { supportsExternalPlugins: true, supportsRealtimePluginInsert: true, supportsOfflineRender: true, supportedAudioExtensions: ['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac'] }
+  }
+
+  private normalizePlugins(plugins: NativePluginDescriptor[]): PluginDescriptor[] {
+    return plugins
+      .filter((plugin) => plugin.format === 'vst3' || plugin.format === 'clap')
+      .map((plugin) => ({ ...plugin, format: plugin.format === 'clap' ? 'clap' : 'vst3', parameters: plugin.parameters.map((parameter) => ({ ...parameter, min: finite(parameter.min), max: finite(parameter.max, 1), defaultValue: finite(parameter.defaultValue) })) }))
   }
 
   private send(command: Promise<CommandResult<unknown>>): void {
@@ -276,7 +305,14 @@ export class RustEngine implements IAudioEngine {
         const id = this.distortionMeterIds[index]
         const source = state.distortionSpectra[index]
         if (!id || !source) continue
-        this.distortionSpectra[id] = source.map((value) => finite(value))
+        let values = this.distortionSpectra[id] as number[] | undefined
+        if (!values || values.length !== source.length) values = Array.from({ length: source.length }, () => 0)
+        for (let bin = 0; bin < source.length; bin += 1) {
+          const target = finite(source[bin] ?? null)
+          const current = values[bin] ?? 0
+          values[bin] = current + (target - current) * (target > current ? .68 : .36)
+        }
+        this.distortionSpectra[id] = values
       }
       for (let index = 0; index < this.limiterMeterIds.length; index += 1) {
         const id = this.limiterMeterIds[index]
@@ -301,7 +337,11 @@ export class RustEngine implements IAudioEngine {
     } catch (error) {
       this.streamStatus = { ...this.streamStatus, running: false, error: describeEngineError(error) }
     } finally {
-      this.schedulePoll(playing ? 1000 / 30 : 250)
+      // Analyzer buffers are produced by this snapshot. Poll at display rate
+      // while transport is active; canvas consumers update imperatively and do
+      // not cause React/store renders.
+      const liveMidi = this.liveMidiNotes.size > 0 || Object.values(this.activeVoiceCounts).some((count) => count > 0)
+      this.schedulePoll(playing || liveMidi ? 1000 / 60 : 1000 / 15)
     }
   }
 }

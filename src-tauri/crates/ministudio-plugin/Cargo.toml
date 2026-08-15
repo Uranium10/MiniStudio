@@ -1,0 +1,17 @@
+[package]
+name = "ministudio-plugin"
+version = "0.1.0"
+edition = "2021"
+description = "Isolated VST3 and CLAP discovery and hosting for MiniStudio"
+
+[dependencies]
+clack-host = "0.1.1"
+clack-extensions = { version = "0.1.1", features = ["clack-host", "audio-ports", "gui", "latency", "log", "note-ports", "params", "state", "tail", "thread-check"] }
+ministudio-contracts = { path = "../ministudio-contracts" }
+ministudio-dsp = { path = "../ministudio-dsp" }
+serde = { version = "1", features = ["derive"] }
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+vst3-host = { version = "0.9.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winuser"] }

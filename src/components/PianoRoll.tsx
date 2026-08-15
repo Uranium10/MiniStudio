@@ -4,15 +4,17 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { GRID_OPTIONS, MIDI_PITCH_BEND_LANE, MIDI_PPQ, type CcLane, type MidiNote } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { useProjectStore } from '../store/projectStore'
-import { getEffectiveTool, useToolStore } from '../store/toolStore'
+import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { MenuPanel, type MenuItem } from './Menu'
 import { findVisibleNoteStart } from './pianoRollMath'
+import { buildRulerTicks } from './rulerMath'
 
 const GUTTER = 52
 const EVENT_LANE_HEIGHT = 74
+const PIANO_RULER_HEIGHT = 24
 const SCALES: Record<string, number[]> = { Major: [0, 2, 4, 5, 7, 9, 11], 'Natural Minor': [0, 2, 3, 5, 7, 8, 10], 'Harmonic Minor': [0, 2, 3, 5, 7, 8, 11], Dorian: [0, 2, 3, 5, 7, 9, 10], Phrygian: [0, 1, 3, 5, 7, 8, 10], Lydian: [0, 2, 4, 6, 7, 9, 11], Mixolydian: [0, 2, 4, 5, 7, 9, 10], Locrian: [0, 1, 3, 5, 6, 8, 10], 'Pentatonic Major': [0, 2, 4, 7, 9], 'Pentatonic Minor': [0, 3, 5, 7, 10], Blues: [0, 3, 5, 6, 7, 10] }
 
-type Drag = { mode: 'move' | 'resize'; note: MidiNote; startX: number; startY: number; latestTick: number; latestPitch: number; latestLength: number; copy: boolean }
+type Drag = { mode: 'move' | 'resize' | 'create'; note: MidiNote; startX: number; startY: number; latestTick: number; latestPitch: number; latestLength: number; copy: boolean }
 type Marquee = { x0: number; y0: number; x1: number; y1: number }
 type NoteMenu = { x: number; y: number; tick: number; pitch: number; note: MidiNote | null }
 type EventLane = 'velocity' | 'releaseVelocity' | 'sustain' | 'vibrato' | 'pitchBend' | 'cc'
@@ -22,7 +24,6 @@ export function PianoRoll() {
   const tracks = useProjectStore((state) => state.project.tracks)
   const selected = useProjectStore((state) => state.selectedNoteIds)
   const maximized = useProjectStore((state) => state.editorMaximized)
-  const playhead = useProjectStore((state) => state.playheadSec)
   const focused = useProjectStore((state) => state.editFocus === 'pianoRoll')
   const setEditFocus = useProjectStore((state) => state.setEditFocus)
   const engine = useEngine()
@@ -53,12 +54,13 @@ export function PianoRoll() {
   const marqueeBaseRef = useRef<string[]>([])
   const [marquee, setMarquee] = useState<Marquee | null>(null)
   const [noteMenu, setNoteMenu] = useState<NoteMenu | null>(null)
+  const [noteCursor, setNoteCursor] = useState('default')
   const [eventLane, setEventLane] = useState<EventLane>('velocity')
   const [genericCc, setGenericCc] = useState(11)
   const centredClipId = useRef<string | null>(null)
   const auditionId = useRef(2_000_000)
   const pixelsPerTick = pixelsPerQuarter / MIDI_PPQ
-  const maxTicks = Math.max(15_360, clip?.loopLengthTicks ?? 0, ...(clip?.notes.map((note) => note.startTicks + note.lengthTicks + 960) ?? []), ...(clip?.ccLanes.flatMap((lane) => lane.points.map((point) => point.ticks + 960)) ?? []))
+  const maxTicks = useMemo(() => Math.max(15_360, clip?.loopLengthTicks ?? 0, ...(clip?.notes.map((note) => note.startTicks + note.lengthTicks + 960) ?? []), ...(clip?.ccLanes.flatMap((lane) => lane.points.map((point) => point.ticks + 960)) ?? [])), [clip?.ccLanes, clip?.loopLengthTicks, clip?.notes])
   const contentWidth = Math.max(1000, Math.ceil(maxTicks * pixelsPerTick))
   const contentHeight = 128 * noteHeight
   const activeCc = eventLane === 'pitchBend' ? MIDI_PITCH_BEND_LANE : eventLane === 'sustain' ? 64 : eventLane === 'vibrato' ? 1 : genericCc
@@ -84,21 +86,50 @@ export function PianoRoll() {
     scroll.scrollLeft = Math.max(0, (clip.notes[0]?.startTicks ?? 0) * pixelsPerTick - 80)
   }, [clip, noteHeight, pixelsPerTick])
   useEffect(() => {
+    drawGrid(backgroundRef.current, contentWidth, contentHeight, noteHeight, pixelsPerTick, gridTicks, scaleRoot, scaleName)
+  }, [contentHeight, contentWidth, gridTicks, noteHeight, pixelsPerTick, scaleName, scaleRoot])
+
+  useEffect(() => {
     if (!clip) return
     const scroll = scrollRef.current
-    const draw = () => {
-      drawGrid(backgroundRef.current, contentWidth, contentHeight, noteHeight, pixelsPerTick, gridTicks, scaleRoot, scaleName)
-      drawNotes(notesRef.current, clip.notes, selected, contentWidth, contentHeight, noteHeight, pixelsPerTick, scroll)
-      drawOverlay(overlayRef.current, contentWidth, contentHeight, (playhead - clip.startSec) * useProjectStore.getState().project.transport.bpm / 60 * MIDI_PPQ * pixelsPerTick, dragRef.current, noteHeight, pixelsPerTick)
-      drawEventLane(eventCanvasRef.current, eventLane, activeControllerLane, clip.notes, selected, pixelsPerTick, gridTicks, scroll?.scrollLeft ?? 0)
+    let frame = requestAnimationFrame(() => drawNotes(notesRef.current, clip.notes, selected, contentWidth, contentHeight, noteHeight, pixelsPerTick, scroll))
+    const onScroll = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => drawNotes(notesRef.current, clip.notes, selected, contentWidth, contentHeight, noteHeight, pixelsPerTick, scroll))
     }
-    let frame = requestAnimationFrame(draw)
-    const onScroll = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw) }
-    const resize = new ResizeObserver(onScroll)
-    if (eventCanvasRef.current) resize.observe(eventCanvasRef.current)
     scroll?.addEventListener('scroll', onScroll, { passive: true })
-    return () => { cancelAnimationFrame(frame); resize.disconnect(); scroll?.removeEventListener('scroll', onScroll) }
-  }, [clip, selected, contentWidth, contentHeight, noteHeight, pixelsPerTick, gridTicks, scaleRoot, scaleName, playhead, eventLane, activeControllerLane])
+    return () => { cancelAnimationFrame(frame); scroll?.removeEventListener('scroll', onScroll) }
+  }, [clip, contentHeight, contentWidth, noteHeight, pixelsPerTick, selected])
+
+  useEffect(() => {
+    if (!clip) return
+    let frame = 0
+    let previousX = Number.NaN
+    const animate = () => {
+      const state = useProjectStore.getState()
+      const x = (state.playheadSec - clip.startSec) * state.project.transport.bpm / 60 * MIDI_PPQ * pixelsPerTick
+      if (x !== previousX || dragRef.current) {
+        previousX = x
+        drawOverlay(overlayRef.current, contentWidth, contentHeight, x, dragRef.current, noteHeight, pixelsPerTick)
+      }
+      frame = requestAnimationFrame(animate)
+    }
+    frame = requestAnimationFrame(animate)
+    return () => cancelAnimationFrame(frame)
+  }, [clip, contentHeight, contentWidth, noteHeight, pixelsPerTick])
+
+  useEffect(() => {
+    if (!clip) return
+    const scroll = scrollRef.current
+    let frame = 0
+    const draw = () => drawEventLane(eventCanvasRef.current, eventLane, activeControllerLane, clip.notes, selected, pixelsPerTick, gridTicks, scroll?.scrollLeft ?? 0)
+    const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw) }
+    const resize = new ResizeObserver(schedule)
+    if (eventCanvasRef.current) resize.observe(eventCanvasRef.current)
+    scroll?.addEventListener('scroll', schedule, { passive: true })
+    schedule()
+    return () => { cancelAnimationFrame(frame); resize.disconnect(); scroll?.removeEventListener('scroll', schedule) }
+  }, [activeControllerLane, clip, eventLane, gridTicks, pixelsPerTick, selected])
 
   const noteAt = (x: number, y: number): MidiNote | undefined => {
     if (!clip) return undefined
@@ -123,6 +154,30 @@ export function PianoRoll() {
     const { x, y } = point(event)
     const hit = noteAt(x, y)
     const tool = getEffectiveTool(useToolStore.getState())
+    if (!hit && (event.ctrlKey || event.metaKey) && (tool === 'arrow' || tool === 'range')) {
+      const pitch = snapPitch(127 - Math.floor(y / noteHeight))
+      const anchor = snapTick(x / pixelsPerTick, event.shiftKey)
+      const id = useProjectStore.getState().addMidiNote(editor.trackId, editor.clipId, { pitch, velocity: keyboardVelocity, startTicks: anchor, lengthTicks: gridTicks, releaseVelocity: 64, muted: false })
+      if (!id) return
+      audition(pitch)
+      const note: MidiNote = { id, pitch, velocity: keyboardVelocity, startTicks: anchor, lengthTicks: gridTicks, releaseVelocity: 64, muted: false }
+      dragRef.current = { mode: 'create', note, startX: x, startY: y, latestTick: anchor, latestPitch: pitch, latestLength: gridTicks, copy: false }
+      setNoteCursor('ew-resize')
+      const move = (pointer: PointerEvent) => {
+        const drag = dragRef.current; if (!drag) return
+        const current = snapTick(anchor + (pointer.clientX - event.clientX) / pixelsPerTick, pointer.shiftKey)
+        drag.latestTick = Math.min(anchor, current)
+        drag.latestLength = Math.max(pointer.shiftKey ? 1 : gridTicks, Math.abs(current - anchor) || gridTicks)
+        drawOverlay(overlayRef.current, contentWidth, contentHeight, -1, drag, noteHeight, pixelsPerTick)
+      }
+      const up = () => {
+        const drag = dragRef.current; dragRef.current = null; setNoteCursor('default')
+        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up)
+        if (drag) useProjectStore.getState().updateMidiNotes(editor.trackId, editor.clipId, [id], { startTicks: drag.latestTick, lengthTicks: drag.latestLength })
+      }
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up, { once: true })
+      return
+    }
     if (tool === 'paint' || (!hit && event.detail >= 2)) {
       const pitch = snapPitch(127 - Math.floor(y / noteHeight)); const tick = snapTick(x / pixelsPerTick, event.shiftKey)
       const id = useProjectStore.getState().addMidiNote(editor.trackId, editor.clipId, { pitch, velocity: keyboardVelocity, startTicks: tick, lengthTicks: gridTicks, releaseVelocity: 64, muted: false })
@@ -149,6 +204,7 @@ export function PianoRoll() {
     if (!store.selectedNoteIds.includes(hit.id) || additive) store.selectMidiNote(hit.id, additive)
     audition(hit.pitch)
     const resize = Math.abs(x - (hit.startTicks + hit.lengthTicks) * pixelsPerTick) <= 7
+    setNoteCursor(resize ? 'ew-resize' : 'grabbing')
     dragRef.current = { mode: resize ? 'resize' : 'move', note: { ...hit }, startX: x, startY: y, latestTick: hit.startTicks, latestPitch: hit.pitch, latestLength: hit.lengthTicks, copy: event.altKey && !resize }
     const move = (pointer: PointerEvent) => {
       const drag = dragRef.current; if (!drag) return
@@ -158,6 +214,7 @@ export function PianoRoll() {
     }
     const up = () => {
       const drag = dragRef.current; dragRef.current = null
+      setNoteCursor('default')
       window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up)
       if (!drag) return
       const ids = useProjectStore.getState().selectedNoteIds.includes(drag.note.id) ? useProjectStore.getState().selectedNoteIds : [drag.note.id]
@@ -176,7 +233,14 @@ export function PianoRoll() {
 
   const onOverlayPointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
     const box = marqueeRef.current
-    if (!box) return
+    if (!box) {
+      const { x, y } = point(event)
+      const hit = noteAt(x, y)
+      const tool = getEffectiveTool(useToolStore.getState())
+      const atResizeEdge = hit && Math.abs(x - (hit.startTicks + hit.lengthTicks) * pixelsPerTick) <= 7
+      setNoteCursor(atResizeEdge && (tool === 'arrow' || tool === 'range') ? 'ew-resize' : pianoCursorFor(tool, Boolean(hit)))
+      return
+    }
     const { x, y } = point(event)
     box.x1 = x
     box.y1 = y
@@ -304,12 +368,13 @@ export function PianoRoll() {
     </div>
     <div className="keyboard-toolbar"><span>↑↓ 반음 · Ctrl+↑↓ 옥타브 · Alt+드래그 복사 · D 다음 구간 복제 · W/E 가로 줌 · CapsLock 가상 피아노</span><label>미리듣기 벨로시티 <input type="range" min="1" max="127" value={keyboardVelocity} onChange={(event) => setKeyboardVelocity(Number(event.target.value))} /> {keyboardVelocity}</label></div>
     <div className="piano-scroll" ref={scrollRef}>
-      <div className="piano-stage" style={{ width: GUTTER + contentWidth, height: contentHeight }}>
-        <canvas className="piano-layer piano-background" ref={backgroundRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER }} />
-        <canvas className="piano-layer piano-notes" ref={notesRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER }} />
-        <canvas className="piano-layer piano-overlay" ref={overlayRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER }} onContextMenu={(event) => { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const note = noteAt(x, y) ?? null; if (note && !selected.includes(note.id)) useProjectStore.getState().selectMidiNote(note.id); setNoteMenu({ x: event.clientX, y: event.clientY, tick: snapTick(x / pixelsPerTick), pitch: snapPitch(127 - Math.floor(y / noteHeight)), note }) }} onPointerDown={onPointerDown} onPointerMove={onOverlayPointerMove} onPointerUp={finishMarquee} onPointerCancel={finishMarquee} />
-        <PianoGutter height={contentHeight} noteHeight={noteHeight} onNote={(pitch) => audition(pitch)} onSelectPitch={(pitch) => useProjectStore.setState({ selectedNoteIds: clip.notes.filter((note) => note.pitch === pitch).map((note) => note.id) })} />
-        {marquee && <div className="note-marquee" style={{ left: GUTTER + Math.min(marquee.x0, marquee.x1), top: Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }} />}
+      <div className="piano-stage" style={{ width: GUTTER + contentWidth, height: contentHeight + PIANO_RULER_HEIGHT }}>
+        <PianoRuler clipStartSec={clip.startSec} width={contentWidth} pixelsPerQuarter={pixelsPerQuarter} />
+        <canvas className="piano-layer piano-background" ref={backgroundRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER, top: PIANO_RULER_HEIGHT }} />
+        <canvas className="piano-layer piano-notes" ref={notesRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER, top: PIANO_RULER_HEIGHT }} />
+        <canvas className="piano-layer piano-overlay" ref={overlayRef} width={contentWidth} height={contentHeight} style={{ left: GUTTER, top: PIANO_RULER_HEIGHT, cursor: noteCursor }} onContextMenu={(event) => { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top; const note = noteAt(x, y) ?? null; if (note && !selected.includes(note.id)) useProjectStore.getState().selectMidiNote(note.id); setNoteMenu({ x: event.clientX, y: event.clientY, tick: snapTick(x / pixelsPerTick), pitch: snapPitch(127 - Math.floor(y / noteHeight)), note }) }} onPointerDown={onPointerDown} onPointerMove={onOverlayPointerMove} onPointerLeave={() => { if (!marqueeRef.current && !dragRef.current) setNoteCursor('default') }} onPointerUp={finishMarquee} onPointerCancel={finishMarquee} />
+        <div className="piano-gutter-offset" style={{ top: PIANO_RULER_HEIGHT }}><PianoGutter height={contentHeight} noteHeight={noteHeight} onNote={(pitch) => audition(pitch)} onSelectPitch={(pitch) => useProjectStore.setState({ selectedNoteIds: clip.notes.filter((note) => note.pitch === pitch).map((note) => note.id) })} /></div>
+        {marquee && <div className="note-marquee" style={{ left: GUTTER + Math.min(marquee.x0, marquee.x1), top: PIANO_RULER_HEIGHT + Math.min(marquee.y0, marquee.y1), width: Math.abs(marquee.x1 - marquee.x0), height: Math.abs(marquee.y1 - marquee.y0) }} />}
         {noteMenu && <MenuPanel items={noteMenuItems} anchor={{ x: noteMenu.x, y: noteMenu.y }} onClose={() => setNoteMenu(null)} />}
       </div>
     </div>
@@ -333,7 +398,30 @@ export function PianoRoll() {
 
 function PianoGutter({ height, noteHeight, onNote, onSelectPitch }: { height: number; noteHeight: number; onNote(pitch: number): void; onSelectPitch(pitch: number): void }) {
   const rows = useMemo(() => Array.from({ length: 128 }, (_, row) => 127 - row), [])
-  return <div className="piano-gutter" style={{ width: GUTTER, height }}>{rows.map((pitch) => { const black = [1, 3, 6, 8, 10].includes(pitch % 12); return <button key={pitch} className={black ? 'black' : 'white'} style={{ height: noteHeight }} onPointerDown={() => onNote(pitch)} onDoubleClick={() => onSelectPitch(pitch)}>{pitch % 12 === 0 ? `C${Math.floor(pitch / 12) - 1}` : ''}</button> })}</div>
+  const dragging = useRef(false)
+  const lastPitch = useRef<number | null>(null)
+  const playAt = (x: number, y: number) => {
+    const button = document.elementFromPoint(x, y)?.closest<HTMLButtonElement>('.piano-gutter button[data-pitch]')
+    const pitch = button ? Number(button.dataset.pitch) : Number.NaN
+    if (!Number.isFinite(pitch) || pitch === lastPitch.current) return
+    lastPitch.current = pitch
+    onNote(pitch)
+  }
+  return <div className="piano-gutter" style={{ width: GUTTER, height }} onPointerDown={(event) => { event.preventDefault(); dragging.current = true; lastPitch.current = null; event.currentTarget.setPointerCapture(event.pointerId); playAt(event.clientX, event.clientY) }} onPointerMove={(event) => { if (dragging.current) playAt(event.clientX, event.clientY) }} onPointerUp={(event) => { dragging.current = false; lastPitch.current = null; if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }} onPointerCancel={() => { dragging.current = false; lastPitch.current = null }}>{rows.map((pitch) => { const black = [1, 3, 6, 8, 10].includes(pitch % 12); return <button key={pitch} data-pitch={pitch} className={black ? 'black' : 'white'} style={{ height: noteHeight }} onDoubleClick={() => onSelectPitch(pitch)}>{pitch % 12 === 0 ? `C${Math.floor(pitch / 12) - 1}` : ''}</button> })}</div>
+}
+
+function PianoRuler({ clipStartSec, width, pixelsPerQuarter }: { clipStartSec: number; width: number; pixelsPerQuarter: number }) {
+  const engine = useEngine()
+  const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const pixelsPerSecond = pixelsPerQuarter * bpm / 60
+  const ticks = useMemo(() => buildRulerTicks(width, pixelsPerSecond, bpm, signature), [bpm, pixelsPerSecond, signature, width])
+  return <div className="piano-ruler" style={{ width: GUTTER + width }} onPointerDown={(event) => {
+    const localSec = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left - GUTTER) / pixelsPerSecond)
+    const sec = clipStartSec + localSec
+    useProjectStore.getState().setPlayhead(sec)
+    void engine.seek(sec)
+  }}><span className="piano-ruler-corner" style={{ width: GUTTER }} />{ticks.map((tick) => <i key={tick.sec} className={tick.strong ? 'strong' : ''} style={{ left: GUTTER + tick.sec * pixelsPerSecond }}>{tick.label && <b>{tick.label}</b>}</i>)}</div>
 }
 
 function setupCanvas(canvas: HTMLCanvasElement | null, width: number, height: number) { if (!canvas) return null; const ratio = Math.min(window.devicePixelRatio || 1, 1.5); if (canvas.width !== Math.ceil(width * ratio) || canvas.height !== Math.ceil(height * ratio)) { canvas.width = Math.ceil(width * ratio); canvas.height = Math.ceil(height * ratio); canvas.style.width = `${width}px`; canvas.style.height = `${height}px` }; const context = canvas.getContext('2d'); context?.setTransform(ratio, 0, 0, ratio, 0, 0); return context }
@@ -415,4 +503,7 @@ function midiCcName(cc: number): string {
   return names[cc] ?? 'Controller'
 }
 const lowerBound = findVisibleNoteStart
+function pianoCursorFor(tool: ToolId, hit: boolean): string {
+  return ({ arrow: hit ? 'grab' : 'default', range: hit ? 'grab' : 'crosshair', split: 'col-resize', erase: 'not-allowed', paint: 'crosshair', mute: 'pointer', listen: 'pointer' } as Record<ToolId, string>)[tool]
+}
 function nearestScalePitch(pitch: number, root: number, scale: number[]) { for (let distance = 0; distance < 12; distance += 1) { for (const candidate of [pitch - distance, pitch + distance]) if (candidate >= 0 && candidate <= 127 && scale.includes((candidate - root + 120) % 12)) return candidate } return Math.max(0, Math.min(127, pitch)) }

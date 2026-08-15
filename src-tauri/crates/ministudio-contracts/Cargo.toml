@@ -1,0 +1,9 @@
+[package]
+name = "ministudio-contracts"
+version = "0.1.0"
+edition = "2021"
+description = "Serializable domain and IPC contracts for MiniStudio"
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }

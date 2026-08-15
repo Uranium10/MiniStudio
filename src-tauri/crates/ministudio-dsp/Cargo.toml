@@ -1,0 +1,9 @@
+[package]
+name = "ministudio-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Allocation-free native DSP for MiniStudio"
+
+[dependencies]
+rustfft = "6.4"
+ministudio-contracts = { path = "../ministudio-contracts" }

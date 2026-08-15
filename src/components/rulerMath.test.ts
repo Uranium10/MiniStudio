@@ -1,6 +1,6 @@
 // Ruler tick layout regression tests.
 import { describe, expect, it } from 'vitest'
-import { buildRulerTicks } from './rulerMath'
+import { adaptiveGridStepSec, buildRulerTicks } from './rulerMath'
 
 const FOUR_FOUR = { numerator: 4, denominator: 4 }
 
@@ -49,5 +49,10 @@ describe('buildRulerTicks', () => {
 
   it('returns nothing for a degenerate zoom or tempo', () => {
     expect(buildRulerTicks(1000, 0, 120, FOUR_FOUR)).toEqual([])
+  })
+
+  it('coarsens painted grid lines without changing their musical phase', () => {
+    expect(adaptiveGridStepSec(.125, 20)).toBe(.5)
+    expect(adaptiveGridStepSec(.125, 100)).toBe(.125)
   })
 })
