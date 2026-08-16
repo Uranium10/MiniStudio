@@ -725,6 +725,10 @@ pub struct Plugin {
 
 // Internal trait for hiding implementation details
 pub(crate) trait PluginInternal: Send {
+    #[cfg(feature = "process-isolation")]
+    fn take_realtime_client(&mut self) -> Option<crate::realtime_ipc::RealtimeClient> {
+        None
+    }
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()>;
     /// Schedule a parameter change at a sample offset within the next process block.
     /// Defaults to a block-start change (ignores the offset) for implementations that don't
@@ -904,7 +908,12 @@ pub(crate) trait PluginInternal: Send {
     fn take_editor_host_actions(&mut self) -> Vec<crate::process_isolation::EditorHostAction> {
         Vec::new()
     }
-    fn set_editor_host_state(&mut self, _state: crate::process_isolation::EditorHostState) {}
+    fn set_editor_host_state(
+        &mut self,
+        _state: crate::process_isolation::EditorHostState,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn get_editor_size(&self) -> Result<(i32, i32)>;
     /// Whether the editor accepts host-driven size changes.
     fn editor_can_resize(&self) -> bool {
@@ -1116,6 +1125,19 @@ pub(crate) trait PluginInternal: Send {
 }
 
 impl Plugin {
+    /// Detach the process-isolated realtime endpoint from control ownership.
+    ///
+    /// A successful call transfers the only audio-side client to the caller while retaining a
+    /// lightweight recovery handle in the isolated implementation. Native editor, state and
+    /// lifecycle calls can then block on their own control transport without ever contending
+    /// with the audio callback.
+    #[cfg(feature = "process-isolation")]
+    pub fn take_isolated_realtime(&mut self) -> Option<crate::realtime_ipc::RealtimeClient> {
+        self.internal
+            .as_mut()
+            .and_then(|internal| internal.take_realtime_client())
+    }
+
     /// Get plugin information
     pub fn info(&self) -> &PluginInfo {
         &self.info
@@ -2052,10 +2074,14 @@ impl Plugin {
     }
 
     /// Synchronize native host-chrome indicators with authoritative DAW state.
-    pub fn set_editor_host_state(&mut self, state: crate::process_isolation::EditorHostState) {
-        if let Some(internal) = self.internal.as_mut() {
-            internal.set_editor_host_state(state);
-        }
+    pub fn set_editor_host_state(
+        &mut self,
+        state: crate::process_isolation::EditorHostState,
+    ) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .set_editor_host_state(state)
     }
 
     /// Get the preferred editor size

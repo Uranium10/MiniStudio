@@ -30,6 +30,8 @@ export const commands = {
 	engineSetEffectBypass: (effectId: string, bypassed: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_effect_bypass", { effectId, bypassed })),
 	engineSetInstrumentParam: (trackId: string, paramId: string, value: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_instrument_param", { trackId, paramId, value })),
 	engineMidiNote: (trackId: string, noteId: number, pitch: number, velocity: number | null, noteOn: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_midi_note", { trackId, noteId, pitch, velocity, noteOn })),
+	/**  Submit a UI/Web-MIDI burst under one control-plane lookup and engine lock. */
+	engineMidiNotes: (trackId: string, notes: MidiNoteInput[]) => typedError<null, EngineError>(__TAURI_INVOKE("engine_midi_notes", { trackId, notes })),
 	engineMidiAllNotesOff: (trackId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_midi_all_notes_off", { trackId })),
 	engineListMidiInputs: () => typedError<MidiInputPortInfo[], EngineError>(__TAURI_INVOKE("engine_list_midi_inputs")),
 	engineConnectMidiInput: (portId: string, trackId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_connect_midi_input", { portId, trackId })),
@@ -44,7 +46,6 @@ export const commands = {
 	engineEqResponse: (effectId: string, points: number) => typedError<EqFrequencyResponse, EngineError>(__TAURI_INVOKE("engine_eq_response", { effectId, points })),
 	engineOpenPluginEditor: (targetKind: string, targetId: string, foreground: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_open_plugin_editor", { targetKind, targetId, foreground })),
 	engineClosePluginEditor: (targetKind: string, targetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_close_plugin_editor", { targetKind, targetId })),
-	engineTakePluginEditorActions: (targetId: string) => typedError<string[], EngineError>(__TAURI_INVOKE("engine_take_plugin_editor_actions", { targetId })),
 	engineSetPluginEditorHostState: (targetId: string, bypassed: boolean, automation: number) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_host_state", { targetId, bypassed, automation })),
 	enginePluginEditorIsOpen: (targetKind: string, targetId: string) => typedError<boolean, EngineError>(__TAURI_INVOKE("engine_plugin_editor_is_open", { targetKind, targetId })),
 	engineSetPluginEditorPinned: (targetId: string, pinned: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_pinned", { targetId, pinned })),
@@ -263,6 +264,13 @@ export type MidiInputPortInfo = {
 	targetTrackId: string | null,
 };
 
+export type MidiNoteInput = {
+	noteId: number,
+	pitch: number,
+	velocity: number | null,
+	noteOn: boolean,
+};
+
 export type MidiNoteSpec = {
 	id: string,
 	pitch: number,
@@ -356,6 +364,17 @@ export type StreamStatus = {
 	cpuPeakPercent: number | null,
 	/**  Zero outside pre-count; otherwise the number of musical beats still to count. */
 	countInBeatsRemaining: number,
+	/**  Callback latency percentiles, calculated off the audio thread. */
+	callbackP50Ms: number | null,
+	callbackP95Ms: number | null,
+	callbackP99Ms: number | null,
+	callbackMaxMs: number | null,
+	/**  Highest observed occupancy of the bounded control queue. */
+	commandQueueHighWater: number,
+	/**  Commands rejected because the bounded queue was full. */
+	commandQueueOverflow: number,
+	/**  Realtime plug-in endpoint deadline misses. */
+	pluginDeadlineMisses: number,
 };
 
 export type TempoCurveSpec = "jump" | "linear";

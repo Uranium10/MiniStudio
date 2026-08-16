@@ -842,13 +842,16 @@ mod windows {
 
             if let Some(window) = editor.as_mut() {
                 let _ = window.service_platform_events();
+                let mut actions = window.take_host_actions();
                 if window.closed_by_user() {
-                    pending_editor_actions.extend(window.take_host_actions());
-                    pending_editor_actions.push(
-                        vst3_host::process_isolation::EditorHostAction::Closed,
-                    );
+                    actions.push(vst3_host::process_isolation::EditorHostAction::Closed);
                     window.close();
                     editor = None;
+                }
+                if let Some(realtime) = realtime.as_ref() {
+                    realtime.publish_editor_actions(&actions);
+                } else {
+                    pending_editor_actions.extend(actions);
                 }
             }
             if !pump_messages() {

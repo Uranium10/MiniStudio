@@ -1,6 +1,7 @@
 // CPAL backend/device enumeration and configured output-stream construction.
 use super::{
     engine::AudioCore,
+    metrics::RealtimeMetrics,
     types::{AudioBackendInfo, AudioDeviceInfo, AudioSettings},
     MAX_BLOCK_SIZE,
 };
@@ -97,6 +98,7 @@ pub fn open_stream(
     failed: Arc<AtomicBool>,
     cpu_load: Arc<AtomicU32>,
     cpu_peak: Arc<AtomicU32>,
+    metrics: Arc<RealtimeMetrics>,
 ) -> Result<Stream, String> {
     let host = host_for(&settings.backend_id)?;
     let device = if settings.device_id == "default" {
@@ -160,37 +162,37 @@ pub fn open_stream(
     };
     let stream = match supported.sample_format() {
         SampleFormat::F32 => build::<f32>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::F64 => build::<f64>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::I8 => build::<i8>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::I16 => build::<i16>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::I24 => build::<I24>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::I32 => build::<i32>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::I64 => build::<i64>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::U8 => build::<u8>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::U16 => build::<u16>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::U32 => build::<u32>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         SampleFormat::U64 => build::<u64>(
-            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak, metrics,
         )?,
         other => return Err(format!("unsupported output sample format: {other:?}")),
     };
@@ -265,6 +267,7 @@ fn build<T>(
     failed: Arc<AtomicBool>,
     cpu_load: Arc<AtomicU32>,
     cpu_peak: Arc<AtomicU32>,
+    metrics: Arc<RealtimeMetrics>,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -304,8 +307,10 @@ where
                         }
                     }
                     let budget = frames as f64 / sample_rate;
+                    let elapsed = started.elapsed();
+                    metrics.observe_callback(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
                     let load = if budget > 0.0 {
-                        (started.elapsed().as_secs_f64() / budget).clamp(0.0, 8.0) as f32
+                        (elapsed.as_secs_f64() / budget).clamp(0.0, 8.0) as f32
                     } else {
                         0.0
                     };
@@ -378,6 +383,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(RealtimeMetrics::default()),
         );
         assert!(result.is_ok(), "default stream failed: {:?}", result.err());
     }

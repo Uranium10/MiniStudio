@@ -13,6 +13,9 @@ export const PLUGIN_SHELL_CLOSED = 'ministudio:plugin-shell-closed'
 export const PLUGIN_SHELL_REACTIVATE = 'ministudio:plugin-shell-reactivate'
 export const PLUGIN_SHELL_CONNECTION = 'ministudio:plugin-shell-connection'
 export const PLUGIN_SHELL_PIN_CHANGED = 'ministudio:plugin-shell-pin-changed'
+export const PLUGIN_EDITOR_ACTION = 'ministudio:plugin-editor-action'
+
+type NativePluginEditorAction = { targetId: string; generation: number; action: string }
 
 export type PluginShellTarget = {
   windowLabel: string
@@ -146,7 +149,6 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
   let pendingForeground: PluginEditorForegroundIntent | null = null
   let pendingForegroundTimer = 0
   let stopped = false
-  let pollingNativeChrome = false
   const unlisteners: UnlistenFn[] = []
   const publish = (target: PluginShellTarget) => {
     const state = shellState(target)
@@ -174,18 +176,12 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
     if (payload.pinned) pinnedWindows.add(payload.windowLabel)
     else pinnedWindows.delete(payload.windowLabel)
   }).then((unlisten) => stopped ? unlisten() : unlisteners.push(unlisten))
-  const nativeChromeTimer = window.setInterval(() => {
-    if (stopped || pollingNativeChrome || targets.size === 0) return
-    pollingNativeChrome = true
-    void Promise.all([...targets.values()].map(async ({ target }) => {
-      const actions = await invoke<string[]>('engine_take_plugin_editor_actions', {
-        targetId: target.targetId,
-      }).catch(() => [])
-      for (const nativeAction of actions) {
+  const applyNativeAction = async (target: PluginShellTarget, nativeAction: string) => {
         if (nativeAction === 'closed') {
           targets.delete(target.windowLabel)
           pinnedWindows.delete(target.windowLabel)
-          continue
+          await engine.closePluginEditor(target.targetKind, target.targetId).catch(() => undefined)
+          return
         }
         if (nativeAction === 'toggle-pin') {
           const pinned = !pinnedWindows.has(target.windowLabel)
@@ -198,7 +194,7 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
             if (pinned) pinnedWindows.delete(target.windowLabel)
             else pinnedWindows.add(target.windowLabel)
           })
-          continue
+          return
         }
         const action: PluginShellAction = {
           ...target,
@@ -213,10 +209,15 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
             : undefined,
         }
         await runAction(engine, action)
-      }
-      publish(target)
-    })).finally(() => { pollingNativeChrome = false })
-  }, 100)
+        publish(target)
+  }
+  void listen<NativePluginEditorAction>(PLUGIN_EDITOR_ACTION, ({ payload }) => {
+    const entry = [...targets.values()].find(({ target }) => target.targetId === payload.targetId)
+    if (!entry) return
+    void applyNativeAction(entry.target, payload.action).catch((error) => {
+      useProjectStore.getState().showToast(`플러그인 창 작업 실패: ${String(error)}`)
+    })
+  }).then((unlisten) => stopped ? unlisten() : unlisteners.push(unlisten))
   const foregroundPending = (event: Event) => {
     pendingForeground = (event as CustomEvent<PluginEditorForegroundIntent>).detail
     window.clearTimeout(pendingForegroundTimer)
@@ -248,8 +249,8 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
       if (policy === 'keep') return
       // Production standalone helpers retain their native editor across a
       // graph swap. Reopening every ordinary target here resurrected windows
-      // that had just been closed but whose 100 ms native-action poll had not
-      // fired yet. Only pinned restoration is intentional background work;
+      // that had just been closed. Native actions now arrive through a generation-guarded
+      // helper event, but only pinned restoration is intentional background work;
       // ordinary editors are opened solely by an explicit foreground action.
       // Graph restoration is background intent. A simultaneous explicit EDIT
       // or newly inserted plug-in must win instead of attaching two GUIs.
@@ -259,5 +260,5 @@ export function installPluginShellBridge(engine: IAudioEngine): () => void {
     window.clearTimeout(pendingForegroundTimer)
   }
   window.addEventListener('ministudio:graph-synced', resyncEditors)
-  return () => { stopped = true; unsubscribe(); window.clearInterval(nativeChromeTimer); window.clearTimeout(pendingForegroundTimer); window.removeEventListener(PLUGIN_EDITOR_FOREGROUND_PENDING, foregroundPending); window.removeEventListener('ministudio:graph-synced', resyncEditors); unlisteners.splice(0).forEach((unlisten) => unlisten()) }
+  return () => { stopped = true; unsubscribe(); window.clearTimeout(pendingForegroundTimer); window.removeEventListener(PLUGIN_EDITOR_FOREGROUND_PENDING, foregroundPending); window.removeEventListener('ministudio:graph-synced', resyncEditors); unlisteners.splice(0).forEach((unlisten) => unlisten()) }
 }

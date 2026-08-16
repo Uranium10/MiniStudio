@@ -60,4 +60,8 @@ Rust는 `bytemuck::cast_slice`로 `&[f32]`를 바이트 뷰로 변환하고 TS�
 
 폴링 페이로드는 트랙 ID가 없는 그래프 순서 `Level[]`과 `graphRevision`을 사용한다. TS는 그래프 동기화 때만 ID 배열을 만들고 revision 변경 시 교체한다. f32 미터를 i16 0.1dB 고정소수점으로 바꾸는 최적화는 프로파일링에서 병목이 확인될 때만 적용한다.
 
-현재 전역 이벤트는 없다. 향후 디바이스 분리, 복구 불가능한 스트림 오류, xrun 임계 초과처럼 특정 호출에 귀속되지 않는 알림만 전역 이벤트로 추가한다.
+미터/transport snapshot은 연속 표시 데이터이므로 제한된 polling을 유지한다. 네이티브 편집기 수명주기는 polling하지 않는다. helper의 toolbar action은 고정 크기 shared-memory ring에 기록되고 OS event를 signal한다. Rust는 supervisor가 현재 generation으로 승인한 action만 `ministudio:plugin-editor-action`으로 push한다. 제거된 `engine_take_plugin_editor_actions` 명령을 timer polling 형태로 다시 추가하지 않는다.
+
+Windows VST3 realtime mapping은 request, response, editor-action, fault event를 독립적으로 가진다. 오디오 block deadline에는 request/response만 관여한다. editor action은 event bridge를 깨우고, realtime fault는 isolated control owner를 깨워 복구를 예약한다. JSON pipe에는 lifecycle/state control만 전달한다.
+
+UI MIDI audition은 `engine_midi_notes(trackId, notes[])`를 사용한다. TypeScript adapter가 한 microtask의 note를 batch하고 callback은 bounded budget 안에서 MIDI를 drain한다. 새로운 note source는 이 ingress 또는 hardware lock-free queue에 합류해야 하며 plug-in에 note별 synchronous control 호출을 추가하면 안 된다.

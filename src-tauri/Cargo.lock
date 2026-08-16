@@ -1977,6 +1977,8 @@ version = "0.2.0"
 dependencies = [
  "bytemuck",
  "ministudio-audio",
+ "ministudio-plugin-api",
+ "ministudio-plugin-runtime",
  "serde",
  "serde_json",
  "specta",
@@ -1999,6 +2001,7 @@ dependencies = [
  "ministudio-contracts",
  "ministudio-dsp",
  "ministudio-plugin",
+ "ministudio-plugin-api",
  "mp3lame-encoder",
  "rtrb",
  "rubato",
@@ -2038,6 +2041,29 @@ dependencies = [
  "specta",
  "vst3-host",
  "winapi",
+]
+
+[[package]]
+name = "ministudio-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "ministudio-plugin-helper"
+version = "0.1.0"
+dependencies = [
+ "ministudio-plugin-api",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ministudio-plugin-runtime"
+version = "0.1.0"
+dependencies = [
+ "ministudio-plugin-api",
 ]
 
 [[package]]

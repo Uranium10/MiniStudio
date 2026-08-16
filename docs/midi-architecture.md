@@ -24,6 +24,12 @@ the audio callback drains it and merges live events with scheduled events. Live 
 are processed even when transport playback is stopped. Overflow drops the newest
 event instead of allocating or blocking the audio thread.
 
+Virtual keyboard and piano-roll audition calls are microtask-batched in the WebView and submitted
+through one bounded ingress command per batch. Hardware connections stay open after the user
+connects them; graph rebuilds and selected-track changes retarget an atomic track index rather than
+polling or reconnecting the device. Slow WinRT/MIDI service enumeration and connection teardown run
+outside the global engine control lock.
+
 ## Voices and stuck-note prevention
 
 `VoiceAllocator<32>` owns a fixed array. Allocation priority is idle, oldest release,
@@ -46,4 +52,18 @@ untouched tracks.
 
 Offline rendering uses the same graph and MIDI schedule, resets instruments before
 rendering, includes instrument release tails, and excludes the live input queue.
+
+## MIDI service boundary and remaining migration
+
+`MidiService` now owns the `midir` connections, route table, note identity counter and lock-free
+ingress. `NativeEngine` supplies only graph track-index snapshots. Retarget, graph replacement,
+disconnect and shutdown publish `AllNotesOff` to the previous graph destination before changing the
+atomic route, preventing a later NoteOff from being delivered only to the new track.
+
+The format-neutral `MidiPacket` contract exists in `ministudio-plugin-api`, but hardware callbacks
+still enter the current `LiveMidiMessage` representation. The remaining gate timestamps hardware,
+Web MIDI, virtual keyboard and piano-roll audition against one shared audio clock, adds platform
+hot-plug notifications, and makes selected-track routing an immutable service snapshot. Until that
+gate lands, callers must continue using the bounded service/UI ingress and must not add note-by-note
+synchronous plug-in calls.
 

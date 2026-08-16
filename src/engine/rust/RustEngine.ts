@@ -10,10 +10,10 @@ import type {
 import { NotSupportedError } from '../types'
 import { TempoMap } from '../tempoMap'
 import { commands } from './bindings'
-import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot, PluginDescriptor as NativePluginDescriptor } from './bindings'
+import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot, MidiNoteInput, PluginDescriptor as NativePluginDescriptor } from './bindings'
 import { getAssetPeaks } from './binary'
 
-const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0, cpuLoadPercent: 0, cpuPeakPercent: 0, countInBeatsRemaining: 0 }
+const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0, cpuLoadPercent: 0, cpuPeakPercent: 0, countInBeatsRemaining: 0, callbackP50Ms: 0, callbackP95Ms: 0, callbackP99Ms: 0, callbackMaxMs: 0, commandQueueHighWater: 0, commandQueueOverflow: 0, pluginDeadlineMisses: 0 }
 
 export class RustEngine implements IAudioEngine {
   private initialized = false
@@ -28,6 +28,8 @@ export class RustEngine implements IAudioEngine {
   private trackIds: string[] = []
   private activeVoiceCounts: Record<string, number> = {}
   private readonly liveMidiNotes = new Map<string, Set<number>>()
+  private readonly pendingMidiNotes = new Map<string, MidiNoteInput[]>()
+  private midiFlushScheduled = false
   private multibandLevels: Record<string, MultibandLevels> = {}
   private distortionSpectra: Record<string, readonly number[]> = {}
   private limiterMetrics: Record<string, LimiterMetrics> = {}
@@ -75,6 +77,8 @@ export class RustEngine implements IAudioEngine {
     this.pollTimer = null
     this.realtimeFrame = 0
     this.pendingRealtime.clear()
+    this.pendingMidiNotes.clear()
+    this.midiFlushScheduled = false
     if (this.initialized) await unwrapCommand(commands.engineDispose()).catch(() => undefined)
     this.initialized = false
   }
@@ -186,9 +190,19 @@ export class RustEngine implements IAudioEngine {
     const notes = this.liveMidiNotes.get(trackId) ?? new Set<number>()
     if (noteOn && velocity > 0) notes.add(noteId); else notes.delete(noteId)
     this.liveMidiNotes.set(trackId, notes)
-    this.send(commands.engineMidiNote(trackId, noteId, pitch, velocity, noteOn))
+    const pending = this.pendingMidiNotes.get(trackId) ?? []
+    pending.push({ noteId, pitch, velocity, noteOn })
+    this.pendingMidiNotes.set(trackId, pending)
+    if (!this.midiFlushScheduled) {
+      this.midiFlushScheduled = true
+      queueMicrotask(() => this.flushMidiNotes())
+    }
   }
-  midiAllNotesOff(trackId: string): void { this.liveMidiNotes.set(trackId, new Set()); this.send(commands.engineMidiAllNotesOff(trackId)) }
+  midiAllNotesOff(trackId: string): void {
+    this.liveMidiNotes.set(trackId, new Set())
+    this.flushMidiNotes()
+    this.send(commands.engineMidiAllNotesOff(trackId))
+  }
   getActiveVoiceCount(trackId: string): number { return Math.max(this.activeVoiceCounts[trackId] ?? 0, this.liveMidiNotes.get(trackId)?.size ?? 0) }
   getMidiGateCount(trackId: string): number | null { return this.liveMidiNotes.get(trackId)?.size ?? null }
   getTrackLevel(trackId: string): Level { return this.trackLevels[trackId] ?? { peak: 0, rms: 0 } }
@@ -235,6 +249,14 @@ export class RustEngine implements IAudioEngine {
 
   capabilities(): EngineCapabilities {
     return { supportsExternalPlugins: true, supportsRealtimePluginInsert: true, supportsOfflineRender: true, supportedAudioExtensions: ['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac'] }
+  }
+
+  private flushMidiNotes(): void {
+    this.midiFlushScheduled = false
+    for (const [trackId, notes] of this.pendingMidiNotes) {
+      if (notes.length > 0) this.send(commands.engineMidiNotes(trackId, notes))
+    }
+    this.pendingMidiNotes.clear()
   }
 
   private normalizePlugins(plugins: NativePluginDescriptor[]): PluginDescriptor[] {
@@ -338,6 +360,13 @@ export class RustEngine implements IAudioEngine {
       this.streamStatus.cpuLoadPercent = finite(state.stream.cpuLoadPercent)
       this.streamStatus.cpuPeakPercent = finite(state.stream.cpuPeakPercent)
       this.streamStatus.countInBeatsRemaining = state.stream.countInBeatsRemaining
+      this.streamStatus.callbackP50Ms = finite(state.stream.callbackP50Ms)
+      this.streamStatus.callbackP95Ms = finite(state.stream.callbackP95Ms)
+      this.streamStatus.callbackP99Ms = finite(state.stream.callbackP99Ms)
+      this.streamStatus.callbackMaxMs = finite(state.stream.callbackMaxMs)
+      this.streamStatus.commandQueueHighWater = state.stream.commandQueueHighWater
+      this.streamStatus.commandQueueOverflow = state.stream.commandQueueOverflow
+      this.streamStatus.pluginDeadlineMisses = state.stream.pluginDeadlineMisses
       for (const listener of this.listeners) listener(this.playheadSec)
     } catch (error) {
       this.streamStatus = { ...this.streamStatus, running: false, error: describeEngineError(error) }

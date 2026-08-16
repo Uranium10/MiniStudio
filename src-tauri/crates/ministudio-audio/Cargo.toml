@@ -16,6 +16,7 @@ midir = "0.10"
 ministudio-contracts = { path = "../ministudio-contracts" }
 ministudio-dsp = { path = "../ministudio-dsp" }
 ministudio-plugin = { path = "../ministudio-plugin" }
+ministudio-plugin-api = { path = "../ministudio-plugin-api" }
 mp3lame-encoder = "0.2.4"
 rubato = "0.16"
 rtrb = "0.3"

@@ -7,6 +7,8 @@ pub mod engine;
 pub mod error;
 pub mod graph;
 pub mod instrument;
+pub mod metrics;
+pub mod midi_service;
 pub mod plugin;
 pub mod tempo;
 pub mod types;

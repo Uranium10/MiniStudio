@@ -10,7 +10,7 @@ use crate::{
     parameters::Parameter,
     plugin::{PluginInfo, PluginInternal, StateContext},
     process_isolation::{HostCommand, HostResponse, PluginHostProcess},
-    realtime_ipc::RealtimeClient,
+    realtime_ipc::{RealtimeClient, RealtimeRecoveryHandle},
 };
 use std::sync::Mutex;
 use std::time::Duration;
@@ -50,6 +50,8 @@ pub struct IsolatedPluginImpl {
     output_channels: usize,
     /// Lock-free audio/MIDI/parameter transport used by the realtime callback.
     realtime: Option<RealtimeClient>,
+    /// Control-only reference retained after the audio graph takes ownership of `realtime`.
+    realtime_recovery: Option<RealtimeRecoveryHandle>,
     /// MIDI the plugin has emitted across the boundary, buffered for the host to poll
     /// (mirrors PluginImpl::output_midi). Capped to bound growth if never read.
     output_events: Mutex<Vec<PluginEvent>>,
@@ -114,6 +116,7 @@ impl IsolatedPluginImpl {
             editor_size: None,
             output_channels,
             realtime,
+            realtime_recovery: None,
             output_events: Mutex::new(Vec::new()),
             helper_path,
             helper_arg,
@@ -271,6 +274,12 @@ impl IsolatedPluginImpl {
 }
 
 impl PluginInternal for IsolatedPluginImpl {
+    fn take_realtime_client(&mut self) -> Option<RealtimeClient> {
+        let client = self.realtime.take()?;
+        self.realtime_recovery = Some(client.recovery_handle());
+        Some(client)
+    }
+
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()> {
         if self.is_processing {
             if let Some(realtime) = self.realtime.as_mut() {
@@ -914,8 +923,14 @@ impl PluginInternal for IsolatedPluginImpl {
         }
     }
 
-    fn set_editor_host_state(&mut self, state: crate::process_isolation::EditorHostState) {
-        let _ = self.send_command(HostCommand::SetEditorHostState { state });
+    fn set_editor_host_state(
+        &mut self,
+        state: crate::process_isolation::EditorHostState,
+    ) -> Result<()> {
+        self.expect_success(
+            HostCommand::SetEditorHostState { state },
+            "SetEditorHostState",
+        )
     }
 
     fn get_editor_size(&self) -> Result<(i32, i32)> {
@@ -1066,6 +1081,10 @@ impl PluginInternal for IsolatedPluginImpl {
         self.realtime
             .as_ref()
             .is_some_and(RealtimeClient::is_faulted)
+            || self
+                .realtime_recovery
+                .as_ref()
+                .is_some_and(RealtimeRecoveryHandle::is_faulted)
     }
 
     fn recover(&mut self) -> Result<()> {
@@ -1090,7 +1109,7 @@ impl IsolatedPluginImpl {
         // A timed-out audio worker may still be waiting or returning late. Stop its whole helper
         // before a replacement attaches to the same named request event, so two workers can never
         // consume alternate blocks from one client mapping.
-        if self.realtime.is_some() {
+        if self.realtime.is_some() || self.realtime_recovery.is_some() {
             process.shutdown();
         }
 
@@ -1121,11 +1140,27 @@ impl IsolatedPluginImpl {
             Err(e) => return Err(classify_ipc_error(&e)),
         }
 
-        if let Some(realtime) = self.realtime.as_ref() {
+        let realtime_descriptor = self
+            .realtime
+            .as_ref()
+            .map(RealtimeClient::descriptor)
+            .or_else(|| {
+                self.realtime_recovery
+                    .as_ref()
+                    .map(RealtimeRecoveryHandle::descriptor)
+            });
+        if let Some(descriptor) = realtime_descriptor {
             match fresh.send_command(HostCommand::AttachRealtime {
-                descriptor: realtime.descriptor(),
+                descriptor,
             }) {
-                Ok(HostResponse::Success { .. }) => realtime.reset_after_recovery(),
+                Ok(HostResponse::Success { .. }) => {
+                    if let Some(realtime) = self.realtime.as_ref() {
+                        realtime.reset_after_recovery();
+                    }
+                    if let Some(recovery) = self.realtime_recovery.as_ref() {
+                        recovery.reset_after_recovery();
+                    }
+                }
                 Ok(HostResponse::Error { message }) => {
                     return Err(Error::ProcessError(format!(
                         "failed to reattach realtime transport: {message}"

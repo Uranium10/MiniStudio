@@ -1,0 +1,9 @@
+[package]
+name = "ministudio-plugin-api"
+version = "0.1.0"
+edition = "2021"
+description = "Format-neutral realtime and control contracts for MiniStudio plug-ins"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+

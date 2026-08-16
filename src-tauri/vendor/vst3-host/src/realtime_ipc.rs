@@ -12,7 +12,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
     Arc, Mutex,
 };
 
@@ -28,7 +28,7 @@ pub const MAX_REALTIME_MIDI_EVENTS: usize = 1024;
 pub const MAX_REALTIME_PARAMETER_EVENTS: usize = 1024;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"MSRT");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const STATE_IDLE: u32 = 0;
 const STATE_REQUESTED: u32 = 1;
 const STATE_PROCESSING: u32 = 2;
@@ -37,6 +37,50 @@ const STATE_SHUTDOWN: u32 = 4;
 const STATUS_OK: i32 = 0;
 const STATUS_BAD_SHAPE: i32 = -1;
 const STATUS_PLUGIN_ERROR: i32 = -2;
+
+fn editor_action_bit(action: crate::process_isolation::EditorHostAction) -> u32 {
+    use crate::process_isolation::EditorHostAction::*;
+    1 << match action {
+        Closed => 0,
+        TogglePower => 1,
+        TogglePin => 2,
+        ToggleBypass => 3,
+        SavePreset => 4,
+        LoadPreset => 5,
+        ShowSidechain => 6,
+        AutomationOff => 7,
+        AutomationWrite => 8,
+        AutomationRead => 9,
+        AutomationLatch => 10,
+    }
+}
+
+fn encode_editor_actions(actions: &[crate::process_isolation::EditorHostAction]) -> u32 {
+    actions
+        .iter()
+        .copied()
+        .fold(0, |bits, action| bits | editor_action_bit(action))
+}
+
+fn decode_editor_actions(bits: u32) -> Vec<crate::process_isolation::EditorHostAction> {
+    use crate::process_isolation::EditorHostAction::*;
+    [
+        Closed,
+        TogglePower,
+        TogglePin,
+        ToggleBypass,
+        SavePreset,
+        LoadPreset,
+        ShowSidechain,
+        AutomationOff,
+        AutomationWrite,
+        AutomationRead,
+        AutomationLatch,
+    ]
+    .into_iter()
+    .filter(|action| bits & editor_action_bit(*action) != 0)
+    .collect()
+}
 
 /// Portable names required for a helper process to open the host-created transport objects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +91,10 @@ pub struct RealtimeDescriptor {
     pub request_event_name: String,
     /// Auto-reset event signalled by the helper when a block is complete.
     pub response_event_name: String,
+    /// Auto-reset event signalled when helper-owned editor actions are available.
+    pub editor_action_event_name: String,
+    /// Auto-reset event signalled when the realtime client latches a fault.
+    pub fault_event_name: String,
 }
 
 #[repr(C)]
@@ -100,6 +148,7 @@ struct RealtimeBlock {
     output_channel_count: u16,
     midi_count: u16,
     parameter_count: u16,
+    editor_action_bits: AtomicU32,
     input_bus_channels: [u16; MAX_REALTIME_BUSES],
     output_bus_channels: [u16; MAX_REALTIME_BUSES],
     input_bus_active: [u8; MAX_REALTIME_BUSES],
@@ -110,24 +159,182 @@ struct RealtimeBlock {
     output_samples: [f32; MAX_REALTIME_CHANNELS * MAX_REALTIME_FRAMES],
 }
 
+#[cfg(target_os = "windows")]
+struct RealtimeMapping {
+    mapping: usize,
+    request_event: usize,
+    response_event: usize,
+    editor_action_event: usize,
+    fault_event: usize,
+    block: *mut RealtimeBlock,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for RealtimeMapping {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for RealtimeMapping {}
+
+#[cfg(target_os = "windows")]
+impl Drop for RealtimeMapping {
+    fn drop(&mut self) {
+        use winapi::um::{handleapi::CloseHandle, memoryapi::UnmapViewOfFile};
+        unsafe {
+            if !self.block.is_null() {
+                UnmapViewOfFile(self.block.cast());
+            }
+            CloseHandle(self.request_event as winapi::shared::ntdef::HANDLE);
+            CloseHandle(self.response_event as winapi::shared::ntdef::HANDLE);
+            CloseHandle(self.editor_action_event as winapi::shared::ntdef::HANDLE);
+            CloseHandle(self.fault_event as winapi::shared::ntdef::HANDLE);
+            CloseHandle(self.mapping as winapi::shared::ntdef::HANDLE);
+        }
+    }
+}
+
 /// Host-side shared-memory endpoint. One value belongs to one isolated plug-in instance.
 pub struct RealtimeClient {
     descriptor: RealtimeDescriptor,
     #[cfg(target_os = "windows")]
-    mapping: usize,
-    #[cfg(target_os = "windows")]
-    request_event: usize,
-    #[cfg(target_os = "windows")]
-    response_event: usize,
-    #[cfg(target_os = "windows")]
-    block: *mut RealtimeBlock,
+    shared: Arc<RealtimeMapping>,
     sequence: u64,
     sample_rate: f64,
-    faulted: AtomicBool,
+    faulted: Arc<AtomicBool>,
+    deadline_misses: Arc<AtomicU64>,
     pending_midi: [RealtimeMidiMessage; MAX_REALTIME_MIDI_EVENTS],
     pending_midi_count: usize,
     pending_parameters: [RealtimeParameterChange; MAX_REALTIME_PARAMETER_EVENTS],
     pending_parameter_count: usize,
+}
+
+/// Lock-free control-side reader for native editor toolbar actions.
+///
+/// Actions share only one atomic word with the realtime mapping; taking them neither acquires
+/// the plug-in control mutex nor waits for the helper GUI loop.
+pub struct EditorActionReader {
+    #[cfg(target_os = "windows")]
+    shared: Arc<RealtimeMapping>,
+}
+
+/// Event-driven control-side notification for a realtime transport failure.
+pub struct RealtimeFaultReader {
+    #[cfg(target_os = "windows")]
+    shared: std::sync::Weak<RealtimeMapping>,
+}
+
+unsafe impl Send for RealtimeFaultReader {}
+
+impl RealtimeFaultReader {
+    /// Returns true when a fault event arrived. Timeout is only a lifecycle check interval.
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::{synchapi::WaitForSingleObject, winbase::WAIT_OBJECT_0};
+            let Some(shared) = self.shared.upgrade() else {
+                return false;
+            };
+            let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            return unsafe {
+                WaitForSingleObject(
+                    shared.fault_event as winapi::shared::ntdef::HANDLE,
+                    timeout_ms,
+                ) == WAIT_OBJECT_0
+            };
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::thread::sleep(timeout);
+            false
+        }
+    }
+
+    /// Whether the audio-side endpoint still owns the shared event mapping.
+    pub fn alive(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.shared.strong_count() > 0
+        }
+        #[cfg(not(target_os = "windows"))]
+        false
+    }
+}
+
+unsafe impl Send for EditorActionReader {}
+unsafe impl Sync for EditorActionReader {}
+
+impl EditorActionReader {
+    /// Atomically drain all pending helper chrome actions.
+    pub fn take(&self) -> Vec<crate::process_isolation::EditorHostAction> {
+        #[cfg(target_os = "windows")]
+        {
+            let bits = unsafe {
+                (*self.shared.block)
+                    .editor_action_bits
+                    .swap(0, AtomicOrdering::AcqRel)
+            };
+            return decode_editor_actions(bits);
+        }
+        #[cfg(not(target_os = "windows"))]
+        Vec::new()
+    }
+
+    /// Sleep in the kernel until the helper publishes an action or the caller's lifecycle check
+    /// interval expires. This is event-driven and consumes no idle CPU.
+    pub fn wait_and_take(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Vec<crate::process_isolation::EditorHostAction> {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::synchapi::WaitForSingleObject;
+            let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+            unsafe {
+                WaitForSingleObject(
+                    self.shared.editor_action_event as winapi::shared::ntdef::HANDLE,
+                    timeout_ms,
+                );
+            }
+            return self.take();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::thread::sleep(timeout);
+            self.take()
+        }
+    }
+}
+
+/// Control-plane half of a realtime endpoint.
+///
+/// The audio adapter exclusively owns [`RealtimeClient`]. This cloneable handle lets recovery
+/// reattach a replacement helper to the same named transport and clear its fault latch without
+/// borrowing or locking the audio-side client.
+#[derive(Clone)]
+pub struct RealtimeRecoveryHandle {
+    descriptor: RealtimeDescriptor,
+    faulted: Arc<AtomicBool>,
+    deadline_misses: Arc<AtomicU64>,
+}
+
+impl RealtimeRecoveryHandle {
+    /// Descriptor a replacement helper uses to attach to the existing endpoint.
+    pub fn descriptor(&self) -> RealtimeDescriptor {
+        self.descriptor.clone()
+    }
+
+    /// Clear a deadline fault after a replacement helper has attached.
+    pub fn reset_after_recovery(&self) {
+        self.faulted.store(false, AtomicOrdering::Release);
+    }
+
+    /// Whether the audio-side endpoint has latched a processing failure.
+    pub fn is_faulted(&self) -> bool {
+        self.faulted.load(AtomicOrdering::Acquire)
+    }
+
+    /// Number of actual realtime response deadlines missed by this endpoint generation.
+    pub fn deadline_misses(&self) -> u64 {
+        self.deadline_misses.load(AtomicOrdering::Relaxed)
+    }
 }
 
 // The endpoint is created on the control owner then moved into the single audio-side adapter.
@@ -135,6 +342,28 @@ pub struct RealtimeClient {
 unsafe impl Send for RealtimeClient {}
 
 impl RealtimeClient {
+    /// Create a lock-free reader for helper-owned editor toolbar actions.
+    pub fn editor_action_reader(&self) -> EditorActionReader {
+        EditorActionReader {
+            #[cfg(target_os = "windows")]
+            shared: Arc::clone(&self.shared),
+        }
+    }
+    /// Create an event-driven failure reader for the control/recovery actor.
+    pub fn fault_reader(&self) -> RealtimeFaultReader {
+        RealtimeFaultReader {
+            #[cfg(target_os = "windows")]
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+    /// Create a control-plane recovery handle before moving this client to the audio graph.
+    pub fn recovery_handle(&self) -> RealtimeRecoveryHandle {
+        RealtimeRecoveryHandle {
+            descriptor: self.descriptor.clone(),
+            faulted: Arc::clone(&self.faulted),
+            deadline_misses: Arc::clone(&self.deadline_misses),
+        }
+    }
     /// Create and initialize a host-owned mapping and its request/response events.
     #[cfg(target_os = "windows")]
     pub fn create(sample_rate: f64) -> std::result::Result<Self, String> {
@@ -156,6 +385,8 @@ impl RealtimeClient {
             mapping_name: format!("{prefix}-map"),
             request_event_name: format!("{prefix}-request"),
             response_event_name: format!("{prefix}-response"),
+            editor_action_event_name: format!("{prefix}-editor-action"),
+            fault_event_name: format!("{prefix}-fault"),
         };
         let mapping_name = wide(&descriptor.mapping_name);
         let bytes = std::mem::size_of::<RealtimeBlock>() as u64;
@@ -187,17 +418,39 @@ impl RealtimeClient {
         }
         let request_name = wide(&descriptor.request_event_name);
         let response_name = wide(&descriptor.response_event_name);
+        let editor_action_name = wide(&descriptor.editor_action_event_name);
+        let fault_name = wide(&descriptor.fault_event_name);
         let request_event =
             unsafe { CreateEventW(std::ptr::null_mut(), FALSE, FALSE, request_name.as_ptr()) };
         let response_event =
             unsafe { CreateEventW(std::ptr::null_mut(), FALSE, FALSE, response_name.as_ptr()) };
-        if request_event.is_null() || response_event.is_null() {
+        let editor_action_event = unsafe {
+            CreateEventW(
+                std::ptr::null_mut(),
+                FALSE,
+                FALSE,
+                editor_action_name.as_ptr(),
+            )
+        };
+        let fault_event =
+            unsafe { CreateEventW(std::ptr::null_mut(), FALSE, FALSE, fault_name.as_ptr()) };
+        if request_event.is_null()
+            || response_event.is_null()
+            || editor_action_event.is_null()
+            || fault_event.is_null()
+        {
             unsafe {
                 if !request_event.is_null() {
                     CloseHandle(request_event);
                 }
                 if !response_event.is_null() {
                     CloseHandle(response_event);
+                }
+                if !editor_action_event.is_null() {
+                    CloseHandle(editor_action_event);
+                }
+                if !fault_event.is_null() {
+                    CloseHandle(fault_event);
                 }
                 winapi::um::memoryapi::UnmapViewOfFile(block.cast());
                 CloseHandle(mapping);
@@ -212,13 +465,18 @@ impl RealtimeClient {
         }
         Ok(Self {
             descriptor,
-            mapping: mapping as usize,
-            request_event: request_event as usize,
-            response_event: response_event as usize,
-            block,
+            shared: Arc::new(RealtimeMapping {
+                mapping: mapping as usize,
+                request_event: request_event as usize,
+                response_event: response_event as usize,
+                editor_action_event: editor_action_event as usize,
+                fault_event: fault_event as usize,
+                block,
+            }),
             sequence: 0,
             sample_rate,
-            faulted: AtomicBool::new(false),
+            faulted: Arc::new(AtomicBool::new(false)),
+            deadline_misses: Arc::new(AtomicU64::new(0)),
             pending_midi: [RealtimeMidiMessage::EMPTY; MAX_REALTIME_MIDI_EVENTS],
             pending_midi_count: 0,
             pending_parameters: [RealtimeParameterChange::EMPTY; MAX_REALTIME_PARAMETER_EVENTS],
@@ -302,9 +560,10 @@ impl RealtimeClient {
             ));
         }
 
-        let block = unsafe { &mut *self.block };
+        let block = unsafe { &mut *self.shared.block };
         if block.magic != MAGIC || block.version != VERSION || block.state != STATE_IDLE {
             self.faulted.store(true, AtomicOrdering::Release);
+            self.signal_fault();
             silence_outputs(buffers);
             return Err(Error::ProcessError(
                 "realtime shared-memory state is invalid".to_string(),
@@ -346,24 +605,28 @@ impl RealtimeClient {
         block.status = STATUS_OK;
         fence(Ordering::Release);
         block.state = STATE_REQUESTED;
-        let request = self.request_event as winapi::shared::ntdef::HANDLE;
+        let request = self.shared.request_event as winapi::shared::ntdef::HANDLE;
         if unsafe { SetEvent(request) } == 0 {
             self.faulted.store(true, AtomicOrdering::Release);
+            self.signal_fault();
             silence_outputs(buffers);
             return Err(Error::ProcessError(last_error("SetEvent(request)")));
         }
-        let response = self.response_event as winapi::shared::ntdef::HANDLE;
+        let response = self.shared.response_event as winapi::shared::ntdef::HANDLE;
         let block_ms = (frames as f64 * 1000.0 / self.sample_rate.max(1.0)).ceil() as u32;
         let deadline_ms = block_ms.saturating_mul(4).clamp(5, 50);
         match unsafe { WaitForSingleObject(response, deadline_ms) } {
             WAIT_OBJECT_0 => {}
             258 => {
+                self.deadline_misses.fetch_add(1, AtomicOrdering::Relaxed);
                 self.faulted.store(true, AtomicOrdering::Release);
+                self.signal_fault();
                 silence_outputs(buffers);
                 return Err(Error::PluginTimeout);
             }
             _ => {
                 self.faulted.store(true, AtomicOrdering::Release);
+                self.signal_fault();
                 silence_outputs(buffers);
                 return Err(Error::ProcessError(last_error(
                     "WaitForSingleObject(response)",
@@ -373,6 +636,7 @@ impl RealtimeClient {
         fence(Ordering::Acquire);
         if block.response_sequence != self.sequence || block.state != STATE_DONE {
             self.faulted.store(true, AtomicOrdering::Release);
+            self.signal_fault();
             silence_outputs(buffers);
             return Err(Error::ProcessError(
                 "isolated realtime response sequence mismatch".to_string(),
@@ -415,8 +679,8 @@ impl RealtimeClient {
         self.faulted.store(false, AtomicOrdering::Release);
         #[cfg(target_os = "windows")]
         unsafe {
-            (*self.block).state = STATE_IDLE;
-            (*self.block).status = STATUS_OK;
+            (*self.shared.block).state = STATE_IDLE;
+            (*self.shared.block).status = STATUS_OK;
         }
     }
 
@@ -431,21 +695,18 @@ impl RealtimeClient {
             self.sample_rate = sample_rate;
         }
     }
-}
 
-#[cfg(target_os = "windows")]
-impl Drop for RealtimeClient {
-    fn drop(&mut self) {
-        use winapi::um::{handleapi::CloseHandle, memoryapi::UnmapViewOfFile};
+    #[cfg(target_os = "windows")]
+    fn signal_fault(&self) {
         unsafe {
-            if !self.block.is_null() {
-                UnmapViewOfFile(self.block.cast());
-            }
-            CloseHandle(self.request_event as winapi::shared::ntdef::HANDLE);
-            CloseHandle(self.response_event as winapi::shared::ntdef::HANDLE);
-            CloseHandle(self.mapping as winapi::shared::ntdef::HANDLE);
+            winapi::um::synchapi::SetEvent(
+                self.shared.fault_event as winapi::shared::ntdef::HANDLE,
+            );
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    fn signal_fault(&self) {}
 }
 
 /// Helper-side audio worker and mapped transport lifetime.
@@ -457,11 +718,33 @@ pub struct RealtimeServer {
     #[cfg(target_os = "windows")]
     response_event: usize,
     #[cfg(target_os = "windows")]
+    editor_action_event: usize,
+    #[cfg(target_os = "windows")]
     mapping: usize,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RealtimeServer {
+    /// Publish helper-owned toolbar actions without using the JSON control request loop.
+    pub fn publish_editor_actions(
+        &self,
+        actions: &[crate::process_isolation::EditorHostAction],
+    ) {
+        #[cfg(target_os = "windows")]
+        if !actions.is_empty() {
+            let bits = encode_editor_actions(actions);
+            unsafe {
+                (*(self.block as *mut RealtimeBlock))
+                    .editor_action_bits
+                    .fetch_or(bits, AtomicOrdering::Release);
+                winapi::um::synchapi::SetEvent(
+                    self.editor_action_event as winapi::shared::ntdef::HANDLE,
+                );
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = actions;
+    }
     /// Open the host-created objects, preallocate bus buffers, and start the helper audio worker.
     #[cfg(target_os = "windows")]
     pub fn attach(
@@ -509,16 +792,21 @@ impl RealtimeServer {
         }
         let request_name = wide(&descriptor.request_event_name);
         let response_name = wide(&descriptor.response_event_name);
+        let editor_action_name = wide(&descriptor.editor_action_event_name);
         let access = EVENT_MODIFY_STATE | SYNCHRONIZE;
         let request_event = unsafe { OpenEventW(access, FALSE, request_name.as_ptr()) };
         let response_event = unsafe { OpenEventW(access, FALSE, response_name.as_ptr()) };
-        if request_event.is_null() || response_event.is_null() {
+        let editor_action_event = unsafe { OpenEventW(access, FALSE, editor_action_name.as_ptr()) };
+        if request_event.is_null() || response_event.is_null() || editor_action_event.is_null() {
             unsafe {
                 if !request_event.is_null() {
                     winapi::um::handleapi::CloseHandle(request_event);
                 }
                 if !response_event.is_null() {
                     winapi::um::handleapi::CloseHandle(response_event);
+                }
+                if !editor_action_event.is_null() {
+                    winapi::um::handleapi::CloseHandle(editor_action_event);
                 }
                 winapi::um::memoryapi::UnmapViewOfFile(block.cast());
                 winapi::um::handleapi::CloseHandle(mapping);
@@ -544,6 +832,7 @@ impl RealtimeServer {
             block: block_address,
             request_event: request_address,
             response_event: response_address,
+            editor_action_event: editor_action_event as usize,
             mapping: mapping as usize,
             worker: Some(worker),
         })
@@ -575,6 +864,7 @@ impl Drop for RealtimeServer {
             UnmapViewOfFile((self.block as *mut RealtimeBlock).cast());
             CloseHandle(self.request_event as winapi::shared::ntdef::HANDLE);
             CloseHandle(self.response_event as winapi::shared::ntdef::HANDLE);
+            CloseHandle(self.editor_action_event as winapi::shared::ntdef::HANDLE);
             CloseHandle(self.mapping as winapi::shared::ntdef::HANDLE);
         }
     }

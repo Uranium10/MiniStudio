@@ -1,5 +1,7 @@
 // Typed Tauri IPC surface for the native audio control plane and phase-three stubs.
 use ministudio_audio::audio;
+use ministudio_plugin_api::{EditorLifecycle, PluginEvent, PluginInstanceId};
+use ministudio_plugin_runtime::PluginSupervisor;
 
 use audio::{
     engine::{EmbeddedPluginEditor, NativeEngine},
@@ -95,6 +97,9 @@ struct NativeEngineState {
     /// reject embedding keep their hidden shell alive and use the established
     /// standalone path for the rest of the process lifetime.
     floating_editor_targets: Arc<Mutex<HashSet<String>>>,
+    /// Authoritative generation/lifecycle/pin state. Legacy sets below are compatibility
+    /// indexes during the staged migration and must not create editor generations themselves.
+    plugin_supervisor: Mutex<PluginSupervisor>,
 }
 
 #[derive(Default)]
@@ -138,6 +143,7 @@ impl Default for NativeEngineState {
             pinned_editor_targets: Mutex::new(HashSet::new()),
             cancelled_editor_targets: Mutex::new(HashSet::new()),
             floating_editor_targets: Arc::new(Mutex::new(HashSet::new())),
+            plugin_supervisor: Mutex::new(PluginSupervisor::default()),
         }
     }
 }
@@ -394,10 +400,15 @@ async fn engine_dispose(
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
     close_embedded_editors_on_main_thread(&app, None).await?;
-    with_engine(&state, |engine| {
-        engine.dispose();
-        Ok(())
+    let routes = with_engine(&state, |engine| Ok(engine.dispose()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        for route in routes {
+            NativeEngine::release_midi_input(route);
+        }
     })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -465,6 +476,11 @@ async fn engine_sync_graph(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .retain(|target| surviving_plugin_targets.contains(target));
+    state
+        .plugin_supervisor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .retain_instances(|instance_id| surviving_plugin_targets.contains(&instance_id.0));
     with_engine(&state, |engine| {
         let result = engine.sync_graph(snapshot);
         // Requests that started while waiting for the engine lock must not
@@ -716,6 +732,37 @@ fn engine_midi_note(
     })
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+struct MidiNoteInput {
+    note_id: i32,
+    pitch: u8,
+    velocity: f32,
+    note_on: bool,
+}
+
+/// Submit a UI/Web-MIDI burst under one control-plane lookup and engine lock.
+#[tauri::command]
+#[specta::specta]
+fn engine_midi_notes(
+    track_id: String,
+    notes: Vec<MidiNoteInput>,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    with_engine(&state, |engine| {
+        for note in notes {
+            engine.midi_note(
+                &track_id,
+                note.note_id,
+                note.pitch,
+                note.velocity,
+                note.note_on,
+            )?;
+        }
+        Ok(())
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 fn engine_midi_all_notes_off(
@@ -875,6 +922,7 @@ fn validate_plugin_target_kind(kind: &str) -> Result<(), String> {
 
 const PLUGIN_SHELL_TOOLBAR_HEIGHT: f32 = 52.0;
 const PLUGIN_SHELL_CLOSED_EVENT: &str = "ministudio:plugin-shell-closed";
+const PLUGIN_EDITOR_ACTION_EVENT: &str = "ministudio:plugin-editor-action";
 const PLUGIN_SHELL_REACTIVATE_EVENT: &str = "ministudio:plugin-shell-reactivate";
 const PLUGIN_SHELL_CONNECTION_EVENT: &str = "ministudio:plugin-shell-connection";
 const PLUGIN_SHELL_REQUEST_EVENT: &str = "ministudio:plugin-shell-request";
@@ -903,6 +951,102 @@ struct PluginShellTargetPayload {
     target_kind: String,
     target_id: String,
     window_label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginEditorActionPayload {
+    target_id: String,
+    generation: u64,
+    action: String,
+}
+
+fn plugin_editor_action_name(action: audio::dsp::PluginEditorAction) -> &'static str {
+    match action {
+        audio::dsp::PluginEditorAction::Closed => "closed",
+        audio::dsp::PluginEditorAction::TogglePower => "toggle-power",
+        audio::dsp::PluginEditorAction::TogglePin => "toggle-pin",
+        audio::dsp::PluginEditorAction::ToggleBypass => "toggle-bypass",
+        audio::dsp::PluginEditorAction::SavePreset => "save-preset",
+        audio::dsp::PluginEditorAction::LoadPreset => "load-preset",
+        audio::dsp::PluginEditorAction::ShowSidechain => "show-sidechain",
+        audio::dsp::PluginEditorAction::AutomationOff => "automation-off",
+        audio::dsp::PluginEditorAction::AutomationWrite => "automation-write",
+        audio::dsp::PluginEditorAction::AutomationRead => "automation-read",
+        audio::dsp::PluginEditorAction::AutomationLatch => "automation-latch",
+    }
+}
+
+fn editor_action_watchers() -> &'static Mutex<HashSet<String>> {
+    static WATCHERS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    WATCHERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn spawn_editor_action_watcher(
+    app: AppHandle<AppRuntime>,
+    target_id: String,
+    generation: u64,
+    control: Arc<dyn audio::dsp::PluginControl>,
+) {
+    let watcher_id = format!("{target_id}:{generation}");
+    let inserted = editor_action_watchers()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(watcher_id.clone());
+    if !inserted {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("ministudio-editor-events".into())
+        .spawn(move || {
+            while control.is_editor_open() {
+                let instance_id = PluginInstanceId(target_id.clone());
+                let current = app
+                    .state::<NativeEngineState>()
+                    .plugin_supervisor
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .is_current(&instance_id, generation);
+                if !current {
+                    break;
+                }
+                for action in control.wait_editor_actions(std::time::Duration::from_secs(1)) {
+                    let runtime_state = app.state::<NativeEngineState>();
+                    let mut supervisor = runtime_state
+                        .plugin_supervisor
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    let current = supervisor.is_current(&instance_id, generation);
+                    if !current {
+                        break;
+                    }
+                    if matches!(action, audio::dsp::PluginEditorAction::Closed) {
+                        supervisor.apply_event(
+                            &instance_id,
+                            generation,
+                            PluginEvent::EditorLifecycle {
+                                lifecycle: EditorLifecycle::Closed,
+                            },
+                        );
+                    }
+                    drop(supervisor);
+                    let action = plugin_editor_action_name(action).to_owned();
+                    let _ = app.emit_to(
+                        "main",
+                        PLUGIN_EDITOR_ACTION_EVENT,
+                        PluginEditorActionPayload {
+                            target_id: target_id.clone(),
+                            generation,
+                            action,
+                        },
+                    );
+                }
+            }
+            editor_action_watchers()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&watcher_id);
+        });
 }
 
 /// WebView2 controller creation is substantially slower than creating the
@@ -1055,6 +1199,24 @@ async fn engine_set_plugin_editor_pinned(
     app: AppHandle<AppRuntime>,
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
+    let instance_id = PluginInstanceId(target_id.clone());
+    let control = state
+        .engine
+        .lock()
+        .map_err(|_| EngineError::Internal("native engine control lock is poisoned".into()))?
+        .plugin_control(&target_id)
+        .map_err(EngineError::from)?;
+    let generation = state
+        .plugin_supervisor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .session_snapshot(&instance_id)
+        .map(|session| session.generation);
+    tauri::async_runtime::spawn_blocking(move || {
+        control.set_editor_pinned(pinned).map_err(EngineError::from)
+    })
+    .await
+    .map_err(|error| EngineError::Internal(error.to_string()))??;
     {
         let mut targets = state
             .pinned_editor_targets
@@ -1065,6 +1227,13 @@ async fn engine_set_plugin_editor_pinned(
         } else {
             targets.remove(&target_id);
         }
+    }
+    if let Some(generation) = generation {
+        state
+            .plugin_supervisor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_event(&instance_id, generation, PluginEvent::PinApplied { pinned });
     }
     let (reply, receive) = std::sync::mpsc::sync_channel(1);
     app.run_on_main_thread(move || {
@@ -1210,46 +1379,44 @@ async fn engine_open_plugin_editor(
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
     validate_plugin_target_kind(&target_kind).map_err(EngineError::from)?;
+    let instance_id = PluginInstanceId(target_id.clone());
+    let (supervisor_generation, supervisor_closing_ids) = {
+        let mut supervisor = state
+            .plugin_supervisor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let initially_pinned = supervisor
+            .session_snapshot(&instance_id)
+            .is_some_and(|session| session.pinned);
+        let generation = supervisor.begin_open(instance_id.clone(), initially_pinned, foreground);
+        let closing = if foreground && !initially_pinned {
+            supervisor.superseded_unpinned(&instance_id)
+        } else {
+            Vec::new()
+        };
+        for closing_id in &closing {
+            supervisor.begin_close(closing_id);
+        }
+        (generation, closing)
+    };
     state
         .cancelled_editor_targets
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .remove(&target_id);
     if !embedded_plugin_shells_enabled() {
-        let pinned = state
-            .pinned_editor_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        let exclusive_foreground = foreground && !pinned.contains(&target_id);
-        let generation = exclusive_foreground.then(|| {
-            state
-                .editor_open_generation
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1)
-        });
         let closing_ids = {
             let mut open = state
                 .floating_editor_targets
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let closing = if exclusive_foreground {
-                open.iter()
-                    .filter(|candidate| {
-                        candidate.as_str() != target_id.as_str() && !pinned.contains(*candidate)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let closing = supervisor_closing_ids
+                .iter()
+                .filter(|candidate| open.contains(candidate.0.as_str()))
+                .map(|candidate| candidate.0.clone())
+                .collect::<Vec<_>>();
             for candidate in &closing {
                 open.remove(candidate);
-                state
-                    .cancelled_editor_targets
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(candidate.clone());
             }
             open.insert(target_id.clone());
             closing
@@ -1282,6 +1449,13 @@ async fn engine_open_plugin_editor(
             (control, closing)
         };
         for (old_id, old_control) in closing {
+            let old_instance_id = PluginInstanceId(old_id.clone());
+            let old_generation = state
+                .plugin_supervisor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .session_snapshot(&old_instance_id)
+                .map(|session| session.generation);
             let old_label_instrument = plugin_shell_label("instrument", &old_id);
             let old_label_effect = plugin_shell_label("effect", &old_id);
             let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, old_label_instrument);
@@ -1291,7 +1465,21 @@ async fn engine_open_plugin_editor(
             // close left both HWNDs visible and made their focus races appear
             // as random flashes.
             match tauri::async_runtime::spawn_blocking(move || old_control.close_editor()).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Some(generation) = old_generation {
+                        state
+                            .plugin_supervisor
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .apply_event(
+                                &old_instance_id,
+                                generation,
+                                PluginEvent::EditorLifecycle {
+                                    lifecycle: EditorLifecycle::Closed,
+                                },
+                            );
+                    }
+                }
                 Ok(Err(error)) => {
                     eprintln!("failed to close superseded plug-in editor {old_id}: {error}")
                 }
@@ -1308,20 +1496,18 @@ async fn engine_open_plugin_editor(
                 window_label: label,
             },
         );
+        let action_control = Arc::clone(&control);
         let result = tauri::async_runtime::spawn_blocking(move || {
             control.open_editor().map_err(EngineError::from)
         })
         .await
         .map_err(|error| EngineError::Internal(error.to_string()))?;
-        let superseded = generation.is_some_and(|generation| {
-            state.editor_open_generation.load(Ordering::Acquire) != generation
-        });
-        let explicitly_closed = state
-            .cancelled_editor_targets
+        let accepts_completion = state
+            .plugin_supervisor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .contains(&target_id);
-        if result.is_err() || superseded || explicitly_closed {
+            .accepts_open_completion(&instance_id, supervisor_generation);
+        if result.is_err() || !accepts_completion {
             state
                 .floating_editor_targets
                 .lock()
@@ -1329,23 +1515,46 @@ async fn engine_open_plugin_editor(
                 .remove(&target_id);
         }
         if result.is_err() {
+            state
+                .plugin_supervisor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .apply_event(
+                    &instance_id,
+                    supervisor_generation,
+                    PluginEvent::EditorUnresponsive,
+                );
             for kind in ["instrument", "effect"] {
                 let closed_label = plugin_shell_label(kind, &target_id);
                 let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, closed_label);
             }
         }
-        let pinned_now = state
-            .pinned_editor_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains(&target_id);
-        if result.is_ok() && (explicitly_closed || (superseded && !pinned_now)) {
+        if result.is_ok() && !accepts_completion {
             let _ = close_standalone_editor(&state, &target_id).await;
             for kind in ["instrument", "effect"] {
                 let closed_label = plugin_shell_label(kind, &target_id);
                 let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, closed_label);
             }
             return Ok(());
+        }
+        if result.is_ok() {
+            state
+                .plugin_supervisor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .apply_event(
+                    &instance_id,
+                    supervisor_generation,
+                    PluginEvent::EditorLifecycle {
+                        lifecycle: EditorLifecycle::Open,
+                    },
+                );
+            spawn_editor_action_watcher(
+                app.clone(),
+                target_id.clone(),
+                supervisor_generation,
+                action_control,
+            );
         }
         return result;
     }
@@ -1747,6 +1956,17 @@ async fn engine_open_plugin_editor(
     );
     let _ = app.emit_to(&label, PLUGIN_SHELL_REACTIVATE_EVENT, ());
     spawn_plugin_shell_toolbar(window.clone(), label, url);
+    state
+        .plugin_supervisor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .apply_event(
+            &instance_id,
+            supervisor_generation,
+            PluginEvent::EditorLifecycle {
+                lifecycle: EditorLifecycle::Open,
+            },
+        );
     Ok(())
 }
 
@@ -1759,6 +1979,12 @@ async fn engine_close_plugin_editor(
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
     validate_plugin_target_kind(&target_kind).map_err(EngineError::from)?;
+    let instance_id = PluginInstanceId(target_id.clone());
+    let supervisor_generation = state
+        .plugin_supervisor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .begin_close(&instance_id);
     // Fence only this target. Bumping the global last-foreground generation
     // here would incorrectly cancel an unrelated editor being opened now.
     state
@@ -1785,64 +2011,20 @@ async fn engine_close_plugin_editor(
         }
         let _ = app.emit_to("main", PLUGIN_SHELL_CLOSED_EVENT, label);
     }
-    result
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn engine_take_plugin_editor_actions(
-    target_id: String,
-    state: State<'_, NativeEngineState>,
-) -> Result<Vec<String>, EngineError> {
-    let control = state
-        .engine
-        .lock()
-        .map_err(|_| EngineError::Internal("native engine control lock is poisoned".into()))?
-        .plugin_control(&target_id)
-        .map_err(EngineError::from)?;
-    let actions = tauri::async_runtime::spawn_blocking(move || control.take_editor_actions())
-        .await
-        .map_err(|error| EngineError::Internal(error.to_string()))?;
-    if actions
-        .iter()
-        .any(|action| matches!(action, audio::dsp::PluginEditorAction::Closed))
-    {
-        // The native helper toolbar closes outside WebView2. Reflect that
-        // intent in the authoritative backend registry before a graph-sync
-        // callback gets a chance to reopen the target.
+    if let Some(generation) = supervisor_generation {
         state
-            .cancelled_editor_targets
+            .plugin_supervisor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(target_id.clone());
-        state
-            .floating_editor_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&target_id);
-        state
-            .pinned_editor_targets
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&target_id);
+            .apply_event(
+                &instance_id,
+                generation,
+                PluginEvent::EditorLifecycle {
+                    lifecycle: EditorLifecycle::Closed,
+                },
+            );
     }
-    Ok(actions
-        .into_iter()
-        .map(|action| match action {
-            audio::dsp::PluginEditorAction::Closed => "closed",
-            audio::dsp::PluginEditorAction::TogglePower => "toggle-power",
-            audio::dsp::PluginEditorAction::TogglePin => "toggle-pin",
-            audio::dsp::PluginEditorAction::ToggleBypass => "toggle-bypass",
-            audio::dsp::PluginEditorAction::SavePreset => "save-preset",
-            audio::dsp::PluginEditorAction::LoadPreset => "load-preset",
-            audio::dsp::PluginEditorAction::ShowSidechain => "show-sidechain",
-            audio::dsp::PluginEditorAction::AutomationOff => "automation-off",
-            audio::dsp::PluginEditorAction::AutomationWrite => "automation-write",
-            audio::dsp::PluginEditorAction::AutomationRead => "automation-read",
-            audio::dsp::PluginEditorAction::AutomationLatch => "automation-latch",
-        })
-        .map(str::to_owned)
-        .collect())
+    result
 }
 
 #[tauri::command]
@@ -1859,9 +2041,15 @@ fn engine_set_plugin_editor_host_state(
         .map_err(|_| EngineError::Internal("native engine control lock is poisoned".into()))?
         .plugin_control(&target_id)
         .map_err(EngineError::from)?;
+    let pinned = state
+        .pinned_editor_targets
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&target_id);
     control.set_editor_state(audio::dsp::PluginEditorState {
         bypassed,
         automation: automation.min(3),
+        pinned,
     });
     Ok(())
 }
@@ -2453,6 +2641,7 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_set_effect_bypass,
             engine_set_instrument_param,
             engine_midi_note,
+            engine_midi_notes,
             engine_midi_all_notes_off,
             engine_list_midi_inputs,
             engine_connect_midi_input,
@@ -2467,7 +2656,6 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_eq_response,
             engine_open_plugin_editor,
             engine_close_plugin_editor,
-            engine_take_plugin_editor_actions,
             engine_set_plugin_editor_host_state,
             engine_plugin_editor_is_open,
             engine_set_plugin_editor_pinned,

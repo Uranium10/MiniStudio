@@ -4,6 +4,9 @@ members = [
   "crates/ministudio-audio",
   "crates/ministudio-contracts",
   "crates/ministudio-dsp",
+  "crates/ministudio-plugin-api",
+  "crates/ministudio-plugin-helper",
+  "crates/ministudio-plugin-runtime",
   "crates/ministudio-plugin",
 ]
 resolver = "2"
@@ -44,6 +47,8 @@ tauri-build = { version = "2.5", features = [] }
 [dependencies]
 bytemuck = "1.24"
 ministudio-audio = { path = "crates/ministudio-audio" }
+ministudio-plugin-api = { path = "crates/ministudio-plugin-api" }
+ministudio-plugin-runtime = { path = "crates/ministudio-plugin-runtime" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 specta = { version = "=2.0.0-rc.25", features = ["derive", "function"] }

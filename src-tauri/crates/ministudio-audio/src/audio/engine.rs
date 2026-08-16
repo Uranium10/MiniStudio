@@ -1,4 +1,7 @@
 // Control-plane ownership and allocation-free CPAL callback core.
+pub use super::midi_service::{
+    DetachedMidiInputRoute, MidiConnectPlan, MidiInputRouteRequest, OpenedMidiInputRoute,
+};
 use super::{
     asset::{decode_asset, AudioAsset},
     command::{param_key, AudioCommand, MetronomeSettings},
@@ -9,6 +12,8 @@ use super::{
     },
     graph::{AudioGraph, Bindings},
     instrument::{LiveMidiMessage, NoteEvent, NoteEventKind},
+    metrics::RealtimeMetrics,
+    midi_service::MidiService,
     plugin::ExternalPluginRegistry,
     types::{
         db_to_gain, AudioBackendInfo, AudioDeviceInfo, AudioSettings, DecodeProgress, EffectSpec,
@@ -20,7 +25,6 @@ use super::{
 };
 use cpal::Stream;
 use crossbeam_queue::ArrayQueue;
-use midir::{Ignore, MidiInput, MidiInputConnection};
 pub use ministudio_dsp::EmbeddedPluginEditor;
 use mp3lame_encoder::{
     max_required_buffer_size, Bitrate, Builder as Mp3Builder, FlushGap, InterleavedPcm, Mode,
@@ -33,7 +37,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -252,6 +256,14 @@ pub struct AudioCore {
     click_regular: [f32; MAX_METRONOME_CLICK_SAMPLES],
     click_len: usize,
 }
+
+/// Hard callback budget for control commands. Remaining commands stay queued for the next
+/// block; a UI flood can therefore add bounded control latency but can never consume an entire
+/// audio deadline.
+const MAX_COMMANDS_PER_CALLBACK: usize = 256;
+/// Hardware/UI MIDI has its own bounded budget so a faulty device cannot starve graph process.
+const MAX_MIDI_PACKETS_PER_CALLBACK: usize = 512;
+
 impl AudioCore {
     #[cfg(test)]
     pub fn placeholder() -> Self {
@@ -529,7 +541,10 @@ impl AudioCore {
         }
     }
     fn drain_commands(&mut self) {
-        while let Ok(command) = self.commands.pop() {
+        for _ in 0..MAX_COMMANDS_PER_CALLBACK {
+            let Ok(command) = self.commands.pop() else {
+                break;
+            };
             match command {
                 AudioCommand::SetPlaying {
                     playing,
@@ -626,7 +641,10 @@ impl AudioCore {
                 }
             }
         }
-        while let Some(message) = self.midi_input.pop() {
+        for _ in 0..MAX_MIDI_PACKETS_PER_CALLBACK {
+            let Some(message) = self.midi_input.pop() else {
+                break;
+            };
             self.graph.push_live_event(message.track, message.event);
         }
     }
@@ -664,6 +682,7 @@ struct Runtime {
     failed: Arc<AtomicBool>,
     cpu_load: Arc<AtomicU32>,
     cpu_peak: Arc<AtomicU32>,
+    metrics: Arc<RealtimeMetrics>,
 }
 /// A near-silence streak for one track's plug-in control, driving the process-isolation idle
 /// hint. Lives entirely on the control plane (`poll`); the realtime graph never sees it.
@@ -681,38 +700,6 @@ const IDLE_SILENCE_PEAK: f32 = 0.0001;
 /// not currently being worked on", not "the note just ended".
 const IDLE_TRIM_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// MIDI device connections are expensive OS resources on Windows. In particular, opening and
-/// enumerating WinRT MIDI endpoints can enter `MidiSrvClientRpc` for an unbounded amount of time.
-/// Keep the physical connection alive and route each callback through this atomic indirection so
-/// graph rebuilds and track selection never have to reconnect the device.
-const NO_MIDI_TRACK: usize = usize::MAX;
-
-struct MidiInputRoute {
-    _connection: MidiInputConnection<()>,
-    target_track_id: String,
-    target_index: Arc<AtomicUsize>,
-}
-
-pub enum MidiConnectPlan {
-    Routed,
-    Open(MidiInputRouteRequest),
-}
-
-pub struct MidiInputRouteRequest {
-    port_id: String,
-    target_track_id: String,
-    target_index: Arc<AtomicUsize>,
-    queue: Arc<ArrayQueue<LiveMidiMessage>>,
-    counter: Arc<AtomicI32>,
-}
-
-pub struct OpenedMidiInputRoute {
-    port_id: String,
-    route: MidiInputRoute,
-}
-
-pub struct DetachedMidiInputRoute(MidiInputRoute);
-
 pub struct NativeEngine {
     settings: AudioSettings,
     runtime: Option<Runtime>,
@@ -721,9 +708,7 @@ pub struct NativeEngine {
     last_snapshot: Option<GraphSnapshot>,
     last_error: Option<String>,
     graph_revision: u64,
-    midi_input: Arc<ArrayQueue<LiveMidiMessage>>,
-    midi_routes: HashMap<String, MidiInputRoute>,
-    midi_note_counter: Arc<AtomicI32>,
+    midi_service: MidiService,
     plugin_instances: ExternalPluginRegistry,
     idle_trackers: HashMap<String, IdleTracker>,
 }
@@ -747,9 +732,7 @@ impl Default for NativeEngine {
             last_snapshot: None,
             last_error: None,
             graph_revision: 0,
-            midi_input: Arc::new(ArrayQueue::new(2048)),
-            midi_routes: HashMap::new(),
-            midi_note_counter: Arc::new(AtomicI32::new(1)),
+            midi_service: MidiService::default(),
             plugin_instances: ExternalPluginRegistry::default(),
             idle_trackers: HashMap::new(),
         }
@@ -762,11 +745,12 @@ impl NativeEngine {
         }
         self.restart_stream()
     }
-    pub fn dispose(&mut self) {
+    pub fn dispose(&mut self) -> Vec<DetachedMidiInputRoute> {
         self.close_all_plugin_editors();
         self.runtime = None;
-        self.midi_routes.clear();
+        let routes = self.midi_service.detach_all();
         self.plugin_instances.clear();
+        routes
     }
     fn restart_stream(&mut self) -> Result<(), String> {
         self.close_all_plugin_editors();
@@ -790,7 +774,7 @@ impl NativeEngine {
                 &mut self.plugin_instances,
             )?;
             self.bindings = b;
-            self.refresh_midi_routes();
+            self.midi_service.refresh_routes(&self.bindings.tracks);
             g
         } else {
             AudioGraph::empty(self.settings.sample_rate)
@@ -803,12 +787,13 @@ impl NativeEngine {
             retired_tx,
             graph,
             meter_tx,
-            Arc::clone(&self.midi_input),
+            self.midi_service.ingress(),
         );
         let xruns = Arc::new(AtomicU64::new(previous_xruns));
         let failed = Arc::new(AtomicBool::new(false));
         let cpu_load = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let cpu_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let metrics = Arc::new(RealtimeMetrics::default());
         match device::open_stream(
             &self.settings,
             core,
@@ -816,6 +801,7 @@ impl NativeEngine {
             Arc::clone(&failed),
             Arc::clone(&cpu_load),
             Arc::clone(&cpu_peak),
+            Arc::clone(&metrics),
         ) {
             Ok(stream) => {
                 self.runtime = Some(Runtime {
@@ -827,6 +813,7 @@ impl NativeEngine {
                     failed,
                     cpu_load,
                     cpu_peak,
+                    metrics,
                 });
                 self.last_error = None;
                 self.restore_transport(resume);
@@ -846,7 +833,7 @@ impl NativeEngine {
                         &mut self.plugin_instances,
                     )?;
                     self.bindings = bindings;
-                    self.refresh_midi_routes();
+                    self.midi_service.refresh_routes(&self.bindings.tracks);
                     graph
                 } else {
                     AudioGraph::empty(self.settings.sample_rate)
@@ -859,11 +846,12 @@ impl NativeEngine {
                     retired_tx,
                     graph,
                     meter_tx,
-                    Arc::clone(&self.midi_input),
+                    self.midi_service.ingress(),
                 );
                 let failed = Arc::new(AtomicBool::new(false));
                 let cpu_load = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
                 let cpu_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+                let metrics = Arc::new(RealtimeMetrics::default());
                 match device::open_stream(
                     &self.settings,
                     core,
@@ -871,6 +859,7 @@ impl NativeEngine {
                     Arc::clone(&failed),
                     Arc::clone(&cpu_load),
                     Arc::clone(&cpu_peak),
+                    Arc::clone(&metrics),
                 ) {
                     Ok(stream) => {
                         self.runtime = Some(Runtime {
@@ -882,6 +871,7 @@ impl NativeEngine {
                             failed,
                             cpu_load,
                             cpu_peak,
+                            metrics,
                         });
                         self.last_error = Some(format!(
                             "requested audio device failed; using system default: {first}"
@@ -912,12 +902,17 @@ impl NativeEngine {
     }
     fn push(&mut self, command: AudioCommand) -> Result<(), String> {
         self.collect_retired();
-        self.runtime
+        let runtime = self
+            .runtime
             .as_mut()
-            .ok_or("audio stream is not initialized")?
-            .commands
-            .push(command)
-            .map_err(|_| "audio command queue is full".into())
+            .ok_or("audio stream is not initialized")?;
+        runtime
+            .metrics
+            .observe_command_depth(COMMAND_CAPACITY.saturating_sub(runtime.commands.slots()) + 1);
+        runtime.commands.push(command).map_err(|_| {
+            runtime.metrics.command_overflow();
+            "audio command queue is full".into()
+        })
     }
     fn collect_retired(&mut self) {
         if let Some(runtime) = &mut self.runtime {
@@ -964,7 +959,7 @@ impl NativeEngine {
         // and its editor/parameter lookup table must remain one transaction.
         self.push(AudioCommand::SwapGraph(graph))?;
         self.bindings = bindings;
-        self.refresh_midi_routes();
+        self.midi_service.refresh_routes(&self.bindings.tracks);
         self.last_snapshot = Some(spec);
         self.graph_revision = self.graph_revision.wrapping_add(1);
         // Stale entries (deleted/renamed tracks) would otherwise sit here forever; a rebuild is
@@ -1261,18 +1256,28 @@ impl NativeEngine {
             }
         }
         self.collect_retired();
-        let (frame, running, xruns, cpu_load, cpu_peak) = if let Some(runtime) = &mut self.runtime {
-            runtime.meters.update();
-            (
-                *runtime.meters.output_buffer_mut(),
-                true,
-                runtime.xruns.load(Ordering::Relaxed),
-                f32::from_bits(runtime.cpu_load.load(Ordering::Relaxed)),
-                f32::from_bits(runtime.cpu_peak.load(Ordering::Relaxed)),
-            )
-        } else {
-            (MeterFrame::default(), false, 0, 0.0, 0.0)
-        };
+        let (frame, running, xruns, cpu_load, cpu_peak, realtime_metrics) =
+            if let Some(runtime) = &mut self.runtime {
+                runtime.meters.update();
+                let xruns = runtime.xruns.load(Ordering::Relaxed);
+                (
+                    *runtime.meters.output_buffer_mut(),
+                    true,
+                    xruns,
+                    f32::from_bits(runtime.cpu_load.load(Ordering::Relaxed)),
+                    f32::from_bits(runtime.cpu_peak.load(Ordering::Relaxed)),
+                    runtime.metrics.snapshot(xruns),
+                )
+            } else {
+                (
+                    MeterFrame::default(),
+                    false,
+                    0,
+                    0.0,
+                    0.0,
+                    Default::default(),
+                )
+            };
         let track_levels = frame.levels[..self.bindings.track_ids.len().min(MAX_TRACKS)].to_vec();
         self.update_idle_hints(&track_levels);
         let multiband_levels = frame.multiband_levels[..self
@@ -1317,6 +1322,12 @@ impl NativeEngine {
                 integrated_lufs: values[6],
             })
             .collect();
+        let plugin_deadline_misses = self
+            .bindings
+            .plugin_controls
+            .values()
+            .map(|control| control.realtime_deadline_misses())
+            .sum();
         EngineSnapshot {
             playhead_sec: frame.position as f64 / f64::from(self.settings.sample_rate),
             track_levels,
@@ -1332,6 +1343,13 @@ impl NativeEngine {
                 cpu_load_percent: f64::from(cpu_load.clamp(0.0, 8.0)) * 100.0,
                 cpu_peak_percent: f64::from(cpu_peak.clamp(0.0, 8.0)) * 100.0,
                 count_in_beats_remaining: frame.count_in_beats_remaining,
+                callback_p50_ms: realtime_metrics.callback_p50_ns as f64 / 1_000_000.0,
+                callback_p95_ms: realtime_metrics.callback_p95_ns as f64 / 1_000_000.0,
+                callback_p99_ms: realtime_metrics.callback_p99_ns as f64 / 1_000_000.0,
+                callback_max_ms: realtime_metrics.callback_max_ns as f64 / 1_000_000.0,
+                command_queue_high_water: realtime_metrics.command_high_water,
+                command_queue_overflow: realtime_metrics.command_overflow,
+                plugin_deadline_misses,
             },
             graph_revision: self.graph_revision,
             playing: frame.playing,
@@ -1352,30 +1370,13 @@ impl NativeEngine {
     /// A cheap snapshot used by the Tauri layer before it releases the global engine lock and
     /// performs the potentially blocking OS enumeration on the blocking pool.
     pub fn midi_route_snapshot(&self) -> HashMap<String, String> {
-        self.midi_routes
-            .iter()
-            .map(|(port_id, route)| (port_id.clone(), route.target_track_id.clone()))
-            .collect()
+        self.midi_service.route_snapshot()
     }
 
     pub fn scan_midi_inputs(
         connected_routes: &HashMap<String, String>,
     ) -> Result<Vec<MidiInputPortInfo>, String> {
-        let input = MidiInput::new("MiniStudio MIDI scan").map_err(|error| error.to_string())?;
-        input
-            .ports()
-            .iter()
-            .enumerate()
-            .map(|(index, port)| {
-                let id = index.to_string();
-                Ok(MidiInputPortInfo {
-                    name: input.port_name(port).map_err(|error| error.to_string())?,
-                    connected: connected_routes.contains_key(&id),
-                    target_track_id: connected_routes.get(&id).cloned(),
-                    id,
-                })
-            })
-            .collect()
+        MidiService::scan_inputs(connected_routes)
     }
     /// Resolves a route while the engine lock is held, but never talks to the operating system.
     /// Existing hardware connections are retargeted with one atomic store.
@@ -1389,169 +1390,29 @@ impl NativeEngine {
             .tracks
             .get(track_id)
             .ok_or("unknown MIDI target track")?;
-        if let Some(route) = self.midi_routes.get_mut(port_id) {
-            if route.target_track_id == track_id
-                && route.target_index.load(Ordering::Acquire) == track
-            {
-                return Ok(MidiConnectPlan::Routed);
-            }
-            route.target_track_id = track_id.to_owned();
-            route.target_index.store(track, Ordering::Release);
-            return Ok(MidiConnectPlan::Routed);
-        }
-        Ok(MidiConnectPlan::Open(MidiInputRouteRequest {
-            port_id: port_id.to_owned(),
-            target_track_id: track_id.to_owned(),
-            target_index: Arc::new(AtomicUsize::new(track)),
-            queue: Arc::clone(&self.midi_input),
-            counter: Arc::clone(&self.midi_note_counter),
-        }))
+        Ok(self.midi_service.prepare_input(port_id, track_id, track))
     }
 
     /// Performs the potentially slow MidiSrv work without borrowing `NativeEngine` or holding its
     /// global mutex. The returned connection is installed in a short second control-plane step.
     pub fn open_midi_input(request: MidiInputRouteRequest) -> Result<OpenedMidiInputRoute, String> {
-        let mut input =
-            MidiInput::new("MiniStudio MIDI input").map_err(|error| error.to_string())?;
-        input.ignore(Ignore::None);
-        let port_index = request
-            .port_id
-            .parse::<usize>()
-            .map_err(|_| "invalid MIDI port")?;
-        let port = input
-            .ports()
-            .get(port_index)
-            .cloned()
-            .ok_or("MIDI port is unavailable")?;
-        let callback_target = Arc::clone(&request.target_index);
-        let initial_track = callback_target.load(Ordering::Acquire);
-        let mut note_ids = [[-1_i32; 8]; 128];
-        let mut note_counts = [0_usize; 128];
-        let mut last_track = initial_track;
-        let connection = input
-            .connect(
-                &port,
-                "MiniStudio",
-                move |_stamp, message, _| {
-                    if message.is_empty() {
-                        return;
-                    }
-                    let track = callback_target.load(Ordering::Acquire);
-                    if track == NO_MIDI_TRACK {
-                        return;
-                    }
-                    if track != last_track {
-                        note_ids = [[-1_i32; 8]; 128];
-                        note_counts = [0_usize; 128];
-                        last_track = track;
-                    }
-                    let status = message[0] & 0xf0;
-                    let pitch = message.get(1).copied().unwrap_or(0).min(127);
-                    let value = message.get(2).copied().unwrap_or(0);
-                    let kind = match status {
-                        0x90 if value > 0 => {
-                            let id = request.counter.fetch_add(1, Ordering::Relaxed);
-                            let count = &mut note_counts[pitch as usize];
-                            if *count < 8 {
-                                note_ids[pitch as usize][*count] = id;
-                                *count += 1;
-                            }
-                            NoteEventKind::NoteOn {
-                                note_id: id,
-                                pitch,
-                                velocity: f32::from(value) / 127.0,
-                                tuning_cents: 0.0,
-                            }
-                        }
-                        0x80 | 0x90 => {
-                            let count = &mut note_counts[pitch as usize];
-                            let id = if *count > 0 {
-                                *count -= 1;
-                                note_ids[pitch as usize][*count]
-                            } else {
-                                -1
-                            };
-                            NoteEventKind::NoteOff {
-                                note_id: id,
-                                pitch,
-                                velocity: f32::from(value) / 127.0,
-                            }
-                        }
-                        0xb0 => NoteEventKind::Controller {
-                            cc: pitch,
-                            value: f32::from(value) / 127.0,
-                        },
-                        0xe0 => {
-                            let bend = (u16::from(value) << 7) | u16::from(pitch);
-                            NoteEventKind::PitchBend {
-                                value: (f32::from(bend) - 8192.0) / 8192.0,
-                            }
-                        }
-                        _ => return,
-                    };
-                    let _ = request.queue.push(LiveMidiMessage {
-                        track,
-                        event: NoteEvent {
-                            sample_offset: 0,
-                            kind,
-                        },
-                    });
-                },
-                (),
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(OpenedMidiInputRoute {
-            port_id: request.port_id,
-            route: MidiInputRoute {
-                _connection: connection,
-                target_track_id: request.target_track_id,
-                target_index: request.target_index,
-            },
-        })
+        MidiService::open_input(request)
     }
 
     pub fn install_midi_input(
         &mut self,
         opened: OpenedMidiInputRoute,
     ) -> Option<DetachedMidiInputRoute> {
-        let current_target = self
-            .bindings
-            .tracks
-            .get(&opened.route.target_track_id)
-            .copied()
-            .unwrap_or(NO_MIDI_TRACK);
-        opened
-            .route
-            .target_index
-            .store(current_target, Ordering::Release);
-        if let Some(existing) = self.midi_routes.get_mut(&opened.port_id) {
-            existing.target_track_id = opened.route.target_track_id.clone();
-            existing
-                .target_index
-                .store(current_target, Ordering::Release);
-            return Some(DetachedMidiInputRoute(opened.route));
-        }
-        self.midi_routes.insert(opened.port_id, opened.route);
-        None
+        let target = self.bindings.tracks.get(opened.target_track_id()).copied();
+        self.midi_service.install_input(opened, target)
     }
 
     pub fn detach_midi_input(&mut self, port_id: &str) -> Option<DetachedMidiInputRoute> {
-        self.midi_routes.remove(port_id).map(DetachedMidiInputRoute)
+        self.midi_service.detach_input(port_id)
     }
 
     pub fn release_midi_input(route: DetachedMidiInputRoute) {
-        drop(route.0);
-    }
-    fn refresh_midi_routes(&mut self) {
-        for route in self.midi_routes.values_mut() {
-            let target = self
-                .bindings
-                .tracks
-                .get(&route.target_track_id)
-                .copied()
-                .unwrap_or(NO_MIDI_TRACK);
-            route.target_index.store(target, Ordering::Release);
-        }
+        MidiService::release_input(route);
     }
     pub fn settings(&self) -> AudioSettings {
         self.settings.clone()

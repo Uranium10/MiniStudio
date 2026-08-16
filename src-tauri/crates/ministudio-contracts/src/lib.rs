@@ -113,6 +113,17 @@ pub struct StreamStatus {
     pub cpu_peak_percent: f64,
     /// Zero outside pre-count; otherwise the number of musical beats still to count.
     pub count_in_beats_remaining: u32,
+    /// Callback latency percentiles, calculated off the audio thread.
+    pub callback_p50_ms: f64,
+    pub callback_p95_ms: f64,
+    pub callback_p99_ms: f64,
+    pub callback_max_ms: f64,
+    /// Highest observed occupancy of the bounded control queue.
+    pub command_queue_high_water: u32,
+    /// Commands rejected because the bounded queue was full.
+    pub command_queue_overflow: u64,
+    /// Realtime plug-in endpoint deadline misses.
+    pub plugin_deadline_misses: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Type)]

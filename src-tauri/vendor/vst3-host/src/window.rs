@@ -30,8 +30,9 @@ use winapi::{
         LoadCursorW, MoveWindow, RegisterClassExW, ScreenToClient,
         SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackMouseEvent, UpdateWindow, CS_DROPSHADOW,
         CW_USEDEFAULT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_ARROW, PAINTSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, TME_LEAVE, TRACKMOUSEEVENT, WM_CLOSE, WM_DPICHANGED,
+        GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, PAINTSTRUCT,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, TME_LEAVE,
+        TRACKMOUSEEVENT, WM_CLOSE, WM_DPICHANGED,
         WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MOUSELEAVE, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CHILD,
         WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_VISIBLE,
@@ -684,6 +685,7 @@ unsafe extern "system" fn plugin_window_proc(
             | HostChromeButton::AutomationWrite
             | HostChromeButton::AutomationRead
             | HostChromeButton::AutomationLatch)) => {
+                let mut pin_transition = None;
                 if let Ok(mut states) = host_chrome_states().lock() {
                     let state = states.entry(hwnd as usize).or_default();
                     let action = match button {
@@ -693,6 +695,7 @@ unsafe extern "system" fn plugin_window_proc(
                         }
                         HostChromeButton::Pin => {
                             state.pinned = !state.pinned;
+                            pin_transition = Some(state.pinned);
                             EditorHostAction::TogglePin
                         }
                         HostChromeButton::Bypass => {
@@ -725,6 +728,20 @@ unsafe extern "system" fn plugin_window_proc(
                     if state.actions.len() < 64 {
                         state.actions.push(action);
                     }
+                }
+                if let Some(pinned) = pin_transition {
+                    // Apply the native state immediately. The supervisor acknowledgement keeps
+                    // DAW state synchronized later, but a busy WebView/control channel must not
+                    // make the pin button visually lie to the user.
+                    SetWindowPos(
+                        hwnd,
+                        if pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
                 }
                 invalidate_host_chrome(hwnd);
                 return 0;
@@ -1293,12 +1310,14 @@ impl PluginWindow {
                     chrome.bypassed != state.bypassed,
                     chrome.automation,
                     next_automation,
+                    chrome.pinned != state.pinned,
                 );
                 chrome.bypassed = state.bypassed;
                 chrome.automation = next_automation;
+                chrome.pinned = state.pinned;
                 Some(changed)
             });
-            if let Some((bypass_changed, old_automation, new_automation)) = changed {
+            if let Some((bypass_changed, old_automation, new_automation, pin_changed)) = changed {
                 unsafe {
                     if bypass_changed {
                         invalidate_host_button(hwnd, HostChromeButton::Power);
@@ -1313,6 +1332,18 @@ impl PluginWindow {
                         };
                         invalidate_host_button(hwnd, automation_button(old_automation));
                         invalidate_host_button(hwnd, automation_button(new_automation));
+                    }
+                    if pin_changed {
+                        SetWindowPos(
+                            hwnd,
+                            if state.pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        invalidate_host_button(hwnd, HostChromeButton::Pin);
                     }
                 }
             }

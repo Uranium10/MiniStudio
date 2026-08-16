@@ -1,0 +1,9 @@
+[package]
+name = "ministudio-plugin-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Plug-in lifecycle and isolation supervisor for MiniStudio"
+
+[dependencies]
+ministudio-plugin-api = { path = "../ministudio-plugin-api" }
+

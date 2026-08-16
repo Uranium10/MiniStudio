@@ -1,0 +1,11 @@
+[package]
+name = "ministudio-plugin-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Format-neutral helper placement and compatibility policy for MiniStudio"
+
+[dependencies]
+ministudio-plugin-api = { path = "../ministudio-plugin-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+

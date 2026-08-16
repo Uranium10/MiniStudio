@@ -1,27 +1,64 @@
-# 네이티브 오디오 아키텍처
+# MiniStudio audio runtime architecture
 
-## 스레드 모델
+## Ownership model
 
-웹뷰는 `RustEngine`을 통해 Tauri 커맨드를 호출한다. 커맨드 핸들러가 실행되는 제어 평면은 파일 디코딩, 리샘플링, 그래프 구성, 장치 열거와 WAV I/O를 담당한다. CPAL 콜백은 완성된 그래프의 `process()`만 실행한다.
+`NativeEngine` is currently the control-side façade. It builds immutable `AudioGraph` values,
+owns decoded assets and external plug-in control handles, and publishes commands to the running
+audio stream. The CPAL callback owns `AudioCore` and renders only the currently installed graph.
+Graph replacement is transactional: a complete graph is built off the callback, submitted through
+a bounded SPSC queue, and the retired graph is returned to the control side for destruction.
 
-제어 → 오디오는 용량 1024의 `rtrb` SPSC 명령 큐다. 파라미터 명령은 인덱스와 고정 32바이트 키를 가지므로 콜백에서 문자열을 생성하지 않는다. 구조 변경은 `Box<AudioGraph>` 전체를 `SwapGraph`로 보낸다. 이전 그래프는 별도의 반환 SPSC 큐로 보내 제어 측에서 drop한다.
+External plug-in control and realtime processing are separate owners. In particular, the Windows
+VST3 audio adapter owns a detached `RealtimeClient`; editor, state and lifecycle operations retain
+only the control handle. A stalled native editor can therefore not acquire anything needed by the
+audio callback.
 
-오디오 → 제어 상태는 `triple_buffer`의 고정 크기 `MeterFrame`이다. 샘플 위치, 64개 트랙 레벨, 마스터 레벨, PDC를 게시한다. TypeScript는 재생 중 30Hz, 정지 중 4Hz로 폴링하며 트랙 ID 문자열 대신 revision이 붙은 그래프 순서 배열을 받는다.
+## Realtime data plane
 
-## 실시간 안전성
+- Audio commands use a preallocated `rtrb` queue. At most 256 control commands and 512 live MIDI
+  packets are drained in one callback so control traffic cannot consume an unbounded deadline.
+- Meter state is a fixed-size `triple_buffer::Output<MeterFrame>` containing transport position,
+  track/master levels, PDC and bounded DSP analyzer data.
+- Windows VST3 audio, timestamped MIDI and sample-accurate parameters use one versioned shared
+  memory mapping per instance plus request/response OS events. JSON/stdin/stdout is control-only.
+- Editor actions and realtime transport faults have their own OS events. Neither requires a timer
+  poll, a WebView round trip, or a plug-in lifecycle lock.
+- Every callback buffer, event list and graph scratch area is allocated before streaming begins.
 
-콜백 진입 전에 최대 2채널, 2048 프레임, 64트랙, 16버스, 체인당 16 이펙트의 버퍼를 준비한다. 정상 렌더 경로는 파일 I/O, 로그, Mutex/RwLock, 동적 수집, 포맷팅과 블로킹 채널을 사용하지 않는다. 클립은 시작 샘플로 정렬되고 커서 이후의 현재 블록 교차 이벤트만 읽는다.
+The callback must not use mutexes, blocking channels, synchronous control IPC, file I/O, logging,
+or heap allocation. `tests/realtime_architecture.rs` rejects direct regressions in the callback and
+`AudioCore::render` surfaces; this is a guardrail rather than a substitute for profiling.
 
-게인·팬·센드와 연속 DSP 파라미터는 10~20ms 원폴 스무더를 샘플마다 진행한다. 피드백 상태는 절댓값 `1e-20` 아래에서 0으로 만들어 데놈럴을 방지한다. x86 FTZ/DAZ는 플랫폼 모듈 추가 시 콜백 스레드 시작부에서 함께 활성화해야 한다.
+## Bounded failure behavior
 
-## 그래프와 시간
+A VST3 transport timeout latches the realtime endpoint fault, increments a lock-free deadline
+counter, produces a safe block, and signals the control actor through a dedicated fault event. The
+control owner then respawns/restores the helper and reattaches the same mapping. Recovery never runs
+inline in the callback. GUI latency alone is not an audio failure.
 
-모든 내부 시간은 프로젝트 샘플레이트의 `u64` 샘플이다. 클립의 시작/끝, 오프셋과 equal-power 페이드는 블록 안에서도 샘플 정확도로 계산된다. 루프 끝이 블록 중간이면 해당 지점까지 렌더한 후 루프 시작으로 커서와 DSP 상태를 재설정하고 나머지를 처리한다.
+Stream errors increment an atomic xrun counter. Device initialization first tries the selected
+backend/device and then the operating-system default. Failed streams are restarted from the control
+side while preserving the transport snapshot when possible.
 
-신호는 클립 → 트랙 인서트 → 팬/페이더 → 마스터로 흐른다. 센드는 pre/post 지점에서 버스 입력으로 복사되고 버스 인서트/페이더 뒤 마스터에 더해진다. 하나 이상의 트랙이 솔로면 비솔로 트랙만 음소거한다.
+## Telemetry
 
-각 트랙 이펙트 지연 합의 최댓값을 구하고 `max - track` 크기의 사전 할당 지연선을 넣어 PDC를 수행한다. 현재 최대 지연은 `StreamStatus.pdcSamples`로 표시한다.
+`RealtimeMetrics` records callback count, a logarithmic duration histogram, maximum duration,
+command queue high-water/overflow and plug-in deadline misses using relaxed atomics. Percentiles are
+computed only when the control side requests an `EngineSnapshot`, never in the callback. The UI
+receives p50/p95/p99/max milliseconds, xrun count and queue diagnostics through `StreamStatus`.
 
-## 장치 오류
+## Time, routing and PDC
 
-CPAL 오류 콜백은 원자적 xrun 카운터만 증가시킨다. 장치 설정 실패 시 스트림을 정리하고 운영체제 기본 호스트/기본 출력으로 한 번 폴백한다. 오류는 `EngineError` 종류와 상태 폴링으로 UI에 전달한다.
+Project time is represented as `u64` samples inside the renderer. Clip edges, fades, loop splits and
+tempo boundaries are calculated at sample precision. Sends and sidechains use deterministic taps;
+feedback within one callback is prevented with the documented one-block source delay. Track paths
+are delayed to the longest effective latency and the maximum is published as `pdcSamples`.
+
+## Remaining migration gate
+
+The global `NativeEngine` control mutex still serializes short Tauri control calls. Slow editor and
+MIDI operating-system calls are already cloned/prepared under that lock and executed after release,
+so it is not on the audio path. It will be replaced by the planned control actor and immutable
+runtime snapshot only after command parity tests exist. CLAP and non-Windows external plug-ins also
+still need the same out-of-process realtime transport before the legacy compatibility layer can be
+removed.

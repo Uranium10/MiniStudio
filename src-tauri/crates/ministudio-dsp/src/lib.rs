@@ -36,6 +36,7 @@ pub enum PluginEditorAction {
 pub struct PluginEditorState {
     pub bypassed: bool,
     pub automation: u8,
+    pub pinned: bool,
 }
 
 /// Main-thread/control-plane access to an external plug-in instance.
@@ -66,12 +67,26 @@ pub trait PluginControl: Send + Sync {
     fn take_editor_actions(&self) -> Vec<PluginEditorAction> {
         Vec::new()
     }
+    /// Block a non-realtime watcher until editor actions arrive or `timeout` elapses.
+    fn wait_editor_actions(&self, timeout: std::time::Duration) -> Vec<PluginEditorAction> {
+        std::thread::sleep(timeout);
+        self.take_editor_actions()
+    }
     fn set_editor_state(&self, _state: PluginEditorState) {}
+    /// Apply native topmost/floating state and return only after the platform owner acknowledges
+    /// the transition. This is a control-plane call and must never run from the audio callback.
+    fn set_editor_pinned(&self, _pinned: bool) -> Result<(), String> {
+        Ok(())
+    }
     /// Hints that this instance's track has been silent for a while (`true`) or has started
     /// producing audio again (`false`). This is only a future graph-suspension seam: a host
     /// must not trim or page out a helper that is still servicing realtime deadlines. Callers
     /// never depend on the hint taking effect, and current implementations leave it as a no-op.
     fn set_idle(&self, _idle: bool) {}
+    /// Monotonic count of realtime helper response deadlines missed by this instance.
+    fn realtime_deadline_misses(&self) -> u64 {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

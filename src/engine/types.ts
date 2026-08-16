@@ -310,7 +310,7 @@ export type AudioDeviceInfo = {
 }
 export type AudioSettings = { backendId: string; deviceId: string; sampleRate: number; bufferSize: number }
 export type MidiInputPortInfo = { id: string; name: string; connected: boolean; targetTrackId?: string | null }
-export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number; cpuLoadPercent: number; cpuPeakPercent: number; countInBeatsRemaining: number }
+export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number; cpuLoadPercent: number; cpuPeakPercent: number; countInBeatsRemaining: number; callbackP50Ms: number; callbackP95Ms: number; callbackP99Ms: number; callbackMaxMs: number; commandQueueHighWater: number; commandQueueOverflow: number; pluginDeadlineMisses: number }
 export type EqFrequencyResponse = { frequencies: number[]; combinedDb: number[]; bandsDb: number[][] }
 export type ExportProgress = { stage: string; renderedFrames: number; totalFrames: number; fraction: number }
 export type ExportSettings = { format: 'wav' | 'mp3'; sampleRate: number; bitDepth: 16 | 24 | 32; mp3BitrateKbps: 128 | 192 | 256 | 320; normalize: boolean }

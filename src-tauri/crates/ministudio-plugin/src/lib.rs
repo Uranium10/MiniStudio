@@ -40,6 +40,7 @@ use std::{
 use vst3_host::{
     embed::{EditorRect, EmbeddedEditor},
     midi::NoteId,
+    realtime_ipc::{EditorActionReader, RealtimeClient},
     BusAudioBuffers, BusDirection, MediaType, MidiChannel, MidiEvent, Plugin, PluginWindow,
     Vst3Host,
 };
@@ -519,6 +520,7 @@ fn load_vst3(path: &str, uid: &str, sample_rate: f32, role: Vst3Role) -> Result<
 }
 
 enum Vst3ControlCommand {
+    Recover,
     Open(Sender<Result<(), String>>),
     OpenEmbedded {
         parent: usize,
@@ -531,6 +533,7 @@ enum Vst3ControlCommand {
     LoadState(Vec<u8>, Sender<Result<(), String>>),
     TakeEditorActions(Sender<Vec<PluginEditorAction>>),
     SetEditorState(PluginEditorState),
+    SetEditorPinned(PluginEditorState, Sender<Result<(), String>>),
     /// Resource hint only - see `PluginControl::set_idle`. Fire-and-forget, like
     /// `CloseEmbedded`: nothing downstream needs to know it landed.
     SetIdle(bool),
@@ -542,10 +545,15 @@ struct Vst3Control {
     editor_open: Arc<AtomicBool>,
     pending_editor_rect: Arc<Mutex<Option<EditorRect>>>,
     has_editor: Arc<AtomicBool>,
+    host_state: Mutex<PluginEditorState>,
+    action_request_pending: Arc<AtomicBool>,
+    action_reader: Arc<Mutex<Option<EditorActionReader>>>,
+    recovery_handle: Arc<Mutex<Option<vst3_host::realtime_ipc::RealtimeRecoveryHandle>>>,
 }
 
 struct Vst3Ready {
     plugin: Arc<Mutex<Plugin>>,
+    realtime: Option<RealtimeClient>,
     buffers: BusAudioBuffers,
     latency: usize,
     tail: usize,
@@ -624,6 +632,10 @@ fn start_vst3_instance(
     let editor_open = Arc::new(AtomicBool::new(false));
     let has_editor = Arc::new(AtomicBool::new(false));
     let pending_editor_rect = Arc::new(Mutex::new(None));
+    let action_request_pending = Arc::new(AtomicBool::new(false));
+    let action_reader = Arc::new(Mutex::new(None));
+    let recovery_handle = Arc::new(Mutex::new(None));
+    let recovery_sender = sender.clone();
     let state_checkpoint = Arc::new(Mutex::new(state.clone()));
     let parameter_checkpoint = params.clone();
     let control = Arc::new(Vst3Control {
@@ -631,6 +643,10 @@ fn start_vst3_instance(
         editor_open: Arc::clone(&editor_open),
         pending_editor_rect: Arc::clone(&pending_editor_rect),
         has_editor: Arc::clone(&has_editor),
+        host_state: Mutex::new(PluginEditorState::default()),
+        action_request_pending: Arc::clone(&action_request_pending),
+        action_reader: Arc::clone(&action_reader),
+        recovery_handle: Arc::clone(&recovery_handle),
     });
 
     std::thread::Builder::new()
@@ -658,9 +674,36 @@ fn start_vst3_instance(
                 let buffers = plugin
                     .create_bus_audio_buffers(MAX_BLOCK_SIZE)
                     .map_err(|error| error.to_string())?;
+                // The shared-memory endpoint has one audio-side owner. Detach it before the
+                // remaining Plugin value is put behind the control-plane mutex, otherwise a
+                // slow editor/state request can turn `try_lock` failure into a silent block.
+                let realtime = plugin.take_isolated_realtime();
+                if let Some(reader) = realtime.as_ref().map(RealtimeClient::fault_reader) {
+                    let sender = recovery_sender.clone();
+                    let _ = std::thread::Builder::new()
+                        .name("ministudio-vst3-fault-events".into())
+                        .spawn(move || {
+                            while reader.alive() {
+                                if reader.wait(std::time::Duration::from_secs(1))
+                                    && sender.send(Vst3ControlCommand::Recover).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                }
+                *recovery_handle
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    realtime.as_ref().map(RealtimeClient::recovery_handle);
+                *action_reader
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    realtime.as_ref().map(RealtimeClient::editor_action_reader);
                 has_editor.store(plugin.has_editor(), Ordering::Release);
                 Ok(Vst3Ready {
                     plugin: Arc::new(Mutex::new(plugin)),
+                    realtime,
                     buffers,
                     latency,
                     tail,
@@ -678,6 +721,7 @@ fn start_vst3_instance(
                             pending_editor_rect,
                             owner_checkpoint,
                             parameter_checkpoint,
+                            action_request_pending,
                         );
                     }
                 }
@@ -752,12 +796,32 @@ impl PluginControl for Vst3Control {
         self.request(|reply| Vst3ControlCommand::LoadState(state, reply))
     }
     fn take_editor_actions(&self) -> Vec<PluginEditorAction> {
+        if let Some(reader) = self
+            .action_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+        {
+            let actions = reader
+                .take()
+                .into_iter()
+                .map(map_vst3_editor_action)
+                .collect::<Vec<_>>();
+            if actions.contains(&PluginEditorAction::Closed) {
+                self.editor_open.store(false, Ordering::Release);
+            }
+            return actions;
+        }
+        if self.action_request_pending.swap(true, Ordering::AcqRel) {
+            return Vec::new();
+        }
         let (reply, receive) = channel();
         if self
             .sender
             .send(Vst3ControlCommand::TakeEditorActions(reply))
             .is_err()
         {
+            self.action_request_pending.store(false, Ordering::Release);
             return Vec::new();
         }
         let actions = receive
@@ -768,11 +832,94 @@ impl PluginControl for Vst3Control {
         }
         actions
     }
+    fn wait_editor_actions(&self, timeout: std::time::Duration) -> Vec<PluginEditorAction> {
+        if let Some(reader) = self
+            .action_reader
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+        {
+            let actions = reader
+                .wait_and_take(timeout)
+                .into_iter()
+                .map(map_vst3_editor_action)
+                .collect::<Vec<_>>();
+            if actions.contains(&PluginEditorAction::Closed) {
+                self.editor_open.store(false, Ordering::Release);
+            }
+            return actions;
+        }
+        std::thread::sleep(timeout);
+        self.take_editor_actions()
+    }
     fn set_editor_state(&self, state: PluginEditorState) {
+        *self
+            .host_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = state;
         let _ = self.sender.send(Vst3ControlCommand::SetEditorState(state));
+    }
+    fn set_editor_pinned(&self, pinned: bool) -> Result<(), String> {
+        let mut state = *self
+            .host_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        state.pinned = pinned;
+        self.request(|reply| Vst3ControlCommand::SetEditorPinned(state, reply))?;
+        *self
+            .host_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = state;
+        Ok(())
     }
     fn set_idle(&self, idle: bool) {
         let _ = self.sender.send(Vst3ControlCommand::SetIdle(idle));
+    }
+    fn realtime_deadline_misses(&self) -> u64 {
+        self.recovery_handle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map_or(
+                0,
+                vst3_host::realtime_ipc::RealtimeRecoveryHandle::deadline_misses,
+            )
+    }
+}
+
+fn map_vst3_editor_action(
+    action: vst3_host::process_isolation::EditorHostAction,
+) -> PluginEditorAction {
+    match action {
+        vst3_host::process_isolation::EditorHostAction::Closed => PluginEditorAction::Closed,
+        vst3_host::process_isolation::EditorHostAction::TogglePower => {
+            PluginEditorAction::TogglePower
+        }
+        vst3_host::process_isolation::EditorHostAction::TogglePin => PluginEditorAction::TogglePin,
+        vst3_host::process_isolation::EditorHostAction::ToggleBypass => {
+            PluginEditorAction::ToggleBypass
+        }
+        vst3_host::process_isolation::EditorHostAction::SavePreset => {
+            PluginEditorAction::SavePreset
+        }
+        vst3_host::process_isolation::EditorHostAction::LoadPreset => {
+            PluginEditorAction::LoadPreset
+        }
+        vst3_host::process_isolation::EditorHostAction::ShowSidechain => {
+            PluginEditorAction::ShowSidechain
+        }
+        vst3_host::process_isolation::EditorHostAction::AutomationOff => {
+            PluginEditorAction::AutomationOff
+        }
+        vst3_host::process_isolation::EditorHostAction::AutomationWrite => {
+            PluginEditorAction::AutomationWrite
+        }
+        vst3_host::process_isolation::EditorHostAction::AutomationRead => {
+            PluginEditorAction::AutomationRead
+        }
+        vst3_host::process_isolation::EditorHostAction::AutomationLatch => {
+            PluginEditorAction::AutomationLatch
+        }
     }
 }
 
@@ -789,6 +936,7 @@ fn run_vst3_control(
     pending_editor_rect: Arc<Mutex<Option<EditorRect>>>,
     state_checkpoint: Arc<Mutex<Vec<u8>>>,
     parameter_checkpoint: Vec<(String, f32)>,
+    action_request_pending: Arc<AtomicBool>,
 ) {
     // Do not preselect a COM apartment for a vendor's standalone GUI thread.
     // The original standalone host left this thread uninitialized and allowed
@@ -802,7 +950,36 @@ fn run_vst3_control(
         .unwrap_or(false);
     let mut embedded: Option<EmbeddedEditor> = None;
     loop {
-        match receiver.recv_timeout(std::time::Duration::from_millis(8)) {
+        let received = if isolated {
+            receiver
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            receiver.recv_timeout(std::time::Duration::from_millis(8))
+        };
+        match received {
+            Ok(Vst3ControlCommand::Recover) => {
+                editor_open.store(false, Ordering::Release);
+                if let Ok(mut plugin) = plugin.lock() {
+                    if plugin.recover().is_ok() {
+                        let checkpoint = state_checkpoint
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .clone();
+                        if !checkpoint.is_empty() {
+                            let _ = plugin.load_state(&checkpoint);
+                        } else {
+                            for (id, value) in &parameter_checkpoint {
+                                if let Ok(id) =
+                                    id.strip_prefix("param:").unwrap_or(id).parse::<u32>()
+                                {
+                                    let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Ok(Vst3ControlCommand::Open(reply)) => {
                 // Standalone and embedded views are mutually exclusive for one
                 // VST3 instance. Both are owned by this same GUI worker.
@@ -999,15 +1176,17 @@ fn run_vst3_control(
                         })
                         .collect()
                 };
+                action_request_pending.store(false, Ordering::Release);
                 let _ = reply.send(actions);
             }
             Ok(Vst3ControlCommand::SetEditorState(state)) => {
                 if isolated {
                     if let Ok(mut plugin) = plugin.try_lock() {
-                        plugin.set_editor_host_state(
+                        let _ = plugin.set_editor_host_state(
                             vst3_host::process_isolation::EditorHostState {
                                 bypassed: state.bypassed,
                                 automation: state.automation.min(3),
+                                pinned: state.pinned,
                             },
                         );
                     }
@@ -1015,8 +1194,35 @@ fn run_vst3_control(
                     window.set_host_state(vst3_host::process_isolation::EditorHostState {
                         bypassed: state.bypassed,
                         automation: state.automation.min(3),
+                        pinned: state.pinned,
                     });
                 }
+            }
+            Ok(Vst3ControlCommand::SetEditorPinned(state, reply)) => {
+                let result = if isolated {
+                    plugin
+                        .lock()
+                        .map_err(|_| "VST3 instance lock was poisoned".to_owned())
+                        .and_then(|mut plugin| {
+                            plugin
+                                .set_editor_host_state(
+                                    vst3_host::process_isolation::EditorHostState {
+                                        bypassed: state.bypassed,
+                                        automation: state.automation.min(3),
+                                        pinned: state.pinned,
+                                    },
+                                )
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    window.set_host_state(vst3_host::process_isolation::EditorHostState {
+                        bypassed: state.bypassed,
+                        automation: state.automation.min(3),
+                        pinned: state.pinned,
+                    });
+                    Ok(())
+                };
+                let _ = reply.send(result);
             }
             Ok(Vst3ControlCommand::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1042,34 +1248,6 @@ fn run_vst3_control(
             editor_open.store(false, Ordering::Release);
         } else if !isolated && window.is_open() {
             let _ = window.service_platform_events();
-        }
-        if isolated {
-            let needs_recovery = plugin
-                .try_lock()
-                .map(|plugin| plugin.realtime_transport_faulted())
-                .unwrap_or(false);
-            if needs_recovery {
-                editor_open.store(false, Ordering::Release);
-                if let Ok(mut plugin) = plugin.lock() {
-                    if plugin.recover().is_ok() {
-                        let checkpoint = state_checkpoint
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .clone();
-                        if !checkpoint.is_empty() {
-                            let _ = plugin.load_state(&checkpoint);
-                        } else {
-                            for (id, value) in &parameter_checkpoint {
-                                if let Ok(id) =
-                                    id.strip_prefix("param:").unwrap_or(id).parse::<u32>()
-                                {
-                                    let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
         if let Some(editor) = embedded.as_ref() {
             if let Some(rect) = pending_editor_rect
@@ -1136,6 +1314,7 @@ fn keep_hosting_windows_above_daw() {}
 
 struct Vst3Effect {
     plugin: Arc<Mutex<Plugin>>,
+    realtime: Option<RealtimeClient>,
     control: Arc<Vst3Control>,
     buffers: BusAudioBuffers,
     bypassed: bool,
@@ -1162,6 +1341,7 @@ impl Vst3Effect {
         )?;
         Ok(Self {
             plugin: ready.plugin,
+            realtime: ready.realtime,
             control,
             buffers: ready.buffers,
             bypassed: spec.bypassed,
@@ -1204,12 +1384,16 @@ impl DspEffect for Vst3Effect {
                 copy_stereo_to_vst_bus(aux, sidechain, frames);
             }
         }
-        let result = match self.plugin.try_lock() {
-            Ok(mut plugin) => plugin.process_bus_audio(&mut self.buffers),
-            Err(TryLockError::Poisoned(poison)) => {
-                poison.into_inner().process_bus_audio(&mut self.buffers)
+        let result = if let Some(realtime) = self.realtime.as_mut() {
+            realtime.process_buses(&mut self.buffers)
+        } else {
+            match self.plugin.try_lock() {
+                Ok(mut plugin) => plugin.process_bus_audio(&mut self.buffers),
+                Err(TryLockError::Poisoned(poison)) => {
+                    poison.into_inner().process_bus_audio(&mut self.buffers)
+                }
+                Err(TryLockError::WouldBlock) => return,
             }
-            Err(TryLockError::WouldBlock) => return,
         };
         if result.is_ok() {
             if let Some(main) = self.buffers.outputs.first() {
@@ -1219,6 +1403,10 @@ impl DspEffect for Vst3Effect {
     }
     fn set_param(&mut self, id: &str, value: f32) {
         if let Ok(id) = id.strip_prefix("param:").unwrap_or(id).parse::<u32>() {
+            if let Some(realtime) = self.realtime.as_mut() {
+                let _ = realtime.queue_parameter(id, value.clamp(0.0, 1.0) as f64, 0);
+                return;
+            }
             if let Ok(mut plugin) = self.plugin.try_lock() {
                 let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
             }
@@ -1251,9 +1439,11 @@ impl DspEffect for Vst3Effect {
 
 struct Vst3Instrument {
     plugin: Arc<Mutex<Plugin>>,
+    realtime: Option<RealtimeClient>,
     control: Arc<Vst3Control>,
     buffers: BusAudioBuffers,
     active_notes: HashMap<i32, NoteId>,
+    realtime_active_notes: HashSet<i32>,
     tail: usize,
 }
 
@@ -1276,61 +1466,16 @@ impl Vst3Instrument {
         )?;
         Ok(Self {
             plugin: ready.plugin,
+            realtime: ready.realtime,
             control,
             buffers: ready.buffers,
             active_notes: HashMap::with_capacity(64),
+            realtime_active_notes: HashSet::with_capacity(64),
             tail: ready.tail,
         })
     }
     fn send_event(plugin: &mut Plugin, active_notes: &mut HashMap<i32, NoteId>, event: &NoteEvent) {
         let offset = event.sample_offset as i32;
-        // In process isolation, note IDs belong to the helper and a synchronous JSON NoteOn
-        // round-trip would block the audio callback. Use the fixed-capacity short-MIDI section of
-        // the next shared-memory audio block instead; pitch and sample offset remain exact.
-        if plugin.isolation_pid().is_some() {
-            let midi = match event.kind {
-                NoteEventKind::NoteOn {
-                    pitch, velocity, ..
-                } => MidiEvent::NoteOn {
-                    channel: MidiChannel::Ch1,
-                    note: pitch,
-                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
-                },
-                NoteEventKind::NoteOff {
-                    pitch, velocity, ..
-                } => MidiEvent::NoteOff {
-                    channel: MidiChannel::Ch1,
-                    note: pitch,
-                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
-                },
-                NoteEventKind::PolyPressure {
-                    pitch, pressure, ..
-                } => MidiEvent::PolyAftertouch {
-                    channel: MidiChannel::Ch1,
-                    note: pitch,
-                    pressure: (pressure.clamp(0.0, 1.0) * 127.0).round() as u8,
-                },
-                NoteEventKind::Controller { cc, value } => MidiEvent::ControlChange {
-                    channel: MidiChannel::Ch1,
-                    controller: cc,
-                    value: (value.clamp(0.0, 1.0) * 127.0).round() as u8,
-                },
-                NoteEventKind::PitchBend { value } => MidiEvent::PitchBend {
-                    channel: MidiChannel::Ch1,
-                    value: ((value.clamp(-1.0, 1.0) + 1.0) * 8191.5).round() as u16,
-                },
-                NoteEventKind::AllNotesOff => {
-                    active_notes.clear();
-                    MidiEvent::ControlChange {
-                        channel: MidiChannel::Ch1,
-                        controller: 123,
-                        value: 0,
-                    }
-                }
-            };
-            let _ = plugin.send_midi_event_at(midi, offset);
-            return;
-        }
         let midi = match event.kind {
             NoteEventKind::NoteOn {
                 note_id,
@@ -1392,6 +1537,65 @@ impl Vst3Instrument {
         };
         let _ = plugin.send_midi_event_at(midi, offset);
     }
+
+    fn queue_realtime_event(&mut self, event: &NoteEvent) {
+        let Some(realtime) = self.realtime.as_mut() else {
+            return;
+        };
+        let offset = event.sample_offset as i32;
+        let midi = match event.kind {
+            NoteEventKind::NoteOn {
+                note_id,
+                pitch,
+                velocity,
+                ..
+            } => {
+                self.realtime_active_notes.insert(note_id);
+                MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: pitch,
+                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                }
+            }
+            NoteEventKind::NoteOff {
+                note_id,
+                pitch,
+                velocity,
+            } => {
+                self.realtime_active_notes.remove(&note_id);
+                MidiEvent::NoteOff {
+                    channel: MidiChannel::Ch1,
+                    note: pitch,
+                    velocity: (velocity.clamp(0.0, 1.0) * 127.0).round() as u8,
+                }
+            }
+            NoteEventKind::PolyPressure {
+                pitch, pressure, ..
+            } => MidiEvent::PolyAftertouch {
+                channel: MidiChannel::Ch1,
+                note: pitch,
+                pressure: (pressure.clamp(0.0, 1.0) * 127.0).round() as u8,
+            },
+            NoteEventKind::Controller { cc, value } => MidiEvent::ControlChange {
+                channel: MidiChannel::Ch1,
+                controller: cc,
+                value: (value.clamp(0.0, 1.0) * 127.0).round() as u8,
+            },
+            NoteEventKind::PitchBend { value } => MidiEvent::PitchBend {
+                channel: MidiChannel::Ch1,
+                value: ((value.clamp(-1.0, 1.0) + 1.0) * 8191.5).round() as u16,
+            },
+            NoteEventKind::AllNotesOff => {
+                self.realtime_active_notes.clear();
+                MidiEvent::ControlChange {
+                    channel: MidiChannel::Ch1,
+                    controller: 123,
+                    value: 0,
+                }
+            }
+        };
+        let _ = realtime.queue_midi(midi, offset);
+    }
 }
 
 impl Instrument for Vst3Instrument {
@@ -1401,21 +1605,31 @@ impl Instrument for Vst3Instrument {
     fn process(&mut self, events: &[NoteEvent], out: &mut AudioBuffer, frames: usize) {
         let frames = frames.min(MAX_BLOCK_SIZE);
         prepare_vst_bus_block(&mut self.buffers, frames);
-        let result = match self.plugin.try_lock() {
-            Ok(mut plugin) => {
-                for event in events {
-                    Self::send_event(&mut plugin, &mut self.active_notes, event);
-                }
-                plugin.process_bus_audio(&mut self.buffers)
+        let result = if self.realtime.is_some() {
+            for event in events {
+                self.queue_realtime_event(event);
             }
-            Err(TryLockError::Poisoned(poison)) => {
-                let mut plugin = poison.into_inner();
-                for event in events {
-                    Self::send_event(&mut plugin, &mut self.active_notes, event);
+            self.realtime
+                .as_mut()
+                .expect("realtime endpoint checked")
+                .process_buses(&mut self.buffers)
+        } else {
+            match self.plugin.try_lock() {
+                Ok(mut plugin) => {
+                    for event in events {
+                        Self::send_event(&mut plugin, &mut self.active_notes, event);
+                    }
+                    plugin.process_bus_audio(&mut self.buffers)
                 }
-                plugin.process_bus_audio(&mut self.buffers)
+                Err(TryLockError::Poisoned(poison)) => {
+                    let mut plugin = poison.into_inner();
+                    for event in events {
+                        Self::send_event(&mut plugin, &mut self.active_notes, event);
+                    }
+                    plugin.process_bus_audio(&mut self.buffers)
+                }
+                Err(TryLockError::WouldBlock) => return,
             }
-            Err(TryLockError::WouldBlock) => return,
         };
         if result.is_ok() {
             if let Some(main) = self.buffers.outputs.first() {
@@ -1425,6 +1639,10 @@ impl Instrument for Vst3Instrument {
     }
     fn set_param(&mut self, id: &str, value: f32) {
         if let Ok(id) = id.strip_prefix("param:").unwrap_or(id).parse::<u32>() {
+            if let Some(realtime) = self.realtime.as_mut() {
+                let _ = realtime.queue_parameter(id, value.clamp(0.0, 1.0) as f64, 0);
+                return;
+            }
             if let Ok(mut plugin) = self.plugin.try_lock() {
                 let _ = plugin.set_parameter(id, value.clamp(0.0, 1.0) as f64);
             }
@@ -1437,6 +1655,18 @@ impl Instrument for Vst3Instrument {
     }
     fn reset(&mut self) {
         self.active_notes.clear();
+        self.realtime_active_notes.clear();
+        if let Some(realtime) = self.realtime.as_mut() {
+            let _ = realtime.queue_midi(
+                MidiEvent::ControlChange {
+                    channel: MidiChannel::Ch1,
+                    controller: 123,
+                    value: 0,
+                },
+                0,
+            );
+            return;
+        }
         if let Ok(mut plugin) = self.plugin.try_lock() {
             let _ = plugin.stop_processing();
             let _ = plugin.start_processing();
@@ -1446,7 +1676,7 @@ impl Instrument for Vst3Instrument {
         self.tail
     }
     fn active_voice_count(&self) -> usize {
-        self.active_notes.len()
+        self.active_notes.len() + self.realtime_active_notes.len()
     }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         Some(self.control.clone())
@@ -1607,6 +1837,86 @@ mod isolated_realtime_hardware_tests {
 
     #[test]
     #[ignore = "requires the built MiniStudio executable and locally installed Serum VST3"]
+    fn isolated_serum_audio_does_not_wait_for_control_mutex() {
+        let executable = PathBuf::from(
+            std::env::var_os("MINISTUDIO_SELF_HOST_EXE")
+                .expect("MINISTUDIO_SELF_HOST_EXE must point to ministudio.exe"),
+        );
+        let path = PathBuf::from(
+            std::env::var_os("MINISTUDIO_TEST_SERUM_VST3")
+                .expect("MINISTUDIO_TEST_SERUM_VST3 must point to Serum.vst3"),
+        );
+        let mut host = Vst3Host::builder()
+            .sample_rate(48_000.0)
+            .block_size(MAX_BLOCK_SIZE)
+            .input_channels(MAX_CHANNELS)
+            .output_channels(MAX_CHANNELS)
+            .with_process_isolation(true)
+            .self_hosted_helper(executable, "--ministudio-vst3-host")
+            .build()
+            .expect("build isolated host");
+        let mut plugin = host
+            .load_plugin_class(path, "56535458667358736572756D00000000")
+            .expect("load Serum in helper");
+        plugin.start_processing().expect("start Serum");
+        let mut buffers = plugin
+            .create_bus_audio_buffers(MAX_BLOCK_SIZE)
+            .expect("create bus buffers");
+        let mut realtime = plugin
+            .take_isolated_realtime()
+            .expect("isolated realtime endpoint");
+        let control_plugin = Arc::new(Mutex::new(plugin));
+        let stalled_plugin = Arc::clone(&control_plugin);
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let stall = std::thread::spawn(move || {
+            let _guard = stalled_plugin.lock().expect("control mutex");
+            locked_tx.send(()).expect("announce control stall");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        locked_rx.recv().expect("control mutex acquired");
+
+        realtime
+            .queue_midi(
+                MidiEvent::NoteOn {
+                    channel: MidiChannel::Ch1,
+                    note: 60,
+                    velocity: 110,
+                },
+                0,
+            )
+            .expect("queue realtime note");
+        let started = std::time::Instant::now();
+        let mut peak = 0.0_f32;
+        for _ in 0..96 {
+            prepare_vst_bus_block(&mut buffers, 256);
+            realtime
+                .process_buses(&mut buffers)
+                .expect("process while control mutex is stalled");
+            for sample in buffers
+                .outputs
+                .iter()
+                .flat_map(|bus| &bus.channels)
+                .flat_map(|channel| channel.iter())
+            {
+                peak = peak.max(sample.abs());
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(peak > 1.0e-4, "control stall made realtime output silent");
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "realtime endpoint waited for the 500 ms control stall: {elapsed:?}"
+        );
+        stall.join().expect("control stall thread");
+        control_plugin
+            .lock()
+            .expect("control plugin after stall")
+            .stop_processing()
+            .expect("stop Serum");
+    }
+
+    #[test]
+    #[ignore = "requires the built MiniStudio executable and locally installed Serum VST3"]
     fn isolated_worker_recovers_and_reattaches_the_same_mapping() {
         use winapi::{
             shared::minwindef::FALSE,
@@ -1694,8 +2004,8 @@ mod isolated_realtime_hardware_tests {
             um::winuser::{
                 EnumWindows, GetClientRect, GetDpiForWindow, GetWindow, GetWindowLongPtrW,
                 GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-                PostMessageW, ShowWindow, GWL_STYLE, GW_CHILD, SW_RESTORE, WM_LBUTTONUP,
-                WS_CAPTION,
+                PostMessageW, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_CHILD, SW_RESTORE,
+                WM_LBUTTONUP, WS_CAPTION, WS_EX_TOPMOST,
             },
         };
 
@@ -1763,11 +2073,46 @@ mod isolated_realtime_hardware_tests {
             .load_plugin_class(path, "56535453616E746262632073796D7068")
             .expect("load BBC in helper");
         plugin.start_processing().expect("start BBC");
+        let editor_actions = plugin
+            .take_isolated_realtime()
+            .expect("BBC realtime endpoint")
+            .editor_action_reader();
         plugin
             .open_isolated_editor()
             .expect("open BBC helper-owned editor");
         assert_eq!(plugin.get_editor_size().expect("editor size"), (1083, 917));
         let hwnd = helper_window(plugin.isolation_pid().expect("helper pid"));
+        plugin
+            .set_editor_host_state(vst3_host::process_isolation::EditorHostState {
+                pinned: true,
+                ..Default::default()
+            })
+            .expect("pin native host window");
+        let pin_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_TOPMOST == 0
+            && std::time::Instant::now() < pin_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_TOPMOST,
+            0,
+            "acknowledged pin must apply native topmost state"
+        );
+        plugin
+            .set_editor_host_state(Default::default())
+            .expect("unpin native host window");
+        let unpin_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_TOPMOST != 0
+            && std::time::Instant::now() < unpin_deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 } & WS_EX_TOPMOST,
+            0,
+            "acknowledged unpin must restore ordinary z-order"
+        );
         unsafe {
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
             assert_eq!(style & WS_CAPTION, 0, "system caption must stay hidden");
@@ -1812,6 +2157,12 @@ mod isolated_realtime_hardware_tests {
                 "custom close button must tear the editor down"
             );
         }
+        assert!(
+            editor_actions
+                .wait_and_take(std::time::Duration::from_secs(1))
+                .contains(&vst3_host::process_isolation::EditorHostAction::Closed),
+            "custom close action must wake the event-driven host reader"
+        );
         plugin.close_editor().expect("close BBC editor");
         plugin.stop_processing().expect("stop BBC");
     }
@@ -2017,6 +2368,7 @@ struct ClapReady {
 }
 
 enum ClapOwnerCommand {
+    Callback,
     Open(Sender<Result<(), String>>),
     Close(Sender<Result<(), String>>),
     SaveState(Sender<Result<Vec<u8>, String>>),
@@ -2028,14 +2380,21 @@ struct ClapHost;
 
 struct ClapHostShared {
     editor_open: Arc<AtomicBool>,
-    callback_requested: AtomicBool,
+    owner_commands: SyncSender<ClapOwnerCommand>,
+    callback_pending: Arc<AtomicBool>,
 }
 
 impl SharedHandler<'_> for ClapHostShared {
     fn request_restart(&self) {}
     fn request_process(&self) {}
     fn request_callback(&self) {
-        self.callback_requested.store(true, Ordering::Release);
+        // CLAP permits this callback from arbitrary threads. A bounded try-send wakes the owner
+        // without blocking a realtime caller and replaces the former permanent 8 ms poll loop.
+        // The atomic coalesces repeated requests and preserves one pending callback even when the
+        // bounded channel is temporarily full of lifecycle commands.
+        if !self.callback_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.owner_commands.try_send(ClapOwnerCommand::Callback);
+        }
     }
 }
 
@@ -2194,8 +2553,11 @@ impl ClapRuntime {
         let (owner_commands, owner_rx) = sync_channel::<ClapOwnerCommand>(16);
         let editor_open = Arc::new(AtomicBool::new(false));
         let has_editor = Arc::new(AtomicBool::new(false));
+        let callback_pending = Arc::new(AtomicBool::new(false));
         let thread_editor_open = Arc::clone(&editor_open);
         let thread_has_editor = Arc::clone(&has_editor);
+        let thread_callback_pending = Arc::clone(&callback_pending);
+        let shared_owner_commands = owner_commands.clone();
         std::thread::Builder::new()
             .name("ministudio-clap-owner".into())
             .spawn(move || {
@@ -2214,7 +2576,8 @@ impl ClapRuntime {
                     let mut instance = PluginInstance::<ClapHost>::new(
                         |_| ClapHostShared {
                             editor_open: shared_editor_open,
-                            callback_requested: AtomicBool::new(false),
+                            owner_commands: shared_owner_commands,
+                            callback_pending,
                         },
                         |_| (),
                         &entry,
@@ -2254,20 +2617,26 @@ impl ClapRuntime {
                         if ready_tx.send(Ok(ClapReady { processor, inputs, outputs })).is_ok() {
                             let mut gui_open = false;
                             loop {
-                                let command = match owner_rx.recv_timeout(std::time::Duration::from_millis(8)) {
-                                    Ok(command) => Some(command),
-                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                                let command = match owner_rx.recv() {
+                                    Ok(command) => command,
+                                    Err(_) => break,
                                 };
-                                if instance.access_shared_handler(|shared| shared.callback_requested.swap(false, Ordering::AcqRel)) {
+                                if matches!(&command, ClapOwnerCommand::Callback) {
+                                    thread_callback_pending.store(false, Ordering::Release);
+                                    instance.call_on_main_thread_callback();
+                                    continue;
+                                }
+                                // If `try_send(Callback)` encountered a full channel, the first
+                                // lifecycle command that frees a slot services the coalesced request.
+                                if thread_callback_pending.swap(false, Ordering::AcqRel) {
                                     instance.call_on_main_thread_callback();
                                 }
                                 if gui_open && !thread_editor_open.load(Ordering::Acquire) {
                                     close_clap_editor(&mut instance);
                                     gui_open = false;
                                 }
-                                let Some(command) = command else { continue };
                                 match command {
+                                    ClapOwnerCommand::Callback => unreachable!(),
                                     ClapOwnerCommand::Open(reply) => {
                                         let result = if gui_open {
                                             Ok(())

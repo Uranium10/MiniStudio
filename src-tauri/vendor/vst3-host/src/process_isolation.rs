@@ -1015,6 +1015,8 @@ pub struct EditorHostState {
     pub bypassed: bool,
     /// Automation mode encoded as off=0, write=1, read=2 and latch=3.
     pub automation: u8,
+    /// Whether the platform window must remain in the always-on-top z-order band.
+    pub pinned: bool,
 }
 
 /// The helper process's write half of the request/response protocol.

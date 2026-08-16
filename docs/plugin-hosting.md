@@ -162,9 +162,10 @@ silently discarded merely because a fixed UI timer elapsed.
 - Each helper remains the sole owner of its VST3/CLAP instance, native window and format-required
   GUI thread. The supervisor sends lifecycle intent; the helper reports opened, closed, resized,
   crashed and toolbar-action events.
-- Control messages use request IDs and unsolicited event envelopes (or a bounded shared-memory
-  action ring plus a Windows event). The current 100 ms WebView action poll is transitional and
-  must not merely be relocated to a Rust timer.
+- Control messages use request IDs and unsolicited event envelopes. Windows helper toolbar actions
+  use a bounded shared-memory action ring plus a dedicated OS event; the old 100 ms WebView action
+  poll has been removed. Realtime transport faults use a separate OS event so an isolated control
+  owner can block while idle and wake only for an explicit command or audio-side fault.
 - Lease/generation tokens make resource reclamation deterministic: helper death releases every
   window and instance lease, while a late response from an obsolete open request is discarded.
   Realtime audio shared memory remains a separate, allocation-free data plane.
@@ -186,6 +187,12 @@ silently discarded merely because a fixed UI timer elapsed.
   and coordinated group recovery. The present one-slot helper must not pretend
   to group instances merely by attaching policy metadata.
 
+The format-neutral placement planner and relative compatibility cache now implement these rules,
+including the four-instance cap and automatic dedicated promotion after a crash, hang or deadline
+miss. Group execution deliberately remains disabled by default until the multiplexed helper itself
+passes the dedicated-process stability gate; current instances therefore remain dedicated rather
+than claiming isolation that the transport cannot yet provide.
+
 ### Verified Windows control-plane baseline
 
 The self-hosted helper has been physically tested against the locally
@@ -198,8 +205,9 @@ installed commercial plug-ins, rather than only a mock protocol:
   code 0.
 
 The realtime path was also physically rendered through Serum: repeated runs of
-96 blocks of 256 frames completed in about 10-11 ms total (roughly 0.11 ms per
+96 blocks of 256 frames completed in about 9.7-11 ms total (roughly 0.10-0.11 ms per
 block) with a non-silent 0.124861 RMS result. A forced helper termination then recovered to a
 new PID, reattached the same mapping and rendered audio again. This verifies
 the Windows VST3 process boundary end to end, including timestamped MIDI and
-audio return.
+audio return. A separate regression holds the plug-in control mutex for 500 ms while the detached
+realtime endpoint renders all 96 blocks, proving native editor/control stalls no longer gate audio.
