@@ -1,5 +1,5 @@
 // Deterministic demo session used until the user imports or opens a project.
-import type { AudioAssetInfo, Clip, EffectInstance, MidiClip, MidiNote, ProjectState, Track } from '../engine'
+import { defaultTempoMap, type AudioAssetInfo, type AudioSourceRef, type Clip, type EffectInstance, type MidiClip, type MidiNote, type ProjectState, type Track } from '../engine'
 
 const colors = ['#ff7a45', '#f2bd3f', '#28c2a0', '#55a7ff', '#a67cff', '#ef6c9a']
 const names = ['Lead Vocal', 'Harmony Stack', 'Neon Drums', 'Midnight Bass', 'Glass Keys', 'Atmosphere']
@@ -25,7 +25,7 @@ function effect(id: string, type: EffectInstance['type'], params: Record<string,
 function clip(track: number, index: number, startSec: number, durationSec: number): Clip {
   return {
     id: `clip-${track}-${index}`,
-    assetId: `asset-${track}`,
+    audioSourceRefId: `source-${track}`,
     name: index === 0 ? names[track] : `${names[track]} ${index + 1}`,
     startSec,
     offsetSec: 0,
@@ -99,6 +99,7 @@ function makeInstrumentTrack(): Track {
 
 export function createDemoProject(): ProjectState {
   const assets: Record<string, AudioAssetInfo> = {}
+  const audioSourceRefs: Record<string, AudioSourceRef> = {}
   for (let index = 0; index < names.length; index += 1) {
     assets[`asset-${index}`] = {
       id: `asset-${index}`,
@@ -109,18 +110,21 @@ export function createDemoProject(): ProjectState {
       numChannels: 2,
       peaks: makePeaks(index + 1),
     }
+    audioSourceRefs[`source-${index}`] = { id: `source-${index}`, assetId: `asset-${index}`, name: `${names[index]}.wav`, modificationId: null }
   }
   return {
-    formatVersion: 2,
+    formatVersion: 3,
     meta: { name: 'Aurora Session', sampleRate: 48_000, createdAt: new Date().toISOString() },
     transport: {
       bpm: 118,
       timeSignature: { numerator: 4, denominator: 4 },
+      tempoMap: defaultTempoMap(118),
       playheadSec: 6.4,
       isPlaying: false,
       loop: { enabled: true, startSec: 8, endSec: 40 },
     },
     assets,
+    audioSourceRefs,
     tracks: [...names.map((_, index) => makeTrack(index)), makeInstrumentTrack()],
     buses: [
       { id: 'bus-a', name: 'A · Space', volumeDb: -5, muted: false, effects: [effect('fx-reverb-a', 'builtin:reverb', { decaySec: 2.8, damping: 0.42, width: 0.85, mix: 0.3 })] },
@@ -133,16 +137,18 @@ export function createDemoProject(): ProjectState {
 /** A clean session used by File > New Project. */
 export function createEmptyProject(): ProjectState {
   return {
-    formatVersion: 2,
+    formatVersion: 3,
     meta: { name: 'Untitled Project', sampleRate: 48_000, createdAt: new Date().toISOString() },
     transport: {
       bpm: 120,
       timeSignature: { numerator: 4, denominator: 4 },
+      tempoMap: defaultTempoMap(120),
       playheadSec: 0,
       isPlaying: false,
       loop: { enabled: false, startSec: 0, endSec: 8 },
     },
     assets: {},
+    audioSourceRefs: {},
     tracks: [],
     buses: [
       { id: 'bus-a', name: 'A · Space', volumeDb: -6, muted: false, effects: [] },

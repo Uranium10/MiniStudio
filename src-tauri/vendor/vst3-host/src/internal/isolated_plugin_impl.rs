@@ -905,6 +905,19 @@ impl PluginInternal for IsolatedPluginImpl {
         }
     }
 
+    fn take_editor_host_actions(
+        &mut self,
+    ) -> Vec<crate::process_isolation::EditorHostAction> {
+        match self.send_command(HostCommand::TakeEditorHostActions) {
+            Ok(HostResponse::EditorHostActions { actions }) => actions,
+            Ok(_) | Err(_) => Vec::new(),
+        }
+    }
+
+    fn set_editor_host_state(&mut self, state: crate::process_isolation::EditorHostState) {
+        let _ = self.send_command(HostCommand::SetEditorHostState { state });
+    }
+
     fn get_editor_size(&self) -> Result<(i32, i32)> {
         // The real size is learned when the helper creates the editor (GuiCreated);
         // fall back to a sensible default before the GUI has been opened.

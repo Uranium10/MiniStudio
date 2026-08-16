@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::plugin::Plugin;
+use crate::process_isolation::{EditorHostAction, EditorHostState};
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
@@ -20,26 +21,43 @@ use winapi::{
     shared::windef::{HDC, HWND, POINT, RECT},
     um::libloaderapi::GetModuleHandleW,
     um::wingdi::{
-        CreatePen, CreateSolidBrush, DeleteObject, GetStockObject, LineTo, MoveToEx, SelectObject,
-        SetBkMode, SetTextColor, DEFAULT_GUI_FONT, PS_SOLID, TRANSPARENT,
+        GetStockObject, LineTo, MoveToEx, SelectObject, SetBkMode, SetDCBrushColor,
+        SetDCPenColor, SetTextColor, DC_BRUSH, DC_PEN, DEFAULT_GUI_FONT, TRANSPARENT,
     },
     um::winuser::{
         BeginPaint, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawTextW, EndPaint, FillRect,
-        GetClientRect, GetCursorPos, GetDpiForWindow, GetWindowLongPtrW, GetWindowTextLengthW,
-        GetWindowTextW, InvalidateRect, LoadCursorW, MoveWindow, RegisterClassExW, ScreenToClient,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, UpdateWindow, CS_DROPSHADOW, CS_HREDRAW,
-        CS_VREDRAW, CW_USEDEFAULT, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        GetClientRect, GetDpiForWindow, GetWindowLongPtrW, GetWindowTextW, InvalidateRect,
+        LoadCursorW, MoveWindow, RegisterClassExW, ScreenToClient,
+        SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackMouseEvent, UpdateWindow, CS_DROPSHADOW,
+        CW_USEDEFAULT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_ARROW, PAINTSTRUCT, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, WM_CLOSE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CHILD,
+        SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, TME_LEAVE, TRACKMOUSEEVENT, WM_CLOSE, WM_DPICHANGED,
+        WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MOUSELEAVE, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_CHILD,
         WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_POPUP, WS_VISIBLE,
     },
 };
 
 #[cfg(target_os = "windows")]
-const HOST_CHROME_HEIGHT_DIP: i32 = 38;
+const HOST_CHROME_TOP_HEIGHT_DIP: i32 = 34;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_ACTION_HEIGHT_DIP: i32 = 30;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_HEIGHT_DIP: i32 = HOST_CHROME_TOP_HEIGHT_DIP + HOST_CHROME_ACTION_HEIGHT_DIP;
 #[cfg(target_os = "windows")]
 const HOST_CHROME_BUTTON_WIDTH_DIP: i32 = 42;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_BYPASS_WIDTH_DIP: i32 = 78;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_SAVE_WIDTH_DIP: i32 = 54;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_LOAD_WIDTH_DIP: i32 = 68;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_SIDECHAIN_WIDTH_DIP: i32 = 82;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_AUTOMATION_LABEL_WIDTH_DIP: i32 = 72;
+#[cfg(target_os = "windows")]
+const HOST_CHROME_AUTOMATION_BUTTON_WIDTH_DIP: i32 = 24;
 
 #[cfg(target_os = "windows")]
 fn scale_dip(value: i32, dpi: u32) -> i32 {
@@ -52,13 +70,6 @@ fn host_chrome_height(hwnd: HWND) -> i32 {
 }
 
 #[cfg(target_os = "windows")]
-fn host_chrome_button_width(hwnd: HWND) -> i32 {
-    scale_dip(HOST_CHROME_BUTTON_WIDTH_DIP, unsafe {
-        GetDpiForWindow(hwnd)
-    })
-}
-
-#[cfg(target_os = "windows")]
 fn color(r: u8, g: u8, b: u8) -> u32 {
     u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
 }
@@ -66,23 +77,243 @@ fn color(r: u8, g: u8, b: u8) -> u32 {
 #[cfg(target_os = "windows")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostChromeButton {
+    Power,
+    Pin,
     Minimize,
     Close,
+    Bypass,
+    Save,
+    Load,
+    Sidechain,
+    AutomationOff,
+    AutomationWrite,
+    AutomationRead,
+    AutomationLatch,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct HostChromeState {
+    actions: Vec<EditorHostAction>,
+    pinned: bool,
+    bypassed: bool,
+    has_sidechain: bool,
+    automation: u8,
+    hovered: Option<HostChromeButton>,
+    tracking_mouse_leave: bool,
+    interactive_move: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn host_chrome_states() -> &'static Mutex<std::collections::HashMap<usize, HostChromeState>> {
+    static STATES: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<usize, HostChromeState>>,
+    > = std::sync::OnceLock::new();
+    STATES.get_or_init(Mutex::default)
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct HostChromeLayout {
+    width: i32,
+    top_height: i32,
+    chrome_height: i32,
+    dpi: u32,
+    has_sidechain: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl HostChromeLayout {
+    fn new(width: i32, chrome_height: i32, dpi: u32, has_sidechain: bool) -> Self {
+        Self {
+            width: width.max(0),
+            top_height: scale_dip(HOST_CHROME_TOP_HEIGHT_DIP, dpi).min(chrome_height.max(0)),
+            chrome_height: chrome_height.max(0),
+            dpi,
+            has_sidechain,
+        }
+    }
+
+    fn automation_start(&self) -> i32 {
+        (self.width
+            - scale_dip(HOST_CHROME_AUTOMATION_BUTTON_WIDTH_DIP, self.dpi) * 4)
+            .max(0)
+    }
+
+    fn left_action_end(&self) -> i32 {
+        let widths = [
+            HOST_CHROME_BYPASS_WIDTH_DIP,
+            HOST_CHROME_SAVE_WIDTH_DIP,
+            HOST_CHROME_LOAD_WIDTH_DIP,
+        ];
+        let mut right: i32 = widths
+            .into_iter()
+            .map(|width| scale_dip(width, self.dpi))
+            .sum();
+        if self.has_sidechain {
+            let with_sidechain = right + scale_dip(HOST_CHROME_SIDECHAIN_WIDTH_DIP, self.dpi);
+            if with_sidechain <= self.automation_start() {
+                right = with_sidechain;
+            }
+        }
+        right.min(self.automation_start())
+    }
+
+    fn button_rect(&self, button: HostChromeButton) -> Option<RECT> {
+        let top_button_width = scale_dip(HOST_CHROME_BUTTON_WIDTH_DIP, self.dpi);
+        let top_rect = |left: i32, right: i32| RECT {
+            left,
+            top: 0,
+            right,
+            bottom: self.top_height,
+        };
+        match button {
+            HostChromeButton::Power => Some(top_rect(0, top_button_width)),
+            HostChromeButton::Pin => Some(top_rect(
+                self.width - top_button_width * 3,
+                self.width - top_button_width * 2,
+            )),
+            HostChromeButton::Minimize => Some(top_rect(
+                self.width - top_button_width * 2,
+                self.width - top_button_width,
+            )),
+            HostChromeButton::Close => Some(top_rect(
+                self.width - top_button_width,
+                self.width,
+            )),
+            HostChromeButton::AutomationOff
+            | HostChromeButton::AutomationWrite
+            | HostChromeButton::AutomationRead
+            | HostChromeButton::AutomationLatch => {
+                let tiny = scale_dip(HOST_CHROME_AUTOMATION_BUTTON_WIDTH_DIP, self.dpi);
+                let index = match button {
+                    HostChromeButton::AutomationOff => 0,
+                    HostChromeButton::AutomationWrite => 1,
+                    HostChromeButton::AutomationRead => 2,
+                    HostChromeButton::AutomationLatch => 3,
+                    _ => unreachable!(),
+                };
+                let left = self.automation_start() + tiny * index;
+                Some(RECT {
+                    left,
+                    top: self.top_height,
+                    right: left + tiny,
+                    bottom: self.chrome_height,
+                })
+            }
+            HostChromeButton::Bypass
+            | HostChromeButton::Save
+            | HostChromeButton::Load
+            | HostChromeButton::Sidechain => {
+                let definitions = [
+                    (HostChromeButton::Bypass, HOST_CHROME_BYPASS_WIDTH_DIP),
+                    (HostChromeButton::Save, HOST_CHROME_SAVE_WIDTH_DIP),
+                    (HostChromeButton::Load, HOST_CHROME_LOAD_WIDTH_DIP),
+                    (HostChromeButton::Sidechain, HOST_CHROME_SIDECHAIN_WIDTH_DIP),
+                ];
+                let mut left = 0;
+                for (candidate, width_dip) in definitions {
+                    if candidate == HostChromeButton::Sidechain && !self.has_sidechain {
+                        continue;
+                    }
+                    let right = left + scale_dip(width_dip, self.dpi);
+                    if right > self.automation_start() {
+                        return None;
+                    }
+                    if candidate == button {
+                        return Some(RECT {
+                            left,
+                            top: self.top_height,
+                            right,
+                            bottom: self.chrome_height,
+                        });
+                    }
+                    left = right;
+                }
+                None
+            }
+        }
+    }
+
+    fn automation_label_rect(&self) -> Option<RECT> {
+        let right = self.automation_start();
+        let left = right - scale_dip(HOST_CHROME_AUTOMATION_LABEL_WIDTH_DIP, self.dpi);
+        (left >= self.left_action_end() + scale_dip(4, self.dpi)).then_some(RECT {
+            left,
+            top: self.top_height,
+            right,
+            bottom: self.chrome_height,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn host_chrome_layout(hwnd: HWND, has_sidechain: bool) -> Option<HostChromeLayout> {
+    let mut client: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+        return None;
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    Some(HostChromeLayout::new(
+        client.right.max(0),
+        host_chrome_height(hwnd).min(client.bottom.max(0)),
+        dpi,
+        has_sidechain,
+    ))
 }
 
 #[cfg(target_os = "windows")]
 fn host_chrome_button_at(hwnd: HWND, x: i32, y: i32) -> Option<HostChromeButton> {
-    let mut client: RECT = unsafe { std::mem::zeroed() };
-    if unsafe { GetClientRect(hwnd, &mut client) } == 0 || y < 0 || y >= host_chrome_height(hwnd) {
+    let has_sidechain = host_chrome_states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(&(hwnd as usize)).map(|state| state.has_sidechain))
+        .unwrap_or(false);
+    let layout = host_chrome_layout(hwnd, has_sidechain)?;
+    if x < 0 || x >= layout.width || y < 0 || y >= layout.chrome_height {
         return None;
     }
-    let width = host_chrome_button_width(hwnd);
-    if x >= client.right - width {
-        Some(HostChromeButton::Close)
-    } else if x >= client.right - width * 2 {
-        Some(HostChromeButton::Minimize)
-    } else {
-        None
+    const BUTTONS: [HostChromeButton; 12] = [
+        HostChromeButton::Power,
+        HostChromeButton::Pin,
+        HostChromeButton::Minimize,
+        HostChromeButton::Close,
+        HostChromeButton::Bypass,
+        HostChromeButton::Save,
+        HostChromeButton::Load,
+        HostChromeButton::Sidechain,
+        HostChromeButton::AutomationOff,
+        HostChromeButton::AutomationWrite,
+        HostChromeButton::AutomationRead,
+        HostChromeButton::AutomationLatch,
+    ];
+    BUTTONS.into_iter().find(|button| {
+        layout.button_rect(*button).is_some_and(|rect| {
+            x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+        })
+    })
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn invalidate_host_chrome(hwnd: HWND) {
+    let mut client: RECT = std::mem::zeroed();
+    if GetClientRect(hwnd, &mut client) != 0 {
+        client.bottom = host_chrome_height(hwnd).min(client.bottom.max(0));
+        InvalidateRect(hwnd, &client, 0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn invalidate_host_button(hwnd: HWND, button: HostChromeButton) {
+    let has_sidechain = host_chrome_states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(&(hwnd as usize)).map(|state| state.has_sidechain))
+        .unwrap_or(false);
+    if let Some(rect) = host_chrome_layout(hwnd, has_sidechain)
+        .and_then(|layout| layout.button_rect(button))
+    {
+        InvalidateRect(hwnd, &rect, 0);
     }
 }
 
@@ -93,9 +324,28 @@ fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
 
 #[cfg(target_os = "windows")]
 unsafe fn fill_rect(hdc: HDC, rect: &RECT, fill: u32) {
-    let brush = CreateSolidBrush(fill);
-    FillRect(hdc, rect, brush);
-    DeleteObject(brush.cast());
+    let brush = GetStockObject(DC_BRUSH as i32);
+    SetDCBrushColor(hdc, fill);
+    FillRect(hdc, rect, brush.cast());
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn draw_chrome_label(hdc: HDC, rect: &RECT, label: &str, text_color: u32) {
+    let mut wide = [0_u16; 32];
+    let mut length = 0;
+    for unit in label.encode_utf16().take(wide.len()) {
+        wide[length] = unit;
+        length += 1;
+    }
+    let mut rect = *rect;
+    SetTextColor(hdc, text_color);
+    DrawTextW(
+        hdc,
+        wide.as_ptr(),
+        length as i32,
+        &mut rect,
+        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+    );
 }
 
 /// Paint the host-owned toolbar. It is intentionally GDI-only: no WebView,
@@ -109,42 +359,75 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
     }
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
+    let (pinned, bypassed, has_sidechain, automation, hovered) = host_chrome_states()
+        .lock()
+        .ok()
+        .and_then(|states| {
+            states.get(&(hwnd as usize)).map(|state| {
+                (
+                    state.pinned,
+                    state.bypassed,
+                    state.has_sidechain,
+                    state.automation,
+                    state.hovered,
+                )
+            })
+        })
+        .unwrap_or((false, false, false, 0, None));
+    let dpi = GetDpiForWindow(hwnd);
     let chrome_height = host_chrome_height(hwnd).min(client.bottom.max(0));
-    let button_width = host_chrome_button_width(hwnd);
-    fill_rect(hdc, &client, color(12, 20, 27));
+    let layout = HostChromeLayout::new(client.right, chrome_height, dpi, has_sidechain);
     let toolbar = RECT {
         left: 0,
         top: 0,
         right: client.right,
         bottom: chrome_height,
     };
+    // The plug-in child owns every pixel below this toolbar. Painting the
+    // entire parent client on hover forced DWM to reconsider a potentially
+    // 4K vendor surface for a one-button color change.
     fill_rect(hdc, &toolbar, color(17, 29, 39));
+    let action_row = RECT {
+        left: 0,
+        top: layout.top_height,
+        right: client.right,
+        bottom: chrome_height,
+    };
+    fill_rect(hdc, &action_row, color(13, 23, 31));
     let accent = RECT {
         left: 0,
-        top: chrome_height.saturating_sub(scale_dip(1, GetDpiForWindow(hwnd))),
+        top: chrome_height.saturating_sub(scale_dip(1, dpi)),
         right: client.right,
         bottom: chrome_height,
     };
     fill_rect(hdc, &accent, color(63, 113, 137));
 
-    let mut cursor = POINT { x: -1, y: -1 };
-    let hovered = if GetCursorPos(&mut cursor) != 0 && ScreenToClient(hwnd, &mut cursor) != 0 {
-        host_chrome_button_at(hwnd, cursor.x, cursor.y)
-    } else {
-        None
-    };
-    let minimize_rect = RECT {
-        left: client.right - button_width * 2,
-        top: 0,
-        right: client.right - button_width,
-        bottom: chrome_height,
-    };
-    let close_rect = RECT {
-        left: client.right - button_width,
-        top: 0,
-        right: client.right,
-        bottom: chrome_height,
-    };
+    let power_rect = layout.button_rect(HostChromeButton::Power).unwrap();
+    let pin_rect = layout.button_rect(HostChromeButton::Pin).unwrap();
+    let minimize_rect = layout.button_rect(HostChromeButton::Minimize).unwrap();
+    let close_rect = layout.button_rect(HostChromeButton::Close).unwrap();
+    fill_rect(
+        hdc,
+        &power_rect,
+        if bypassed {
+            color(29, 41, 49)
+        } else if hovered == Some(HostChromeButton::Power) {
+            color(23, 83, 99)
+        } else {
+            color(19, 68, 82)
+        },
+    );
+    fill_rect(
+        hdc,
+        &pin_rect,
+        if pinned {
+            color(77, 64, 25)
+        } else if hovered == Some(HostChromeButton::Pin) {
+            color(27, 52, 65)
+        } else {
+            color(17, 29, 39)
+        },
+    );
     if hovered == Some(HostChromeButton::Minimize) {
         fill_rect(hdc, &minimize_rect, color(27, 52, 65));
     }
@@ -158,16 +441,12 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
         },
     );
 
-    let dpi = GetDpiForWindow(hwnd);
     let icon_half = scale_dip(5, dpi);
-    let pen = CreatePen(
-        PS_SOLID as i32,
-        scale_dip(1, dpi).max(1),
-        color(211, 229, 237),
-    );
-    let previous_pen = SelectObject(hdc, pen.cast());
+    let pen = GetStockObject(DC_PEN as i32);
+    SetDCPenColor(hdc, color(211, 229, 237));
+    let previous_pen = SelectObject(hdc, pen);
     let min_x = (minimize_rect.left + minimize_rect.right) / 2;
-    let center_y = chrome_height / 2;
+    let center_y = layout.top_height / 2;
     MoveToEx(
         hdc,
         min_x - icon_half,
@@ -191,20 +470,18 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
     );
     LineTo(hdc, close_x - icon_half - 1, center_y + icon_half + 1);
     SelectObject(hdc, previous_pen);
-    DeleteObject(pen.cast());
 
-    let title_length = GetWindowTextLengthW(hwnd).max(0) as usize;
-    let mut title = vec![0_u16; title_length.saturating_add(1)];
+    let mut title = [0_u16; 256];
     let read = GetWindowTextW(
         hwnd,
         title.as_mut_ptr(),
-        title.len().min(i32::MAX as usize) as i32,
+        title.len() as i32,
     );
     let mut title_rect = RECT {
-        left: scale_dip(13, dpi),
+        left: power_rect.right + scale_dip(10, dpi),
         top: 0,
-        right: (client.right - button_width * 2 - scale_dip(8, dpi)).max(0),
-        bottom: chrome_height,
+        right: (pin_rect.left - scale_dip(8, dpi)).max(0),
+        bottom: layout.top_height,
     };
     SetBkMode(hdc, TRANSPARENT as i32);
     SetTextColor(hdc, color(216, 231, 240));
@@ -218,6 +495,105 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
             &mut title_rect,
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
         );
+    }
+
+    draw_chrome_label(
+        hdc,
+        &power_rect,
+        "전원",
+        if bypassed {
+            color(105, 125, 135)
+        } else {
+            color(99, 221, 245)
+        },
+    );
+    draw_chrome_label(
+        hdc,
+        &pin_rect,
+        "고정",
+        if pinned {
+            color(242, 200, 91)
+        } else {
+            color(126, 151, 165)
+        },
+    );
+
+    for (button, label, active_color) in [
+        (
+            HostChromeButton::Bypass,
+            "바이패스",
+            if bypassed {
+                color(197, 92, 91)
+            } else {
+                color(103, 139, 155)
+            },
+        ),
+        (HostChromeButton::Save, "저장", color(103, 139, 155)),
+        (HostChromeButton::Load, "불러오기", color(103, 139, 155)),
+        (
+            HostChromeButton::Sidechain,
+            "사이드체인",
+            color(103, 139, 155),
+        ),
+    ] {
+        let Some(rect) = layout.button_rect(button) else {
+            continue;
+        };
+        fill_rect(
+            hdc,
+            &rect,
+            if hovered == Some(button) {
+                color(29, 49, 61)
+            } else {
+                color(13, 23, 31)
+            },
+        );
+        draw_chrome_label(hdc, &rect, label, active_color);
+    }
+
+    if let Some(label_rect) = layout.automation_label_rect() {
+        draw_chrome_label(hdc, &label_rect, "오토메이션", color(93, 121, 135));
+    }
+    for (button, active_color) in [
+        (HostChromeButton::AutomationOff, color(138, 148, 155)),
+        (HostChromeButton::AutomationWrite, color(240, 82, 88)),
+        (HostChromeButton::AutomationRead, color(76, 201, 138)),
+        (HostChromeButton::AutomationLatch, color(233, 189, 75)),
+    ] {
+        let rect = layout.button_rect(button).unwrap();
+        let active = match button {
+            HostChromeButton::AutomationOff => automation == 0,
+            HostChromeButton::AutomationWrite => automation == 1,
+            HostChromeButton::AutomationRead => automation == 2,
+            HostChromeButton::AutomationLatch => automation == 3,
+            _ => false,
+        };
+        fill_rect(
+            hdc,
+            &rect,
+            if hovered == Some(button) || active {
+                color(29, 49, 61)
+            } else {
+                color(13, 23, 31)
+            },
+        );
+        let inset = scale_dip(if active { 7 } else { 9 }, dpi);
+        let swatch = RECT {
+            left: rect.left + inset,
+            top: rect.top + inset,
+            right: rect.right - inset,
+            bottom: rect.bottom - inset,
+        };
+        fill_rect(hdc, &swatch, active_color);
+        if active {
+            let underline = RECT {
+                left: rect.left + scale_dip(4, dpi),
+                top: rect.bottom - scale_dip(2, dpi),
+                right: rect.right - scale_dip(4, dpi),
+                bottom: rect.bottom - scale_dip(1, dpi),
+            };
+            fill_rect(hdc, &underline, active_color);
+        }
     }
     SelectObject(hdc, previous_font);
     EndPaint(hwnd, &paint);
@@ -298,6 +674,61 @@ unsafe extern "system" fn plugin_window_proc(
     if msg == WM_LBUTTONUP {
         let (x, y) = point_from_lparam(lparam);
         match host_chrome_button_at(hwnd, x, y) {
+            Some(button @ (HostChromeButton::Power
+            | HostChromeButton::Pin
+            | HostChromeButton::Bypass
+            | HostChromeButton::Save
+            | HostChromeButton::Load
+            | HostChromeButton::Sidechain
+            | HostChromeButton::AutomationOff
+            | HostChromeButton::AutomationWrite
+            | HostChromeButton::AutomationRead
+            | HostChromeButton::AutomationLatch)) => {
+                if let Ok(mut states) = host_chrome_states().lock() {
+                    let state = states.entry(hwnd as usize).or_default();
+                    let action = match button {
+                        HostChromeButton::Power => {
+                            state.bypassed = !state.bypassed;
+                            EditorHostAction::TogglePower
+                        }
+                        HostChromeButton::Pin => {
+                            state.pinned = !state.pinned;
+                            EditorHostAction::TogglePin
+                        }
+                        HostChromeButton::Bypass => {
+                            state.bypassed = !state.bypassed;
+                            EditorHostAction::ToggleBypass
+                        }
+                        HostChromeButton::Save => EditorHostAction::SavePreset,
+                        HostChromeButton::Load => EditorHostAction::LoadPreset,
+                        HostChromeButton::Sidechain => EditorHostAction::ShowSidechain,
+                        HostChromeButton::AutomationOff => {
+                            state.automation = 0;
+                            EditorHostAction::AutomationOff
+                        }
+                        HostChromeButton::AutomationWrite => {
+                            state.automation = 1;
+                            EditorHostAction::AutomationWrite
+                        }
+                        HostChromeButton::AutomationRead => {
+                            state.automation = 2;
+                            EditorHostAction::AutomationRead
+                        }
+                        HostChromeButton::AutomationLatch => {
+                            state.automation = 3;
+                            EditorHostAction::AutomationLatch
+                        }
+                        _ => unreachable!(),
+                    };
+                    // UI gestures are human-rate; the cap prevents an unattended helper from
+                    // growing if the main host disappears without closing the editor.
+                    if state.actions.len() < 64 {
+                        state.actions.push(action);
+                    }
+                }
+                invalidate_host_chrome(hwnd);
+                return 0;
+            }
             Some(HostChromeButton::Minimize) => {
                 ShowWindow(hwnd, SW_MINIMIZE);
                 return 0;
@@ -312,9 +743,76 @@ unsafe extern "system" fn plugin_window_proc(
         }
     }
     if msg == WM_MOUSEMOVE {
-        // The toolbar is tiny and repaints independently of the plug-in child.
-        // Invalidating here gives the custom buttons native-rate hover feedback.
-        InvalidateRect(hwnd, std::ptr::null(), 0);
+        let (x, y) = point_from_lparam(lparam);
+        let hovered = host_chrome_button_at(hwnd, x, y);
+        let (previous, changed, register_leave) = host_chrome_states()
+            .lock()
+            .ok()
+            .map(|mut states| {
+                let state = states.entry(hwnd as usize).or_default();
+                if state.interactive_move {
+                    return (state.hovered, false, false);
+                }
+                let previous = state.hovered;
+                let changed = previous != hovered;
+                state.hovered = hovered;
+                let register_leave = !state.tracking_mouse_leave;
+                state.tracking_mouse_leave = true;
+                (previous, changed, register_leave)
+            })
+            .unwrap_or((None, false, false));
+        if register_leave {
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+        }
+        // Repaint only when the hover target changes, and only the two small
+        // button rectangles involved. A title-bar drag no longer invalidates
+        // the plug-in-sized parent surface for every pointer pixel.
+        if changed {
+            if let Some(button) = previous {
+                invalidate_host_button(hwnd, button);
+            }
+            if let Some(button) = hovered {
+                invalidate_host_button(hwnd, button);
+            }
+        }
+        return 0;
+    }
+    if msg == WM_MOUSELEAVE {
+        let previous = host_chrome_states().lock().ok().and_then(|mut states| {
+            let state = states.get_mut(&(hwnd as usize))?;
+            state.tracking_mouse_leave = false;
+            state.hovered.take()
+        });
+        if let Some(button) = previous {
+            invalidate_host_button(hwnd, button);
+        }
+        return 0;
+    }
+    if msg == WM_ENTERSIZEMOVE {
+        let previous = host_chrome_states().lock().ok().and_then(|mut states| {
+            let state = states.get_mut(&(hwnd as usize))?;
+            state.interactive_move = true;
+            state.tracking_mouse_leave = false;
+            state.hovered.take()
+        });
+        if let Some(button) = previous {
+            invalidate_host_button(hwnd, button);
+        }
+        return 0;
+    }
+    if msg == WM_EXITSIZEMOVE {
+        if let Ok(mut states) = host_chrome_states().lock() {
+            if let Some(state) = states.get_mut(&(hwnd as usize)) {
+                state.interactive_move = false;
+                state.tracking_mouse_leave = false;
+            }
+        }
         return 0;
     }
     if msg == WM_SIZE {
@@ -333,6 +831,7 @@ unsafe extern "system" fn plugin_window_proc(
                 );
             }
         }
+        invalidate_host_chrome(hwnd);
         return 0;
     }
     if msg == WM_PAINT {
@@ -537,7 +1036,11 @@ impl PluginWindow {
                 let class_name = "VST3PluginWindow\0".encode_utf16().collect::<Vec<u16>>();
                 let mut wc: WNDCLASSEXW = mem::zeroed();
                 wc.cbSize = mem::size_of::<WNDCLASSEXW>() as UINT;
-                wc.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
+                // The child editor covers everything below the 64-DIP host
+                // toolbar. CS_HREDRAW/CS_VREDRAW would invalidate that entire
+                // parent surface on every size transition; WM_SIZE already
+                // resizes the child and explicitly invalidates only chrome.
+                wc.style = CS_DROPSHADOW;
                 wc.lpfnWndProc = Some(plugin_window_proc);
                 wc.hInstance = GetModuleHandleW(ptr::null());
                 wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
@@ -547,7 +1050,7 @@ impl PluginWindow {
                 RegisterClassExW(&wc);
 
                 // Create window
-                let window_title = format!("MiniStudio  ·  {}  ·  VST3\0", plugin_info.name);
+                let window_title = format!("MiniStudio · {} · VST3\0", plugin_info.name);
                 let window_name = window_title.encode_utf16().collect::<Vec<u16>>();
 
                 let hwnd = CreateWindowExW(
@@ -619,6 +1122,16 @@ impl PluginWindow {
                 match plugin.open_editor(window_handle) {
                     Ok(()) => {
                         drop(plugin);
+                        host_chrome_states()
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .insert(
+                                hwnd as usize,
+                                HostChromeState {
+                                    has_sidechain: plugin_info.audio_inputs > 1,
+                                    ..HostChromeState::default()
+                                },
+                            );
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
                         self.native_window = Some(hwnd);
@@ -747,6 +1260,67 @@ impl PluginWindow {
         }
     }
 
+    /// Drain user intent from the host-owned native toolbar without calling into vendor code.
+    /// This is consumed over the isolation control channel and is never used by the audio path.
+    pub fn take_host_actions(&self) -> Vec<EditorHostAction> {
+        #[cfg(target_os = "windows")]
+        {
+            let Some(hwnd) = self.native_window else {
+                return Vec::new();
+            };
+            return host_chrome_states()
+                .lock()
+                .ok()
+                .and_then(|mut states| {
+                    states
+                        .get_mut(&(hwnd as usize))
+                        .map(|state| std::mem::take(&mut state.actions))
+                })
+                .unwrap_or_default();
+        }
+        #[cfg(not(target_os = "windows"))]
+        Vec::new()
+    }
+
+    /// Apply authoritative DAW state to the lightweight native indicators.
+    pub fn set_host_state(&self, state: EditorHostState) {
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.native_window {
+            let changed = host_chrome_states().lock().ok().and_then(|mut states| {
+                let chrome = states.get_mut(&(hwnd as usize))?;
+                let next_automation = state.automation.min(3);
+                let changed = (
+                    chrome.bypassed != state.bypassed,
+                    chrome.automation,
+                    next_automation,
+                );
+                chrome.bypassed = state.bypassed;
+                chrome.automation = next_automation;
+                Some(changed)
+            });
+            if let Some((bypass_changed, old_automation, new_automation)) = changed {
+                unsafe {
+                    if bypass_changed {
+                        invalidate_host_button(hwnd, HostChromeButton::Power);
+                        invalidate_host_button(hwnd, HostChromeButton::Bypass);
+                    }
+                    if old_automation != new_automation {
+                        let automation_button = |mode| match mode {
+                            1 => HostChromeButton::AutomationWrite,
+                            2 => HostChromeButton::AutomationRead,
+                            3 => HostChromeButton::AutomationLatch,
+                            _ => HostChromeButton::AutomationOff,
+                        };
+                        invalidate_host_button(hwnd, automation_button(old_automation));
+                        invalidate_host_button(hwnd, automation_button(new_automation));
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = state;
+    }
+
     /// Take the plugin lock without blocking, recovering a lock poisoned by an unrelated panic
     /// (a poisoned mutex is permanent, and treating it as failure would stop servicing the
     /// editor for the rest of the session).
@@ -864,6 +1438,9 @@ impl PluginWindow {
                 }
                 if let Ok(mut changes) = dpi_changes().lock() {
                     changes.remove(&(hwnd as usize));
+                }
+                if let Ok(mut states) = host_chrome_states().lock() {
+                    states.remove(&(hwnd as usize));
                 }
                 unsafe {
                     DestroyWindow(hwnd);
@@ -998,5 +1575,49 @@ mod tests {
         let packed = (192usize << 16) | 144;
         assert_eq!(super::dpi_from_wparam(packed), Some(144));
         assert_eq!(super::dpi_from_wparam(0), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn host_chrome_keeps_automation_controls_right_aligned() {
+        use super::{HostChromeButton, HostChromeLayout};
+
+        let layout = HostChromeLayout::new(900, 64, 96, true);
+        let off = layout
+            .button_rect(HostChromeButton::AutomationOff)
+            .unwrap();
+        let latch = layout
+            .button_rect(HostChromeButton::AutomationLatch)
+            .unwrap();
+        let label = layout.automation_label_rect().unwrap();
+
+        assert_eq!(off.left, 900 - 24 * 4);
+        assert_eq!(latch.right, 900);
+        assert_eq!(label.right, off.left);
+        assert!(
+            layout
+                .button_rect(HostChromeButton::Sidechain)
+                .unwrap()
+                .right
+                < label.left
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn narrow_host_chrome_preserves_automation_hit_targets() {
+        use super::{HostChromeButton, HostChromeLayout};
+
+        let layout = HostChromeLayout::new(300, 64, 96, true);
+        assert!(layout
+            .button_rect(HostChromeButton::Sidechain)
+            .is_none());
+        assert_eq!(
+            layout
+                .button_rect(HostChromeButton::AutomationLatch)
+                .unwrap()
+                .right,
+            300
+        );
     }
 }

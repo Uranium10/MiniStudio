@@ -15,14 +15,17 @@ describe('media placement and quantize', () => {
     useProjectStore.getState().insertAudioAsset(asset, 3.25, track.id)
     const result = useProjectStore.getState().project.tracks.find((item) => item.id === track.id)!
     expect(result.clips).toHaveLength(before + 1)
-    expect(result.clips.at(-1)).toMatchObject({ assetId: asset.id, startSec: 3.25, playbackRate: 1, reversed: false })
+    const clip = result.clips.at(-1)!
+    expect(clip).toMatchObject({ startSec: 3.25, playbackRate: 1, reversed: false })
+    expect(useProjectStore.getState().project.audioSourceRefs[clip.audioSourceRefId]?.assetId).toBe(asset.id)
   })
 
   it('creates an audio track at a gap index', () => {
     useProjectStore.getState().insertAudioAsset(asset, 1, undefined, 1)
     const result = useProjectStore.getState().project.tracks[1]!
     expect(result.kind).toBe('audio')
-    expect(result.clips[0]).toMatchObject({ assetId: asset.id, startSec: 1 })
+    expect(result.clips[0]).toMatchObject({ startSec: 1 })
+    expect(useProjectStore.getState().project.audioSourceRefs[result.clips[0]!.audioSourceRefId]?.assetId).toBe(asset.id)
   })
 
   it('quantizes selected arrangement clips and piano notes to the active grid', () => {
@@ -42,6 +45,55 @@ describe('media placement and quantize', () => {
     useProjectStore.setState({ editorClip: { trackId: instrument.id, clipId: midi.id }, selectedNoteIds: [note.id], editFocus: 'pianoRoll', pianoGridTicks: 480 })
     quantizeInContext()
     expect(useProjectStore.getState().project.tracks.find((item) => item.id === instrument.id)!.midiClips[0]!.notes.find((item) => item.id === note.id)!.startTicks).toBe(960)
+  })
+
+  it('quantizes arrangement time through a variable tempo map', () => {
+    const project = createDemoProject()
+    project.transport.tempoMap = {
+      tempoPoints: [{ tick: 0, bpm: 120, curve: 'jump' }, { tick: 960, bpm: 60, curve: 'jump' }],
+      timeSignatures: [{ bar: 1, numerator: 4, denominator: 4 }],
+    }
+    useProjectStore.getState().setProject(project)
+    const track = useProjectStore.getState().project.tracks.find((item) => item.clips.length)!
+    const clip = track.clips[0]!
+    useProjectStore.getState().updateClip(track.id, clip.id, { startSec: .87 })
+    useProjectStore.setState({ selectedClipIds: [clip.id], editFocus: 'arrangement', gridTicks: 480 })
+    quantizeInContext()
+    expect(useProjectStore.getState().project.tracks.find((item) => item.id === track.id)!.clips[0]!.startSec).toBeCloseTo(1, 6)
+  })
+
+  it('shares source refs on duplicate, makes them unique explicitly, and collects unused sources', () => {
+    const store = useProjectStore.getState()
+    store.insertAudioAsset(asset, 0)
+    const track = useProjectStore.getState().project.tracks.find((candidate) => candidate.clips.length)!
+    const original = track.clips[0]!
+    const duplicateId = useProjectStore.getState().duplicateClip(track.id, original.id)!
+    let project = useProjectStore.getState().project
+    expect(project.tracks.find((candidate) => candidate.id === track.id)!.clips.find((clip) => clip.id === duplicateId)!.audioSourceRefId).toBe(original.audioSourceRefId)
+
+    useProjectStore.getState().makeAudioSourceUnique(track.id, duplicateId)
+    project = useProjectStore.getState().project
+    const unique = project.tracks.find((candidate) => candidate.id === track.id)!.clips.find((clip) => clip.id === duplicateId)!
+    expect(unique.audioSourceRefId).not.toBe(original.audioSourceRefId)
+    expect(project.audioSourceRefs[unique.audioSourceRefId]!.assetId).toBe(project.audioSourceRefs[original.audioSourceRefId]!.assetId)
+
+    useProjectStore.setState({ selectedClipIds: [duplicateId] })
+    useProjectStore.getState().deleteSelectedClips()
+    project = useProjectStore.getState().project
+    expect(project.audioSourceRefs[unique.audioSourceRefId]).toBeUndefined()
+    expect(project.assets[asset.id]).toBeDefined()
+  })
+
+  it('deduplicates imported assets by path while creating distinct source refs', () => {
+    const store = useProjectStore.getState()
+    const previousRefIds = new Set(store.project.tracks.flatMap((track) => track.clips.map((clip) => clip.audioSourceRefId)))
+    store.insertAudioAsset(asset, 0)
+    store.insertAudioAsset({ ...asset, id: 'decoded-again' }, 2)
+    const project = useProjectStore.getState().project
+    const clips = project.tracks.flatMap((track) => track.clips).filter((clip) => !previousRefIds.has(clip.audioSourceRefId))
+    expect(new Set(clips.map((clip) => clip.audioSourceRefId)).size).toBe(2)
+    expect(new Set(clips.map((clip) => project.audioSourceRefs[clip.audioSourceRefId]!.assetId))).toEqual(new Set([asset.id]))
+    expect(project.assets['decoded-again']).toBeUndefined()
   })
 
   it('keeps arrangement and piano-roll quantize settings independent and swings offbeats', () => {

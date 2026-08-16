@@ -1,9 +1,12 @@
 // Control-plane ownership and allocation-free CPAL callback core.
 use super::{
     asset::{decode_asset, AudioAsset},
-    command::{param_key, AudioCommand},
+    command::{param_key, AudioCommand, MetronomeSettings},
     device,
-    dsp::{create_effect, PluginControl, DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES},
+    dsp::{
+        create_effect, PluginControl, PluginEditorAction, DISTORTION_SPECTRUM_BINS,
+        LIMITER_METER_VALUES,
+    },
     graph::{AudioGraph, Bindings},
     instrument::{LiveMidiMessage, NoteEvent, NoteEventKind},
     plugin::ExternalPluginRegistry,
@@ -30,7 +33,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -167,6 +170,36 @@ fn mp3_bitrate(value: u16) -> Result<Bitrate, String> {
 }
 use triple_buffer::{triple_buffer, Input, Output};
 
+const MAX_METRONOME_CLICK_SAMPLES: usize = 8192;
+
+fn metronome_click_waveforms(
+    sample_rate: u32,
+) -> (
+    [f32; MAX_METRONOME_CLICK_SAMPLES],
+    [f32; MAX_METRONOME_CLICK_SAMPLES],
+    usize,
+) {
+    let mut accent = [0.0; MAX_METRONOME_CLICK_SAMPLES];
+    let mut regular = [0.0; MAX_METRONOME_CLICK_SAMPLES];
+    let rate = sample_rate.max(1) as f32;
+    let len = ((rate * 0.035).round() as usize).clamp(1, MAX_METRONOME_CLICK_SAMPLES);
+    for index in 0..len {
+        let t = index as f32 / rate;
+        let attack = (t / 0.00035).min(1.0);
+        let body = (-t * 76.0).exp();
+        let edge = (-t * 210.0).exp();
+        accent[index] = attack
+            * body
+            * ((std::f32::consts::TAU * 1760.0 * t).sin()
+                + 0.22 * edge * (std::f32::consts::TAU * 3520.0 * t).sin());
+        regular[index] = attack
+            * body
+            * ((std::f32::consts::TAU * 1180.0 * t).sin()
+                + 0.16 * edge * (std::f32::consts::TAU * 2360.0 * t).sin());
+    }
+    (accent, regular, len)
+}
+
 #[derive(Clone, Copy)]
 pub struct MeterFrame {
     pub position: u64,
@@ -174,6 +207,7 @@ pub struct MeterFrame {
     pub master: Level,
     pub pdc: usize,
     pub playing: bool,
+    pub count_in_beats_remaining: u32,
     pub active_voice_counts: [u32; MAX_TRACKS],
     pub multiband_levels: [[[f32; 2]; 3]; MAX_EFFECT_METERS],
     pub distortion_spectra: [[f32; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
@@ -190,6 +224,7 @@ impl Default for MeterFrame {
             master: Level::default(),
             pdc: 0,
             playing: false,
+            count_in_beats_remaining: 0,
             active_voice_counts: [0; MAX_TRACKS],
             multiband_levels: [[[0.0; 2]; 3]; MAX_EFFECT_METERS],
             distortion_spectra: [[0.0; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
@@ -210,6 +245,12 @@ pub struct AudioCore {
     loop_tail: [f32; 2048],
     loop_tail_frames: usize,
     midi_input: Arc<ArrayQueue<LiveMidiMessage>>,
+    metronome: MetronomeSettings,
+    count_in_remaining: u64,
+    count_in_elapsed: u64,
+    click_accent: [f32; MAX_METRONOME_CLICK_SAMPLES],
+    click_regular: [f32; MAX_METRONOME_CLICK_SAMPLES],
+    click_len: usize,
 }
 impl AudioCore {
     #[cfg(test)]
@@ -217,6 +258,7 @@ impl AudioCore {
         let (_, rx): (Producer<AudioCommand>, Consumer<AudioCommand>) = RingBuffer::new(1);
         let (tx, _): (Producer<Box<AudioGraph>>, Consumer<Box<AudioGraph>>) = RingBuffer::new(1);
         let (input, _) = triple_buffer(&MeterFrame::default());
+        let (click_accent, click_regular, click_len) = metronome_click_waveforms(48_000);
         Self {
             commands: rx,
             retired: tx,
@@ -228,6 +270,18 @@ impl AudioCore {
             loop_tail: [0.0; 2048],
             loop_tail_frames: 0,
             midi_input: Arc::new(ArrayQueue::new(1)),
+            metronome: MetronomeSettings {
+                enabled: false,
+                gain: db_to_gain(-12.0),
+                bpm: 120.0,
+                numerator: 4,
+                denominator: 4,
+            },
+            count_in_remaining: 0,
+            count_in_elapsed: 0,
+            click_accent,
+            click_regular,
+            click_len,
         }
     }
     fn new(
@@ -237,6 +291,8 @@ impl AudioCore {
         meters: Input<MeterFrame>,
         midi_input: Arc<ArrayQueue<LiveMidiMessage>>,
     ) -> Self {
+        let (click_accent, click_regular, click_len) =
+            metronome_click_waveforms(graph.sample_rate());
         Self {
             commands,
             retired,
@@ -248,6 +304,18 @@ impl AudioCore {
             loop_tail: [0.0; 2048],
             loop_tail_frames: 0,
             midi_input,
+            metronome: MetronomeSettings {
+                enabled: false,
+                gain: db_to_gain(-12.0),
+                bpm: 120.0,
+                numerator: 4,
+                denominator: 4,
+            },
+            count_in_remaining: 0,
+            count_in_elapsed: 0,
+            click_accent,
+            click_regular,
+            click_len,
         }
     }
     pub fn render(&mut self, output: &mut [f32], frames: usize) {
@@ -256,6 +324,28 @@ impl AudioCore {
             return;
         }
         self.drain_commands();
+        let output = &mut output[..frames * 2];
+        if self.playing && self.count_in_remaining > 0 {
+            output.fill(0.0);
+            let count_in_frames = frames.min(self.count_in_remaining as usize);
+            self.mix_metronome(
+                &mut output[..count_in_frames * 2],
+                self.count_in_elapsed,
+                count_in_frames,
+                true,
+            );
+            self.count_in_elapsed += count_in_frames as u64;
+            self.count_in_remaining -= count_in_frames as u64;
+            let frame = self.meters.input_buffer_mut();
+            frame.levels.fill(Level::default());
+            frame.master = Level::default();
+            self.publish();
+            if count_in_frames == frames {
+                return;
+            }
+            self.render_timeline(&mut output[count_in_frames * 2..], frames - count_in_frames);
+            return;
+        }
         if !self.playing {
             let mut levels = [Level::default(); MAX_TRACKS];
             let mut master = Level::default();
@@ -273,6 +363,9 @@ impl AudioCore {
             self.publish();
             return;
         }
+        self.render_timeline(output, frames);
+    }
+    fn render_timeline(&mut self, output: &mut [f32], frames: usize) {
         let mut done = 0;
         while done < frames {
             let remaining = frames - done;
@@ -283,11 +376,18 @@ impl AudioCore {
                     self.graph.reset(start)
                 }
             }
-            let segment = if let Some((_, end)) = loop_range {
+            let mut segment = if let Some((_, end)) = loop_range {
                 remaining.min((end - self.position) as usize)
             } else {
                 remaining
             };
+            if let Some(boundary) = self
+                .graph
+                .tempo_map()
+                .next_change_sample_after(self.position)
+            {
+                segment = segment.min(boundary.saturating_sub(self.position) as usize);
+            }
             let from = done * 2;
             let to = (done + segment) * 2;
             let mut levels = [Level::default(); MAX_TRACKS];
@@ -300,6 +400,7 @@ impl AudioCore {
                 &mut master,
                 true,
             );
+            self.mix_metronome(&mut output[from..to], self.position, segment, false);
             if self.loop_tail_frames > 0 {
                 let blend = segment.min(self.loop_tail_frames);
                 for i in 0..blend {
@@ -329,6 +430,7 @@ impl AudioCore {
             frame.master = master;
             frame.pdc = self.graph.max_latency();
             frame.playing = true;
+            frame.count_in_beats_remaining = 0;
             for (index, count) in self
                 .graph
                 .active_voice_counts()
@@ -346,23 +448,117 @@ impl AudioCore {
             self.meters.publish();
         }
     }
+    fn beat_samples(&self) -> f64 {
+        let map = self.graph.tempo_map();
+        let tick = map.samples_to_ticks(self.position);
+        let bpm = map.bpm_at_tick(tick).clamp(1.0, 999.0);
+        let denominator = f64::from(map.time_signature_at_tick(tick).denominator.max(1));
+        self.graph.sample_rate() as f64 * 60.0 / bpm * (4.0 / denominator)
+    }
+    fn count_in_samples(&self, bars: u8) -> u64 {
+        (self.beat_samples() * f64::from(self.metronome.numerator.max(1)) * f64::from(bars))
+            .round()
+            .max(0.0) as u64
+    }
+    fn count_in_beats_remaining(&self) -> u32 {
+        if self.count_in_remaining == 0 {
+            0
+        } else {
+            (self.count_in_remaining as f64 / self.beat_samples())
+                .ceil()
+                .clamp(0.0, u32::MAX as f64) as u32
+        }
+    }
+    fn mix_metronome(&self, output: &mut [f32], start_sample: u64, frames: usize, force: bool) {
+        if (!force && !self.metronome.enabled) || frames == 0 || self.click_len == 0 {
+            return;
+        }
+        let map = self.graph.tempo_map();
+        let start_tick = map.samples_to_ticks(start_sample);
+        let (mut bar, beat_position) = map.tick_to_bar_beat(start_tick);
+        let mut beat = beat_position.floor().max(0.0) as u32;
+        let mut beat_start =
+            map.ticks_to_samples(map.bar_beat_to_tick(bar, f64::from(beat))) as i64;
+        if beat_start > start_sample as i64 {
+            if beat > 0 {
+                beat -= 1;
+            } else if bar > 1 {
+                bar -= 1;
+                beat = u32::from(map.time_signature_at_bar(bar).numerator).saturating_sub(1);
+            }
+            beat_start = map.ticks_to_samples(map.bar_beat_to_tick(bar, f64::from(beat))) as i64;
+        }
+        let gain = self.metronome.gain.clamp(0.0, 2.0);
+        for frame in 0..frames {
+            let absolute = start_sample as i64 + frame as i64;
+            let signature = map.time_signature_at_bar(bar);
+            let mut next_bar = bar;
+            let mut next_beat = beat + 1;
+            if next_beat >= u32::from(signature.numerator) {
+                next_bar += 1;
+                next_beat = 0;
+            }
+            let mut next_start =
+                map.ticks_to_samples(map.bar_beat_to_tick(next_bar, f64::from(next_beat))) as i64;
+            while absolute >= next_start {
+                bar = next_bar;
+                beat = next_beat;
+                beat_start = next_start;
+                let next_signature = map.time_signature_at_bar(bar);
+                next_beat = beat + 1;
+                next_bar = bar;
+                if next_beat >= u32::from(next_signature.numerator) {
+                    next_bar += 1;
+                    next_beat = 0;
+                }
+                next_start = map
+                    .ticks_to_samples(map.bar_beat_to_tick(next_bar, f64::from(next_beat)))
+                    as i64;
+            }
+            let age = absolute - beat_start;
+            if age < 0 || age as usize >= self.click_len {
+                continue;
+            }
+            let click = if beat == 0 {
+                self.click_accent[age as usize]
+            } else {
+                self.click_regular[age as usize]
+            } * gain;
+            output[frame * 2] += click;
+            output[frame * 2 + 1] += click;
+        }
+    }
     fn drain_commands(&mut self) {
         while let Ok(command) = self.commands.pop() {
             match command {
-                AudioCommand::SetPlaying(v) => {
-                    if self.playing && !v {
+                AudioCommand::SetPlaying {
+                    playing,
+                    count_in_bars,
+                } => {
+                    if self.playing && !playing {
                         self.graph.all_notes_off()
                     }
-                    self.playing = v
+                    self.playing = playing;
+                    self.count_in_remaining = if playing {
+                        self.count_in_samples(count_in_bars.min(4))
+                    } else {
+                        0
+                    };
+                    self.count_in_elapsed = 0;
                 }
+                AudioCommand::SetMetronome(settings) => self.metronome = settings,
                 AudioCommand::SeekTo(v) => {
                     self.position = v;
-                    self.graph.reset(v)
+                    self.graph.reset(v);
+                    self.count_in_remaining = 0;
+                    self.count_in_elapsed = 0;
                 }
                 AudioCommand::Stop => {
                     self.playing = false;
                     self.position = 0;
-                    self.graph.reset(0)
+                    self.graph.reset(0);
+                    self.count_in_remaining = 0;
+                    self.count_in_elapsed = 0;
                 }
                 AudioCommand::SetTrackGain { track, gain } => {
                     if let Some((g, _, _, _)) = self.graph.track_mut(track) {
@@ -435,9 +631,11 @@ impl AudioCore {
         }
     }
     fn publish(&mut self) {
+        let count_in_beats_remaining = self.count_in_beats_remaining();
         let frame = self.meters.input_buffer_mut();
         frame.position = self.position;
         frame.playing = self.playing;
+        frame.count_in_beats_remaining = count_in_beats_remaining;
         frame.pdc = self.graph.max_latency();
         for (index, count) in self
             .graph
@@ -464,7 +662,57 @@ struct Runtime {
     meters: Output<MeterFrame>,
     xruns: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    cpu_load: Arc<AtomicU32>,
+    cpu_peak: Arc<AtomicU32>,
 }
+/// A near-silence streak for one track's plug-in control, driving the process-isolation idle
+/// hint. Lives entirely on the control plane (`poll`); the realtime graph never sees it.
+#[derive(Default)]
+struct IdleTracker {
+    silent_since: Option<std::time::Instant>,
+    trimmed: bool,
+}
+
+/// Below this the track counts as silent for idle-trim purposes - about -80 dBFS, well under
+/// anything perceptible, so genuinely quiet-but-playing material never trips it.
+const IDLE_SILENCE_PEAK: f32 = 0.0001;
+/// How long a track must stay under `IDLE_SILENCE_PEAK` before its plug-in gets the idle hint.
+/// Long enough that a normal pause between phrases never triggers it - this is for "loaded but
+/// not currently being worked on", not "the note just ended".
+const IDLE_TRIM_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// MIDI device connections are expensive OS resources on Windows. In particular, opening and
+/// enumerating WinRT MIDI endpoints can enter `MidiSrvClientRpc` for an unbounded amount of time.
+/// Keep the physical connection alive and route each callback through this atomic indirection so
+/// graph rebuilds and track selection never have to reconnect the device.
+const NO_MIDI_TRACK: usize = usize::MAX;
+
+struct MidiInputRoute {
+    _connection: MidiInputConnection<()>,
+    target_track_id: String,
+    target_index: Arc<AtomicUsize>,
+}
+
+pub enum MidiConnectPlan {
+    Routed,
+    Open(MidiInputRouteRequest),
+}
+
+pub struct MidiInputRouteRequest {
+    port_id: String,
+    target_track_id: String,
+    target_index: Arc<AtomicUsize>,
+    queue: Arc<ArrayQueue<LiveMidiMessage>>,
+    counter: Arc<AtomicI32>,
+}
+
+pub struct OpenedMidiInputRoute {
+    port_id: String,
+    route: MidiInputRoute,
+}
+
+pub struct DetachedMidiInputRoute(MidiInputRoute);
+
 pub struct NativeEngine {
     settings: AudioSettings,
     runtime: Option<Runtime>,
@@ -474,10 +722,10 @@ pub struct NativeEngine {
     last_error: Option<String>,
     graph_revision: u64,
     midi_input: Arc<ArrayQueue<LiveMidiMessage>>,
-    midi_connections: HashMap<String, MidiInputConnection<()>>,
-    midi_connection_targets: HashMap<String, String>,
+    midi_routes: HashMap<String, MidiInputRoute>,
     midi_note_counter: Arc<AtomicI32>,
     plugin_instances: ExternalPluginRegistry,
+    idle_trackers: HashMap<String, IdleTracker>,
 }
 impl Default for NativeEngine {
     fn default() -> Self {
@@ -500,10 +748,10 @@ impl Default for NativeEngine {
             last_error: None,
             graph_revision: 0,
             midi_input: Arc::new(ArrayQueue::new(2048)),
-            midi_connections: HashMap::new(),
-            midi_connection_targets: HashMap::new(),
+            midi_routes: HashMap::new(),
             midi_note_counter: Arc::new(AtomicI32::new(1)),
             plugin_instances: ExternalPluginRegistry::default(),
+            idle_trackers: HashMap::new(),
         }
     }
 }
@@ -517,8 +765,7 @@ impl NativeEngine {
     pub fn dispose(&mut self) {
         self.close_all_plugin_editors();
         self.runtime = None;
-        self.midi_connections.clear();
-        self.midi_connection_targets.clear();
+        self.midi_routes.clear();
         self.plugin_instances.clear();
     }
     fn restart_stream(&mut self) -> Result<(), String> {
@@ -543,6 +790,7 @@ impl NativeEngine {
                 &mut self.plugin_instances,
             )?;
             self.bindings = b;
+            self.refresh_midi_routes();
             g
         } else {
             AudioGraph::empty(self.settings.sample_rate)
@@ -559,11 +807,15 @@ impl NativeEngine {
         );
         let xruns = Arc::new(AtomicU64::new(previous_xruns));
         let failed = Arc::new(AtomicBool::new(false));
+        let cpu_load = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let cpu_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         match device::open_stream(
             &self.settings,
             core,
             Arc::clone(&xruns),
             Arc::clone(&failed),
+            Arc::clone(&cpu_load),
+            Arc::clone(&cpu_peak),
         ) {
             Ok(stream) => {
                 self.runtime = Some(Runtime {
@@ -573,6 +825,8 @@ impl NativeEngine {
                     meters: meter_rx,
                     xruns,
                     failed,
+                    cpu_load,
+                    cpu_peak,
                 });
                 self.last_error = None;
                 self.restore_transport(resume);
@@ -592,6 +846,7 @@ impl NativeEngine {
                         &mut self.plugin_instances,
                     )?;
                     self.bindings = bindings;
+                    self.refresh_midi_routes();
                     graph
                 } else {
                     AudioGraph::empty(self.settings.sample_rate)
@@ -607,11 +862,15 @@ impl NativeEngine {
                     Arc::clone(&self.midi_input),
                 );
                 let failed = Arc::new(AtomicBool::new(false));
+                let cpu_load = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+                let cpu_peak = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
                 match device::open_stream(
                     &self.settings,
                     core,
                     Arc::clone(&xruns),
                     Arc::clone(&failed),
+                    Arc::clone(&cpu_load),
+                    Arc::clone(&cpu_peak),
                 ) {
                     Ok(stream) => {
                         self.runtime = Some(Runtime {
@@ -621,6 +880,8 @@ impl NativeEngine {
                             meters: meter_rx,
                             xruns,
                             failed,
+                            cpu_load,
+                            cpu_peak,
                         });
                         self.last_error = Some(format!(
                             "requested audio device failed; using system default: {first}"
@@ -643,7 +904,10 @@ impl NativeEngine {
             let _ = self.push(AudioCommand::SeekTo(frame.position));
         }
         if frame.playing {
-            let _ = self.push(AudioCommand::SetPlaying(true));
+            let _ = self.push(AudioCommand::SetPlaying {
+                playing: true,
+                count_in_bars: 0,
+            });
         }
     }
     fn push(&mut self, command: AudioCommand) -> Result<(), String> {
@@ -700,8 +964,12 @@ impl NativeEngine {
         // and its editor/parameter lookup table must remain one transaction.
         self.push(AudioCommand::SwapGraph(graph))?;
         self.bindings = bindings;
+        self.refresh_midi_routes();
         self.last_snapshot = Some(spec);
         self.graph_revision = self.graph_revision.wrapping_add(1);
+        // Stale entries (deleted/renamed tracks) would otherwise sit here forever; a rebuild is
+        // infrequent enough that just losing the accumulated silence streaks is no loss.
+        self.idle_trackers.clear();
         Ok(())
     }
     pub fn open_plugin_editor(&self, target_id: &str) -> Result<(), String> {
@@ -742,6 +1010,17 @@ impl NativeEngine {
             .get(target_id)
             .is_some_and(|control| control.is_editor_open())
     }
+    pub fn take_plugin_editor_actions(
+        &self,
+        target_id: &str,
+    ) -> Result<Vec<PluginEditorAction>, String> {
+        Ok(self
+            .bindings
+            .plugin_controls
+            .get(target_id)
+            .ok_or_else(|| format!("plug-in instance is not available: {target_id}"))?
+            .take_editor_actions())
+    }
     pub fn save_plugin_state(&self, target_id: &str) -> Result<Vec<u8>, String> {
         self.bindings
             .plugin_controls
@@ -763,16 +1042,22 @@ impl NativeEngine {
             }
         }
     }
-    pub fn play(&mut self, from: Option<f64>) -> Result<(), String> {
+    pub fn play(&mut self, from: Option<f64>, count_in_bars: u8) -> Result<(), String> {
         if let Some(sec) = from {
             self.push(AudioCommand::SeekTo(
                 (sec * f64::from(self.settings.sample_rate)) as u64,
             ))?
         }
-        self.push(AudioCommand::SetPlaying(true))
+        self.push(AudioCommand::SetPlaying {
+            playing: true,
+            count_in_bars: count_in_bars.min(4),
+        })
     }
     pub fn pause(&mut self) -> Result<(), String> {
-        self.push(AudioCommand::SetPlaying(false))
+        self.push(AudioCommand::SetPlaying {
+            playing: false,
+            count_in_bars: 0,
+        })
     }
     pub fn stop(&mut self) -> Result<(), String> {
         self.push(AudioCommand::Stop)
@@ -781,6 +1066,25 @@ impl NativeEngine {
         self.push(AudioCommand::SeekTo(
             (sec * f64::from(self.settings.sample_rate)) as u64,
         ))
+    }
+    pub fn set_metronome(
+        &mut self,
+        enabled: bool,
+        gain_db: f32,
+        bpm: f64,
+        numerator: u8,
+        denominator: u8,
+    ) -> Result<(), String> {
+        self.push(AudioCommand::SetMetronome(MetronomeSettings {
+            enabled,
+            gain: db_to_gain(gain_db.clamp(-60.0, 6.0)),
+            bpm: bpm.clamp(20.0, 400.0),
+            numerator: numerator.clamp(1, 32),
+            denominator: match denominator {
+                1 | 2 | 4 | 8 | 16 => denominator,
+                _ => 4,
+            },
+        }))
     }
     pub fn set_track_gain(&mut self, id: &str, db: f32) -> Result<(), String> {
         let i = *self.bindings.tracks.get(id).ok_or("unknown track")?;
@@ -917,6 +1221,35 @@ impl NativeEngine {
             },
         })
     }
+    /// Drives the process-isolation idle hint from each track's measured output level, not
+    /// from mute/solo flags - an instrument that is simply not being played right now (in the
+    /// mix, unmuted, just quiet) still qualifies, which is exactly the common case in a large
+    /// template between takes. Only instrument plug-ins are tracked here: an external effect's
+    /// individual contribution is not separable from its track's post-chain level, and effect
+    /// instances are rarely numerous enough for their isolation overhead to matter the way a
+    /// mega-template's several dozen instrument tracks can.
+    fn update_idle_hints(&mut self, track_levels: &[Level]) {
+        let now = std::time::Instant::now();
+        for (index, track_id) in self.bindings.track_ids.iter().enumerate() {
+            let Some(control) = self.bindings.plugin_controls.get(track_id) else {
+                continue;
+            };
+            let peak = track_levels.get(index).map_or(0.0, |level| level.peak);
+            let tracker = self.idle_trackers.entry(track_id.clone()).or_default();
+            if peak > IDLE_SILENCE_PEAK {
+                if tracker.trimmed {
+                    control.set_idle(false);
+                }
+                *tracker = IdleTracker::default();
+            } else {
+                let silent_since = *tracker.silent_since.get_or_insert(now);
+                if !tracker.trimmed && now.duration_since(silent_since) >= IDLE_TRIM_AFTER {
+                    control.set_idle(true);
+                    tracker.trimmed = true;
+                }
+            }
+        }
+    }
     pub fn poll(&mut self) -> EngineSnapshot {
         let stream_failed = self
             .runtime
@@ -928,17 +1261,20 @@ impl NativeEngine {
             }
         }
         self.collect_retired();
-        let (frame, running, xruns) = if let Some(runtime) = &mut self.runtime {
+        let (frame, running, xruns, cpu_load, cpu_peak) = if let Some(runtime) = &mut self.runtime {
             runtime.meters.update();
             (
                 *runtime.meters.output_buffer_mut(),
                 true,
                 runtime.xruns.load(Ordering::Relaxed),
+                f32::from_bits(runtime.cpu_load.load(Ordering::Relaxed)),
+                f32::from_bits(runtime.cpu_peak.load(Ordering::Relaxed)),
             )
         } else {
-            (MeterFrame::default(), false, 0)
+            (MeterFrame::default(), false, 0, 0.0, 0.0)
         };
         let track_levels = frame.levels[..self.bindings.track_ids.len().min(MAX_TRACKS)].to_vec();
+        self.update_idle_hints(&track_levels);
         let multiband_levels = frame.multiband_levels[..self
             .bindings
             .multiband_meter_ids
@@ -993,6 +1329,9 @@ impl NativeEngine {
                 running,
                 error: self.last_error.clone(),
                 pdc_samples: frame.pdc,
+                cpu_load_percent: f64::from(cpu_load.clamp(0.0, 8.0)) * 100.0,
+                cpu_peak_percent: f64::from(cpu_peak.clamp(0.0, 8.0)) * 100.0,
+                count_in_beats_remaining: frame.count_in_beats_remaining,
             },
             graph_revision: self.graph_revision,
             playing: frame.playing,
@@ -1010,7 +1349,18 @@ impl NativeEngine {
     pub fn devices(&self, id: &str) -> Result<Vec<AudioDeviceInfo>, String> {
         device::list_devices(id)
     }
-    pub fn midi_inputs(&self) -> Result<Vec<MidiInputPortInfo>, String> {
+    /// A cheap snapshot used by the Tauri layer before it releases the global engine lock and
+    /// performs the potentially blocking OS enumeration on the blocking pool.
+    pub fn midi_route_snapshot(&self) -> HashMap<String, String> {
+        self.midi_routes
+            .iter()
+            .map(|(port_id, route)| (port_id.clone(), route.target_track_id.clone()))
+            .collect()
+    }
+
+    pub fn scan_midi_inputs(
+        connected_routes: &HashMap<String, String>,
+    ) -> Result<Vec<MidiInputPortInfo>, String> {
         let input = MidiInput::new("MiniStudio MIDI scan").map_err(|error| error.to_string())?;
         input
             .ports()
@@ -1020,42 +1370,64 @@ impl NativeEngine {
                 let id = index.to_string();
                 Ok(MidiInputPortInfo {
                     name: input.port_name(port).map_err(|error| error.to_string())?,
-                    connected: self.midi_connections.contains_key(&id),
-                    target_track_id: self.midi_connection_targets.get(&id).cloned(),
+                    connected: connected_routes.contains_key(&id),
+                    target_track_id: connected_routes.get(&id).cloned(),
                     id,
                 })
             })
             .collect()
     }
-    pub fn connect_midi_input(&mut self, port_id: &str, track_id: &str) -> Result<(), String> {
-        if self.midi_connections.contains_key(port_id) {
-            if self
-                .midi_connection_targets
-                .get(port_id)
-                .is_some_and(|target| target == track_id)
-            {
-                return Ok(());
-            }
-            self.disconnect_midi_input(port_id);
-        }
+    /// Resolves a route while the engine lock is held, but never talks to the operating system.
+    /// Existing hardware connections are retargeted with one atomic store.
+    pub fn prepare_midi_input(
+        &mut self,
+        port_id: &str,
+        track_id: &str,
+    ) -> Result<MidiConnectPlan, String> {
         let track = *self
             .bindings
             .tracks
             .get(track_id)
             .ok_or("unknown MIDI target track")?;
+        if let Some(route) = self.midi_routes.get_mut(port_id) {
+            if route.target_track_id == track_id
+                && route.target_index.load(Ordering::Acquire) == track
+            {
+                return Ok(MidiConnectPlan::Routed);
+            }
+            route.target_track_id = track_id.to_owned();
+            route.target_index.store(track, Ordering::Release);
+            return Ok(MidiConnectPlan::Routed);
+        }
+        Ok(MidiConnectPlan::Open(MidiInputRouteRequest {
+            port_id: port_id.to_owned(),
+            target_track_id: track_id.to_owned(),
+            target_index: Arc::new(AtomicUsize::new(track)),
+            queue: Arc::clone(&self.midi_input),
+            counter: Arc::clone(&self.midi_note_counter),
+        }))
+    }
+
+    /// Performs the potentially slow MidiSrv work without borrowing `NativeEngine` or holding its
+    /// global mutex. The returned connection is installed in a short second control-plane step.
+    pub fn open_midi_input(request: MidiInputRouteRequest) -> Result<OpenedMidiInputRoute, String> {
         let mut input =
             MidiInput::new("MiniStudio MIDI input").map_err(|error| error.to_string())?;
         input.ignore(Ignore::None);
-        let port_index = port_id.parse::<usize>().map_err(|_| "invalid MIDI port")?;
+        let port_index = request
+            .port_id
+            .parse::<usize>()
+            .map_err(|_| "invalid MIDI port")?;
         let port = input
             .ports()
             .get(port_index)
             .cloned()
             .ok_or("MIDI port is unavailable")?;
-        let queue = Arc::clone(&self.midi_input);
-        let counter = Arc::clone(&self.midi_note_counter);
+        let callback_target = Arc::clone(&request.target_index);
+        let initial_track = callback_target.load(Ordering::Acquire);
         let mut note_ids = [[-1_i32; 8]; 128];
         let mut note_counts = [0_usize; 128];
+        let mut last_track = initial_track;
         let connection = input
             .connect(
                 &port,
@@ -1064,12 +1436,21 @@ impl NativeEngine {
                     if message.is_empty() {
                         return;
                     }
+                    let track = callback_target.load(Ordering::Acquire);
+                    if track == NO_MIDI_TRACK {
+                        return;
+                    }
+                    if track != last_track {
+                        note_ids = [[-1_i32; 8]; 128];
+                        note_counts = [0_usize; 128];
+                        last_track = track;
+                    }
                     let status = message[0] & 0xf0;
                     let pitch = message.get(1).copied().unwrap_or(0).min(127);
                     let value = message.get(2).copied().unwrap_or(0);
                     let kind = match status {
                         0x90 if value > 0 => {
-                            let id = counter.fetch_add(1, Ordering::Relaxed);
+                            let id = request.counter.fetch_add(1, Ordering::Relaxed);
                             let count = &mut note_counts[pitch as usize];
                             if *count < 8 {
                                 note_ids[pitch as usize][*count] = id;
@@ -1108,7 +1489,7 @@ impl NativeEngine {
                         }
                         _ => return,
                     };
-                    let _ = queue.push(LiveMidiMessage {
+                    let _ = request.queue.push(LiveMidiMessage {
                         track,
                         event: NoteEvent {
                             sample_offset: 0,
@@ -1119,14 +1500,58 @@ impl NativeEngine {
                 (),
             )
             .map_err(|error| error.to_string())?;
-        self.midi_connections.insert(port_id.to_owned(), connection);
-        self.midi_connection_targets
-            .insert(port_id.to_owned(), track_id.to_owned());
-        Ok(())
+        Ok(OpenedMidiInputRoute {
+            port_id: request.port_id,
+            route: MidiInputRoute {
+                _connection: connection,
+                target_track_id: request.target_track_id,
+                target_index: request.target_index,
+            },
+        })
     }
-    pub fn disconnect_midi_input(&mut self, port_id: &str) {
-        self.midi_connections.remove(port_id);
-        self.midi_connection_targets.remove(port_id);
+
+    pub fn install_midi_input(
+        &mut self,
+        opened: OpenedMidiInputRoute,
+    ) -> Option<DetachedMidiInputRoute> {
+        let current_target = self
+            .bindings
+            .tracks
+            .get(&opened.route.target_track_id)
+            .copied()
+            .unwrap_or(NO_MIDI_TRACK);
+        opened
+            .route
+            .target_index
+            .store(current_target, Ordering::Release);
+        if let Some(existing) = self.midi_routes.get_mut(&opened.port_id) {
+            existing.target_track_id = opened.route.target_track_id.clone();
+            existing
+                .target_index
+                .store(current_target, Ordering::Release);
+            return Some(DetachedMidiInputRoute(opened.route));
+        }
+        self.midi_routes.insert(opened.port_id, opened.route);
+        None
+    }
+
+    pub fn detach_midi_input(&mut self, port_id: &str) -> Option<DetachedMidiInputRoute> {
+        self.midi_routes.remove(port_id).map(DetachedMidiInputRoute)
+    }
+
+    pub fn release_midi_input(route: DetachedMidiInputRoute) {
+        drop(route.0);
+    }
+    fn refresh_midi_routes(&mut self) {
+        for route in self.midi_routes.values_mut() {
+            let target = self
+                .bindings
+                .tracks
+                .get(&route.target_track_id)
+                .copied()
+                .unwrap_or(NO_MIDI_TRACK);
+            route.target_index.store(target, Ordering::Release);
+        }
     }
     pub fn settings(&self) -> AudioSettings {
         self.settings.clone()
@@ -1319,6 +1744,57 @@ mod realtime_tests {
     };
     use std::{thread, time::Duration};
 
+    fn metronome_test_core() -> (AudioCore, Producer<AudioCommand>, Output<MeterFrame>) {
+        let (command_tx, command_rx) = RingBuffer::new(16);
+        let (retired_tx, _) = RingBuffer::new(1);
+        let (meter_tx, meter_rx) = triple_buffer(&MeterFrame::default());
+        let core = AudioCore::new(
+            command_rx,
+            retired_tx,
+            AudioGraph::empty(48_000),
+            meter_tx,
+            Arc::new(ArrayQueue::new(16)),
+        );
+        (core, command_tx, meter_rx)
+    }
+
+    #[test]
+    fn count_in_clicks_without_advancing_the_timeline() {
+        let (mut core, mut commands, mut meters) = metronome_test_core();
+        commands
+            .push(AudioCommand::SetMetronome(MetronomeSettings {
+                enabled: false,
+                gain: db_to_gain(-12.0),
+                bpm: 120.0,
+                numerator: 4,
+                denominator: 4,
+            }))
+            .expect("metronome settings should enqueue");
+        commands
+            .push(AudioCommand::SetPlaying {
+                playing: true,
+                count_in_bars: 1,
+            })
+            .expect("count-in should enqueue");
+
+        let mut output = vec![0.0; 512 * 2];
+        core.render(&mut output, 512);
+        meters.update();
+        let frame = *meters.output_buffer_mut();
+        assert_eq!(frame.position, 0, "count-in must hold the project clock");
+        assert_eq!(frame.count_in_beats_remaining, 4);
+        assert!(output.iter().any(|sample| sample.abs() > 0.001));
+
+        for _ in 0..188 {
+            core.render(&mut output, 512);
+        }
+        core.render(&mut output, 512);
+        meters.update();
+        let frame = *meters.output_buffer_mut();
+        assert!(frame.position > 0, "timeline must start after the count-in");
+        assert_eq!(frame.count_in_beats_remaining, 0);
+    }
+
     #[test]
     fn validates_supported_mp3_bitrates() {
         assert!(matches!(mp3_bitrate(128), Ok(Bitrate::Kbps128)));
@@ -1361,7 +1837,9 @@ mod realtime_tests {
     fn native_play_advances_the_audio_clock() {
         let mut engine = NativeEngine::default();
         engine.init().expect("default audio stream should open");
-        engine.play(Some(0.0)).expect("play command should enqueue");
+        engine
+            .play(Some(0.0), 0)
+            .expect("play command should enqueue");
         thread::sleep(Duration::from_millis(120));
         let snapshot = engine.poll();
         assert!(snapshot.stream.running);
@@ -1429,6 +1907,8 @@ mod realtime_tests {
                 },
                 transport: TransportSpec {
                     bpm: 120.0,
+                    tempo_points: Vec::new(),
+                    time_signatures: Vec::new(),
                     playhead_sec: 0.0,
                     is_playing: false,
                     loop_: LoopSpec {
@@ -1439,7 +1919,9 @@ mod realtime_tests {
                 },
             })
             .expect("test graph should enqueue");
-        engine.play(Some(0.0)).expect("play command should enqueue");
+        engine
+            .play(Some(0.0), 0)
+            .expect("play command should enqueue");
         thread::sleep(Duration::from_millis(2_200));
         let snapshot = engine.poll();
         assert!(snapshot.playing);

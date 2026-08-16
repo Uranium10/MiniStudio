@@ -4,6 +4,7 @@ import { RustEngine } from './rust/RustEngine'
 
 export type { IAudioEngine } from './IAudioEngine'
 export * from './types'
+export * from './tempoMap'
 export { describeEngineError } from './rust/RustEngine'
 
 export function createEngine(): IAudioEngine {

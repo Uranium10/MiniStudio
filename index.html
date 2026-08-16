@@ -9,7 +9,18 @@
     <title>MiniStudio</title>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="boot-shell" role="status" aria-label="MiniStudio 시작 중">
+        <div class="boot-mark">M</div>
+        <div><strong>MiniStudio</strong><span>오디오 작업 공간을 준비하고 있습니다</span></div>
+      </div>
+    </div>
+    <style>
+      html,body,#root{width:100%;height:100%;margin:0;background:#11171d;color:#dce8ef;font-family:Inter,"Segoe UI",sans-serif}
+      .boot-shell{height:100%;display:flex;align-items:center;justify-content:center;gap:12px;background:linear-gradient(145deg,#11171d,#16212a)}
+      .boot-mark{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;background:#52d4f5;color:#071118;font-weight:900;box-shadow:0 0 28px #52d4f533}
+      .boot-shell strong,.boot-shell span{display:block}.boot-shell strong{font-size:14px}.boot-shell span{margin-top:3px;color:#7793a3;font-size:10px;letter-spacing:.04em}
+    </style>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

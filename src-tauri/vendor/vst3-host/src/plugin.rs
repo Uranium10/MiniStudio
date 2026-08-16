@@ -901,6 +901,10 @@ pub(crate) trait PluginInternal: Send {
     fn has_editor(&self) -> bool;
     fn open_editor(&mut self, parent: *mut std::ffi::c_void) -> Result<()>;
     fn close_editor(&mut self) -> Result<()>;
+    fn take_editor_host_actions(&mut self) -> Vec<crate::process_isolation::EditorHostAction> {
+        Vec::new()
+    }
+    fn set_editor_host_state(&mut self, _state: crate::process_isolation::EditorHostState) {}
     fn get_editor_size(&self) -> Result<(i32, i32)>;
     /// Whether the editor accepts host-driven size changes.
     fn editor_can_resize(&self) -> bool {
@@ -2034,6 +2038,24 @@ impl Plugin {
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
             .close_editor()
+    }
+
+    /// Drain actions from MiniStudio's helper-owned native editor chrome. In-process editors
+    /// and hosts without custom chrome simply return an empty list.
+    pub fn take_editor_host_actions(
+        &mut self,
+    ) -> Vec<crate::process_isolation::EditorHostAction> {
+        self.internal
+            .as_mut()
+            .map(|internal| internal.take_editor_host_actions())
+            .unwrap_or_default()
+    }
+
+    /// Synchronize native host-chrome indicators with authoritative DAW state.
+    pub fn set_editor_host_state(&mut self, state: crate::process_isolation::EditorHostState) {
+        if let Some(internal) = self.internal.as_mut() {
+            internal.set_editor_host_state(state);
+        }
     }
 
     /// Get the preferred editor size

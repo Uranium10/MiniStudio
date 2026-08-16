@@ -50,6 +50,7 @@ export function useShortcuts(): void {
         case 'home': seekTo(engine, 0); break
         case 'loop': store.toggleLoop(); break
         case 'loopSelection': store.setLoopToSelection(); break
+        case 'metronome': store.setMetronomeEnabled(!store.metronomeEnabled); break
         case 'delete': deleteInContext(); break
         case 'split': splitSelectionAtPlayhead(); break
         case 'undo': store.undo(); break
@@ -113,7 +114,7 @@ function zoomHorizontal(factor: number): void {
 }
 
 type Command =
-  | 'play' | 'home' | 'loop' | 'loopSelection'
+  | 'play' | 'home' | 'loop' | 'loopSelection' | 'metronome'
   | 'delete' | 'split' | 'undo' | 'redo' | 'duplicate' | 'smartDuplicate' | 'selectAll' | 'copy' | 'cut' | 'paste' | 'muteClips'
   | 'transposeUp' | 'transposeDown' | 'quantize'
   | 'zoomIn' | 'zoomOut' | 'trackIn' | 'trackOut' | 'fit' | 'follow' | 'panel' | 'tab'
@@ -145,6 +146,7 @@ function keyToCommand(event: KeyboardEvent): Command | null {
   if (key === 'w') return 'zoomOut'
   if (key === 'e') return 'zoomIn'
   if (key === 'l') return event.shiftKey ? 'loopSelection' : 'loop'
+  if (key === 'c') return 'metronome'
   if (key === 's') return 'split'
   if (key === 'm') return 'muteClips'
   if (key === 'd') return 'smartDuplicate'

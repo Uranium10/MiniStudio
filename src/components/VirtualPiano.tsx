@@ -1,7 +1,7 @@
 // CapsLock-gated virtual piano that owns musical key input only while visible.
 import { ChevronDown, ChevronUp, Piano, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { MIDI_PPQ } from '../engine'
+import { TempoMap } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { useProjectStore } from '../store/projectStore'
 
@@ -159,26 +159,34 @@ export function VirtualPiano() {
 function recordNote(note: HeldNote, recordingTakeClip: React.MutableRefObject<string | null>): void {
   const store = useProjectStore.getState()
   const target = store.project.tracks.find((track) => track.id === note.trackId)
-  if (!store.recordingEnabled || !store.project.transport.isPlaying || !target?.armed) return
+  if (!store.recordingEnabled || !store.project.transport.isPlaying || store.countInActive || !target?.armed) return
   const endSec = Math.max(note.startSec + 0.01, store.playheadSec)
-  const bpm = store.project.transport.bpm
-  const barSec = 240 / bpm
+  const tempoMap = new TempoMap(store.project.transport.tempoMap)
+  const noteStartTick = tempoMap.secondsToTicks(note.startSec)
+  const noteBar = tempoMap.tickToBarBeat(noteStartTick).bar
+  const barStartTick = tempoMap.barStartTicks(noteBar)
+  const nextBarTick = tempoMap.barStartTicks(noteBar + 1)
+  const barStartSec = tempoMap.ticksToSeconds(barStartTick)
+  const barSec = Math.max(0.01, tempoMap.ticksToSeconds(nextBarTick) - barStartSec)
   let clip = store.overdubMode === 'new'
     ? target.midiClips.find((item) => item.id === recordingTakeClip.current)
     : target.midiClips.find((item) => note.startSec >= item.startSec && note.startSec < item.startSec + item.durationSec)
   if (!clip) {
-    const clipId = store.addMidiClip(note.trackId, Math.floor(note.startSec / barSec) * barSec, barSec * 4)
+    const fourBarsEndSec = tempoMap.ticksToSeconds(tempoMap.barStartTicks(noteBar + 4))
+    const clipId = store.addMidiClip(note.trackId, barStartSec, Math.max(barSec, fourBarsEndSec - barStartSec))
     recordingTakeClip.current = clipId
     clip = useProjectStore.getState().project.tracks.find((track) => track.id === note.trackId)?.midiClips.find((item) => item.id === clipId)
   }
   if (!clip) return
   const required = endSec - clip.startSec
   if (required > clip.durationSec) store.updateMidiClip(note.trackId, clip.id, { durationSec: required + barSec })
+  const clipStartTick = tempoMap.secondsToTicks(clip.startSec)
+  const noteEndTick = tempoMap.secondsToTicks(endSec)
   store.addMidiNote(note.trackId, clip.id, {
     pitch: note.pitch,
     velocity: note.velocity,
-    startTicks: Math.round((note.startSec - clip.startSec) * bpm / 60 * MIDI_PPQ),
-    lengthTicks: Math.max(1, Math.round((endSec - note.startSec) * bpm / 60 * MIDI_PPQ)),
+    startTicks: Math.max(0, noteStartTick - clipStartTick),
+    lengthTicks: Math.max(1, noteEndTick - noteStartTick),
     releaseVelocity: 64,
     muted: false,
   })

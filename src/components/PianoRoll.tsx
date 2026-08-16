@@ -1,14 +1,13 @@
 // Canvas piano roll sharing the arrangement tool system and realtime test-tone preview.
 import { Activity, ChevronDown, Drum, Eraser, Gauge, Magnet, Maximize2, Minimize2, MousePointer2, Pencil, Piano, Plus, Scissors, Volume2, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { GRID_OPTIONS, MIDI_PITCH_BEND_LANE, MIDI_PPQ, secondsPerBeat, type CcLane, type MidiNote } from '../engine'
+import { GRID_OPTIONS, MIDI_PITCH_BEND_LANE, MIDI_PPQ, TempoMap, type CcLane, type MidiNote } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { snapTicksWithSwing, useProjectStore } from '../store/projectStore'
 import { useToolStore, type ToolId } from '../store/toolStore'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { EditableNumber } from './controls'
 import { findVisibleNoteStart, pianoPitchAtClientY } from './pianoRollMath'
-import { buildRulerTicks } from './rulerMath'
 
 const GUTTER = 52
 const EVENT_LANE_HEIGHT = 74
@@ -51,8 +50,8 @@ export function PianoRoll() {
   const setGridTicks = useProjectStore((state) => state.setPianoGridTicks)
   const snapEnabled = useProjectStore((state) => state.pianoSnapEnabled)
   const quantizeSwing = useProjectStore((state) => state.pianoSwing)
-  const signature = useProjectStore((state) => state.project.transport.timeSignature)
-  const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
   const setQuantizeSwing = useProjectStore((state) => state.setPianoSwing)
   const pixelsPerQuarter = useProjectStore((state) => state.pianoRollZoom)
   const setPixelsPerQuarter = useProjectStore((state) => state.setPianoRollZoom)
@@ -93,25 +92,31 @@ export function PianoRoll() {
   const activeAuditions = useRef(new Map<number, { trackId: string; pitch: number; timer: number | null }>())
   const lastNoteLengthRef = useRef(gridTicks)
   const pixelsPerTick = pixelsPerQuarter / MIDI_PPQ
+  const clipStartTick = clip ? tempoMap.secondsToTicks(clip.startSec) : 0
   const maxTicks = useMemo(() => {
-    const barTicks = Math.max(1, Math.round(MIDI_PPQ * 4 * signature.numerator / signature.denominator))
     const contentEnd = Math.max(0, clip?.loopLengthTicks ?? 0, ...(clip?.notes.map((note) => note.startTicks + note.lengthTicks) ?? []), ...(clip?.ccLanes.flatMap((lane) => lane.points.map((point) => point.ticks)) ?? []))
-    const expanded = Math.ceil((contentEnd + barTicks * 4) / (barTicks * 4)) * barTicks * 4
-    return Math.max(barTicks * 172, expanded)
-  }, [clip?.ccLanes, clip?.loopLengthTicks, clip?.notes, signature.denominator, signature.numerator])
+    const contentBar = tempoMap.tickToBarBeat(clipStartTick + contentEnd).bar
+    const expanded = tempoMap.barStartTicks(contentBar + 5) - clipStartTick
+    const startBar = tempoMap.tickToBarBeat(clipStartTick).bar
+    const base = tempoMap.barStartTicks(startBar + 172) - clipStartTick
+    return Math.max(1, base, expanded)
+  }, [clip?.ccLanes, clip?.loopLengthTicks, clip?.notes, clipStartTick, tempoMap])
   const contentWidth = Math.max(1000, Math.ceil(maxTicks * pixelsPerTick))
   const contentHeight = 128 * noteHeight
-  const activeTicks = useMemo(() => Math.max(1, Math.round((clip?.durationSec ?? 0) / secondsPerBeat(bpm) * MIDI_PPQ)), [bpm, clip?.durationSec])
+  const activeTicks = useMemo(() => {
+    if (!clip) return 1
+    return Math.max(1, tempoMap.secondsToTicks(clip.startSec + clip.durationSec) - clipStartTick)
+  }, [clip, clipStartTick, tempoMap])
   const neighboringClips = useMemo<NeighborClipRange[]>(() => {
     if (!clip || !track) return []
-    const ticksPerSecond = MIDI_PPQ / secondsPerBeat(bpm)
+    const originTick = clipStartTick
     return track.midiClips.filter((item) => item.id !== clip.id).map((item) => ({
       id: item.id,
       name: item.name,
-      startTicks: Math.round((item.startSec - clip.startSec) * ticksPerSecond),
-      endTicks: Math.round((item.startSec + item.durationSec - clip.startSec) * ticksPerSecond),
+      startTicks: tempoMap.secondsToTicks(item.startSec) - originTick,
+      endTicks: tempoMap.secondsToTicks(item.startSec + item.durationSec) - originTick,
     })).filter((item) => item.endTicks > activeTicks && item.endTicks > 0)
-  }, [activeTicks, bpm, clip, track])
+  }, [activeTicks, clip, clipStartTick, tempoMap, track])
   const activeCc = eventLane === 'pitchBend' ? MIDI_PITCH_BEND_LANE : eventLane === 'sustain' ? 64 : eventLane === 'vibrato' ? 1 : genericCc
   const activeControllerLane = clip?.ccLanes.find((lane) => lane.cc === activeCc)
 
@@ -177,11 +182,11 @@ export function PianoRoll() {
   useEffect(() => {
     const scroll = scrollRef.current
     let frame = 0
-    const draw = () => drawGrid(backgroundRef.current, canvasWidth, contentHeight, noteHeight, pixelsPerTick, gridTicks, Math.round(MIDI_PPQ * 4 * signature.numerator / signature.denominator), scaleRoot, scaleName, scroll?.scrollLeft ?? 0, activeTicks, neighboringClips)
+    const draw = () => drawGrid(backgroundRef.current, canvasWidth, contentHeight, noteHeight, pixelsPerTick, gridTicks, tempoMap, clipStartTick, scaleRoot, scaleName, scroll?.scrollLeft ?? 0, activeTicks, neighboringClips)
     const schedule = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(draw) }
     scroll?.addEventListener('scroll', schedule, { passive: true }); schedule()
     return () => { cancelAnimationFrame(frame); scroll?.removeEventListener('scroll', schedule) }
-  }, [activeTicks, canvasWidth, contentHeight, gridTicks, neighboringClips, noteHeight, pixelsPerTick, scaleName, scaleRoot, signature.denominator, signature.numerator])
+  }, [activeTicks, canvasWidth, clipStartTick, contentHeight, gridTicks, neighboringClips, noteHeight, pixelsPerTick, scaleName, scaleRoot, tempoMap])
 
   useEffect(() => {
     if (!clip) return
@@ -202,7 +207,7 @@ export function PianoRoll() {
     let previousScroll = Number.NaN
     const animate = () => {
       const state = useProjectStore.getState()
-      const x = (state.playheadSec - clip.startSec) * state.project.transport.bpm / 60 * MIDI_PPQ * pixelsPerTick
+      const x = (tempoMap.secondsToTicks(state.playheadSec) - tempoMap.secondsToTicks(clip.startSec)) * pixelsPerTick
       const scrollLeft = scrollRef.current?.scrollLeft ?? 0
       if (x !== previousX || scrollLeft !== previousScroll || dragRef.current) {
         previousX = x
@@ -213,7 +218,7 @@ export function PianoRoll() {
     }
     frame = requestAnimationFrame(animate)
     return () => cancelAnimationFrame(frame)
-  }, [activeTicks, canvasWidth, clip, contentHeight, noteHeight, pixelsPerTick])
+  }, [activeTicks, canvasWidth, clip, contentHeight, noteHeight, pixelsPerTick, tempoMap])
 
   useEffect(() => {
     if (!clip) return
@@ -564,21 +569,45 @@ function PianoGutter({ height, noteHeight, mode, onNoteOn, onNoteOff, onSelectPi
 
 function PianoRuler({ clipStartSec, width, pixelsPerQuarter }: { clipStartSec: number; width: number; pixelsPerQuarter: number }) {
   const engine = useEngine()
-  const bpm = useProjectStore((state) => state.project.transport.bpm)
-  const signature = useProjectStore((state) => state.project.transport.timeSignature)
-  const pixelsPerSecond = pixelsPerQuarter * bpm / 60
-  const ticks = useMemo(() => buildRulerTicks(width, pixelsPerSecond, bpm, signature), [bpm, pixelsPerSecond, signature, width])
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
+  const clipStartTick = tempoMap.secondsToTicks(clipStartSec)
+  const ticks = useMemo(() => {
+    const result: Array<{ tick: number; label: string | null; strong: boolean }> = []
+    const endTick = clipStartTick + width / pixelsPerQuarter * MIDI_PPQ
+    let bar = tempoMap.tickToBarBeat(clipStartTick).bar
+    if (tempoMap.barStartTicks(bar) < clipStartTick) bar += 1
+    let lastLabelX = -54
+    for (; result.length < 4_000; bar += 1) {
+      const barTick = tempoMap.barStartTicks(bar)
+      if (barTick > endTick) break
+      const local = barTick - clipStartTick
+      const x = local / MIDI_PPQ * pixelsPerQuarter
+      const label = x - lastLabelX >= 54 ? String(bar) : null
+      if (label) lastLabelX = x
+      result.push({ tick: local, label, strong: true })
+      const signature = tempoMap.timeSignatureAtBar(bar)
+      const beatTicks = MIDI_PPQ * 4 / signature.denominator
+      if (beatTicks / MIDI_PPQ * pixelsPerQuarter < 18) continue
+      for (let beat = 1; beat < signature.numerator && result.length < 4_000; beat += 1) {
+        const tick = local + beat * beatTicks
+        if (clipStartTick + tick > endTick) break
+        result.push({ tick, label: null, strong: false })
+      }
+    }
+    return result
+  }, [clipStartTick, pixelsPerQuarter, tempoMap, width])
   return <div className="piano-ruler" style={{ width: GUTTER + width }} onPointerDown={(event) => {
-    const localSec = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left - GUTTER) / pixelsPerSecond)
-    const sec = clipStartSec + localSec
+    const localTick = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left - GUTTER) / pixelsPerQuarter * MIDI_PPQ)
+    const sec = tempoMap.ticksToSeconds(clipStartTick + localTick)
     useProjectStore.getState().setPlayhead(sec)
     void engine.seek(sec)
-  }}><span className="piano-ruler-corner" style={{ width: GUTTER }} />{ticks.map((tick) => <i key={tick.sec} className={tick.strong ? 'strong' : ''} style={{ left: GUTTER + tick.sec * pixelsPerSecond }}>{tick.label && <b>{tick.label}</b>}</i>)}</div>
+  }}><span className="piano-ruler-corner" style={{ width: GUTTER }} />{ticks.map((tick) => <i key={tick.tick} className={tick.strong ? 'strong' : ''} style={{ left: GUTTER + tick.tick / MIDI_PPQ * pixelsPerQuarter }}>{tick.label && <b>{tick.label}</b>}</i>)}</div>
 }
 
 function setupCanvas(canvas: HTMLCanvasElement | null, width: number, height: number) { if (!canvas) return null; const ratio = Math.min(window.devicePixelRatio || 1, 1.5); if (canvas.width !== Math.ceil(width * ratio) || canvas.height !== Math.ceil(height * ratio)) { canvas.width = Math.ceil(width * ratio); canvas.height = Math.ceil(height * ratio); canvas.style.width = `${width}px`; canvas.style.height = `${height}px` }; const context = canvas.getContext('2d'); context?.setTransform(ratio, 0, 0, ratio, 0, 0); return context }
 function positionPianoCanvas(canvas: HTMLCanvasElement | null, scrollLeft: number) { if (canvas) canvas.style.transform = `translate3d(${scrollLeft}px,0,0)` }
-function drawGrid(canvas: HTMLCanvasElement | null, width: number, height: number, rowHeight: number, ppt: number, grid: number, barTicks: number, root: number, scaleName: string, scrollLeft: number, activeTicks: number, neighbors: readonly NeighborClipRange[]) {
+function drawGrid(canvas: HTMLCanvasElement | null, width: number, height: number, rowHeight: number, ppt: number, grid: number, tempoMap: TempoMap, clipStartTick: number, root: number, scaleName: string, scrollLeft: number, activeTicks: number, neighbors: readonly NeighborClipRange[]) {
   const context = setupCanvas(canvas, width, height)
   if (!context) return
   positionPianoCanvas(canvas, scrollLeft)
@@ -595,7 +624,7 @@ function drawGrid(canvas: HTMLCanvasElement | null, width: number, height: numbe
   const endTick = (scrollLeft + width) / ppt + grid
   for (let tick = startTick; tick <= endTick; tick += grid) {
     const x = tick * ppt - scrollLeft
-    const onBar = tick % Math.max(1, barTicks) === 0
+    const onBar = Math.abs(tempoMap.tickToBarBeat(clipStartTick + tick).beat) < 1e-6
     context.strokeStyle = onBar ? '#52606b' : tick % MIDI_PPQ === 0 ? '#34414c' : '#26323c'
     context.lineWidth = onBar ? 1.5 : 1
     context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke()

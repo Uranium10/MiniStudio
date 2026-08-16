@@ -6,6 +6,17 @@ export type PluginEditorForegroundIntent = {
   targetId: string
 }
 
+export type PluginEditorGraphSyncPolicy = 'keep' | 'drop' | 'restore'
+
+/** Decide graph-sync behavior without touching native state. Ordinary
+ * standalone editors survive graph swaps and must never be reopened in the
+ * background; only pinned windows are restoration intent. */
+export function pluginEditorGraphSyncPolicy(hasPendingForeground: boolean, isPendingTarget: boolean, pinned: boolean): PluginEditorGraphSyncPolicy {
+  if (!hasPendingForeground) return pinned ? 'restore' : 'keep'
+  if (isPendingTarget) return 'keep'
+  return pinned ? 'restore' : 'drop'
+}
+
 /** Open immediately after the structural graph containing this target commits.
  * This avoids timer polling (80 -> 240 -> 640 ms), which made a fast plug-in
  * wait longer than its own editor initialization. */

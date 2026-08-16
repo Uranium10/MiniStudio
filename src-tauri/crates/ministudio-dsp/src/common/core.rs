@@ -60,6 +60,8 @@ pub trait DspEffect: Send {
         self.process(events, buffer, frames)
     }
     fn set_param(&mut self, id: &str, value: f32);
+    /// Musical tempo at the start of the current processing segment.
+    fn set_tempo(&mut self, _bpm: f64) {}
     fn set_bypassed(&mut self, bypassed: bool);
     fn reset(&mut self);
     fn tail_samples(&self) -> usize {

@@ -14,7 +14,8 @@ export const commands = {
 	engineUnloadAsset: (assetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_unload_asset", { assetId })),
 	engineAssetPeaks: (assetId: string, lod: number) => typedError<(number | null)[], EngineError>(__TAURI_INVOKE("engine_asset_peaks", { assetId, lod })),
 	engineSyncGraph: (snapshot: GraphSnapshot) => typedError<null, EngineError>(__TAURI_INVOKE("engine_sync_graph", { snapshot })),
-	enginePlay: (fromSec: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_play", { fromSec })),
+	enginePlay: (fromSec: number | null, countInBars: number) => typedError<null, EngineError>(__TAURI_INVOKE("engine_play", { fromSec, countInBars })),
+	engineSetMetronome: (enabled: boolean, gainDb: number | null, bpm: number | null, numerator: number, denominator: number) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_metronome", { enabled, gainDb, bpm, numerator, denominator })),
 	enginePause: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_pause")),
 	engineStop: () => typedError<null, EngineError>(__TAURI_INVOKE("engine_stop")),
 	engineSeek: (sec: number | null) => typedError<null, EngineError>(__TAURI_INVOKE("engine_seek", { sec })),
@@ -43,6 +44,8 @@ export const commands = {
 	engineEqResponse: (effectId: string, points: number) => typedError<EqFrequencyResponse, EngineError>(__TAURI_INVOKE("engine_eq_response", { effectId, points })),
 	engineOpenPluginEditor: (targetKind: string, targetId: string, foreground: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_open_plugin_editor", { targetKind, targetId, foreground })),
 	engineClosePluginEditor: (targetKind: string, targetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_close_plugin_editor", { targetKind, targetId })),
+	engineTakePluginEditorActions: (targetId: string) => typedError<string[], EngineError>(__TAURI_INVOKE("engine_take_plugin_editor_actions", { targetId })),
+	engineSetPluginEditorHostState: (targetId: string, bypassed: boolean, automation: number) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_host_state", { targetId, bypassed, automation })),
 	enginePluginEditorIsOpen: (targetKind: string, targetId: string) => typedError<boolean, EngineError>(__TAURI_INVOKE("engine_plugin_editor_is_open", { targetKind, targetId })),
 	engineSetPluginEditorPinned: (targetId: string, pinned: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_pinned", { targetId, pinned })),
 	engineSavePluginState: (targetKind: string, targetId: string) => typedError<number[], EngineError>(__TAURI_INVOKE("engine_save_plugin_state", { targetKind, targetId })),
@@ -347,6 +350,27 @@ export type StreamStatus = {
 	running: boolean,
 	error: string | null,
 	pdcSamples: number,
+	/**  Smoothed audio-callback time divided by its realtime buffer budget. */
+	cpuLoadPercent: number | null,
+	/**  Short peak hold for spotting transient overloads that the average hides. */
+	cpuPeakPercent: number | null,
+	/**  Zero outside pre-count; otherwise the number of musical beats still to count. */
+	countInBeatsRemaining: number,
+};
+
+export type TempoCurveSpec = "jump" | "linear";
+
+export type TempoPointSpec = {
+	tick: number,
+	bpm: number | null,
+	curve?: TempoCurveSpec,
+};
+
+export type TimeSignaturePointSpec = {
+	/**  One-based bar number. Signature changes are therefore always bar-aligned. */
+	bar: number,
+	numerator: number,
+	denominator: number,
 };
 
 export type TrackSpec = {
@@ -367,6 +391,8 @@ export type TrackSpec = {
 
 export type TransportSpec = {
 	bpm: number | null,
+	tempoPoints?: TempoPointSpec[],
+	timeSignatures?: TimeSignaturePointSpec[],
 	playheadSec: number | null,
 	isPlaying: boolean,
 	loop: LoopSpec,

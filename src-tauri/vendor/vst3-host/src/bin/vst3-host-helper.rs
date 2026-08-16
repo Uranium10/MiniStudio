@@ -657,6 +657,12 @@ fn handle(
         }),
         HostCommand::CreateGui => gui_request(gui, true),
         HostCommand::CloseGui => gui_request(gui, false),
+        HostCommand::TakeEditorHostActions => HostResponse::EditorHostActions {
+            actions: Vec::new(),
+        },
+        HostCommand::SetEditorHostState { .. } => HostResponse::Success {
+            message: "editor host state accepted".to_string(),
+        },
         HostCommand::AttachRealtime { .. } | HostCommand::DetachRealtime => HostResponse::Error {
             message: "shared-memory realtime transport is unavailable on this platform".to_string(),
         },
@@ -753,6 +759,7 @@ mod windows {
 
         let mut sample_rate = 44_100.0;
         let mut editor: Option<vst3_host::PluginWindow> = None;
+        let mut pending_editor_actions = Vec::new();
         let mut realtime: Option<vst3_host::realtime_ipc::RealtimeServer> = None;
         loop {
             match command_rx.recv_timeout(std::time::Duration::from_millis(4)) {
@@ -765,6 +772,26 @@ mod windows {
                             }
                             HostResponse::Success {
                                 message: "editor closed".to_string(),
+                            }
+                        }
+                        HostCommand::TakeEditorHostActions => {
+                            let mut actions = std::mem::take(&mut pending_editor_actions);
+                            actions.extend(
+                                editor
+                                    .as_ref()
+                                    .map(vst3_host::PluginWindow::take_host_actions)
+                                    .unwrap_or_default(),
+                            );
+                            HostResponse::EditorHostActions {
+                                actions,
+                            }
+                        }
+                        HostCommand::SetEditorHostState { state } => {
+                            if let Some(window) = editor.as_ref() {
+                                window.set_host_state(state);
+                            }
+                            HostResponse::Success {
+                                message: "editor host state updated".to_string(),
                             }
                         }
                         HostCommand::AttachRealtime { descriptor } => {
@@ -816,6 +843,10 @@ mod windows {
             if let Some(window) = editor.as_mut() {
                 let _ = window.service_platform_events();
                 if window.closed_by_user() {
+                    pending_editor_actions.extend(window.take_host_actions());
+                    pending_editor_actions.push(
+                        vst3_host::process_isolation::EditorHostAction::Closed,
+                    );
                     window.close();
                     editor = None;
                 }

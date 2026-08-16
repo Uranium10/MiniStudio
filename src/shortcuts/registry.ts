@@ -1,6 +1,6 @@
 // Declarative keyboard shortcut registry for display and dispatch.
 export type ShortcutId =
-  | 'transport.toggle' | 'transport.home' | 'transport.loop' | 'transport.loopSelection'
+  | 'transport.toggle' | 'transport.home' | 'transport.loop' | 'transport.loopSelection' | 'transport.metronome'
   | 'edit.delete' | 'edit.split' | 'edit.undo' | 'edit.redo' | 'edit.duplicate' | 'edit.selectAll'
   | 'edit.copy' | 'edit.cut' | 'edit.paste' | 'edit.mute' | 'edit.quantize'
   | 'file.new' | 'file.save' | 'file.open' | 'file.export'
@@ -18,6 +18,7 @@ export const shortcutGroups: ReadonlyArray<{ title: string; items: readonly Shor
       { id: 'transport.home', label: '처음으로', keys: 'Enter / B' },
       { id: 'transport.loop', label: '루프 켜기 / 끄기', keys: 'L' },
       { id: 'transport.loopSelection', label: '선택 영역을 루프로', keys: 'Shift+L' },
+      { id: 'transport.metronome', label: '메트로놈 켜기 / 끄기', keys: 'C' },
     ],
   },
   {

@@ -21,7 +21,7 @@ use clack_host::{
 use ministudio_contracts::{EffectSpec, InstrumentSpec};
 use ministudio_dsp::{
     AudioBuffer, DspEffect, EmbeddedPluginEditor, Instrument, NoteEvent, NoteEventKind,
-    PluginControl, MAX_BLOCK_SIZE, MAX_CHANNELS,
+    PluginControl, PluginEditorAction, PluginEditorState, MAX_BLOCK_SIZE, MAX_CHANNELS,
 };
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 use serde::{Deserialize, Serialize};
@@ -529,6 +529,11 @@ enum Vst3ControlCommand {
     Close(Sender<Result<(), String>>),
     SaveState(Sender<Result<Vec<u8>, String>>),
     LoadState(Vec<u8>, Sender<Result<(), String>>),
+    TakeEditorActions(Sender<Vec<PluginEditorAction>>),
+    SetEditorState(PluginEditorState),
+    /// Resource hint only - see `PluginControl::set_idle`. Fire-and-forget, like
+    /// `CloseEmbedded`: nothing downstream needs to know it landed.
+    SetIdle(bool),
     Shutdown,
 }
 
@@ -746,6 +751,29 @@ impl PluginControl for Vst3Control {
     fn load_state(&self, state: Vec<u8>) -> Result<(), String> {
         self.request(|reply| Vst3ControlCommand::LoadState(state, reply))
     }
+    fn take_editor_actions(&self) -> Vec<PluginEditorAction> {
+        let (reply, receive) = channel();
+        if self
+            .sender
+            .send(Vst3ControlCommand::TakeEditorActions(reply))
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let actions = receive
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .unwrap_or_default();
+        if actions.contains(&PluginEditorAction::Closed) {
+            self.editor_open.store(false, Ordering::Release);
+        }
+        actions
+    }
+    fn set_editor_state(&self, state: PluginEditorState) {
+        let _ = self.sender.send(Vst3ControlCommand::SetEditorState(state));
+    }
+    fn set_idle(&self, idle: bool) {
+        let _ = self.sender.send(Vst3ControlCommand::SetIdle(idle));
+    }
 }
 
 impl Drop for Vst3Control {
@@ -852,6 +880,14 @@ fn run_vst3_control(
                     .take();
                 editor_open.store(window.is_open(), Ordering::Release);
             }
+            Ok(Vst3ControlCommand::SetIdle(_idle)) => {
+                // A realtime-isolated helper is still servicing the shared-memory audio
+                // deadline while its track happens to be silent. Emptying that process's
+                // working set here produces page-fault stalls, latches a transport timeout,
+                // and makes auto-recovery shut down and respawn the helper in a loop. Keep
+                // the control-plane hint as the future P1 scheduler seam, but do not reclaim
+                // pages until the graph can actually suspend this node after its tail ends.
+            }
             Ok(Vst3ControlCommand::Close(reply)) => {
                 embedded.take();
                 pending_editor_rect
@@ -897,6 +933,90 @@ fn run_vst3_control(
                         .unwrap_or_else(|poison| poison.into_inner()) = checkpoint;
                 }
                 let _ = reply.send(result);
+            }
+            Ok(Vst3ControlCommand::TakeEditorActions(reply)) => {
+                let actions = if isolated {
+                    plugin
+                        .try_lock()
+                        .map(|mut plugin| {
+                            plugin
+                                .take_editor_host_actions()
+                                .into_iter()
+                                .map(|action| match action {
+                                    vst3_host::process_isolation::EditorHostAction::Closed => PluginEditorAction::Closed,
+                                    vst3_host::process_isolation::EditorHostAction::TogglePower => PluginEditorAction::TogglePower,
+                                    vst3_host::process_isolation::EditorHostAction::TogglePin => PluginEditorAction::TogglePin,
+                                    vst3_host::process_isolation::EditorHostAction::ToggleBypass => PluginEditorAction::ToggleBypass,
+                                    vst3_host::process_isolation::EditorHostAction::SavePreset => PluginEditorAction::SavePreset,
+                                    vst3_host::process_isolation::EditorHostAction::LoadPreset => PluginEditorAction::LoadPreset,
+                                    vst3_host::process_isolation::EditorHostAction::ShowSidechain => PluginEditorAction::ShowSidechain,
+                                    vst3_host::process_isolation::EditorHostAction::AutomationOff => PluginEditorAction::AutomationOff,
+                                    vst3_host::process_isolation::EditorHostAction::AutomationWrite => PluginEditorAction::AutomationWrite,
+                                    vst3_host::process_isolation::EditorHostAction::AutomationRead => PluginEditorAction::AutomationRead,
+                                    vst3_host::process_isolation::EditorHostAction::AutomationLatch => PluginEditorAction::AutomationLatch,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    window
+                        .take_host_actions()
+                        .into_iter()
+                        .map(|action| match action {
+                            vst3_host::process_isolation::EditorHostAction::Closed => {
+                                PluginEditorAction::Closed
+                            }
+                            vst3_host::process_isolation::EditorHostAction::TogglePower => {
+                                PluginEditorAction::TogglePower
+                            }
+                            vst3_host::process_isolation::EditorHostAction::TogglePin => {
+                                PluginEditorAction::TogglePin
+                            }
+                            vst3_host::process_isolation::EditorHostAction::ToggleBypass => {
+                                PluginEditorAction::ToggleBypass
+                            }
+                            vst3_host::process_isolation::EditorHostAction::SavePreset => {
+                                PluginEditorAction::SavePreset
+                            }
+                            vst3_host::process_isolation::EditorHostAction::LoadPreset => {
+                                PluginEditorAction::LoadPreset
+                            }
+                            vst3_host::process_isolation::EditorHostAction::ShowSidechain => {
+                                PluginEditorAction::ShowSidechain
+                            }
+                            vst3_host::process_isolation::EditorHostAction::AutomationOff => {
+                                PluginEditorAction::AutomationOff
+                            }
+                            vst3_host::process_isolation::EditorHostAction::AutomationWrite => {
+                                PluginEditorAction::AutomationWrite
+                            }
+                            vst3_host::process_isolation::EditorHostAction::AutomationRead => {
+                                PluginEditorAction::AutomationRead
+                            }
+                            vst3_host::process_isolation::EditorHostAction::AutomationLatch => {
+                                PluginEditorAction::AutomationLatch
+                            }
+                        })
+                        .collect()
+                };
+                let _ = reply.send(actions);
+            }
+            Ok(Vst3ControlCommand::SetEditorState(state)) => {
+                if isolated {
+                    if let Ok(mut plugin) = plugin.try_lock() {
+                        plugin.set_editor_host_state(
+                            vst3_host::process_isolation::EditorHostState {
+                                bypassed: state.bypassed,
+                                automation: state.automation.min(3),
+                            },
+                        );
+                    }
+                } else {
+                    window.set_host_state(vst3_host::process_isolation::EditorHostState {
+                        bypassed: state.bypassed,
+                        automation: state.automation.min(3),
+                    });
+                }
             }
             Ok(Vst3ControlCommand::Shutdown)
             | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1104,6 +1224,11 @@ impl DspEffect for Vst3Effect {
             }
         }
     }
+    fn set_tempo(&mut self, bpm: f64) {
+        if let Ok(mut plugin) = self.plugin.try_lock() {
+            let _ = plugin.set_tempo(bpm);
+        }
+    }
     fn set_bypassed(&mut self, bypassed: bool) {
         self.bypassed = bypassed;
     }
@@ -1305,6 +1430,11 @@ impl Instrument for Vst3Instrument {
             }
         }
     }
+    fn set_tempo(&mut self, bpm: f64) {
+        if let Ok(mut plugin) = self.plugin.try_lock() {
+            let _ = plugin.set_tempo(bpm);
+        }
+    }
     fn reset(&mut self) {
         self.active_notes.clear();
         if let Ok(mut plugin) = self.plugin.try_lock() {
@@ -1467,6 +1597,11 @@ mod isolated_realtime_hardware_tests {
             "96 realtime blocks took {elapsed:?}"
         );
         eprintln!("shared-memory Serum: 96x256 frames in {elapsed:?}, rms={rms:.6}");
+        plugin
+            .open_isolated_editor()
+            .expect("open Serum in the custom host window");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        plugin.close_editor().expect("close Serum editor");
         plugin.stop_processing().expect("stop Serum");
     }
 
@@ -1551,6 +1686,62 @@ mod isolated_realtime_hardware_tests {
     #[test]
     #[ignore = "requires the built MiniStudio executable and locally installed BBC SO VST3"]
     fn isolated_shared_memory_bbc_editor_opens_and_closes() {
+        use winapi::{
+            shared::{
+                minwindef::{BOOL, FALSE, LPARAM, TRUE},
+                windef::HWND,
+            },
+            um::winuser::{
+                EnumWindows, GetClientRect, GetDpiForWindow, GetWindow, GetWindowLongPtrW,
+                GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+                PostMessageW, ShowWindow, GWL_STYLE, GW_CHILD, SW_RESTORE, WM_LBUTTONUP,
+                WS_CAPTION,
+            },
+        };
+
+        struct WindowSearch {
+            pid: u32,
+            hwnd: HWND,
+        }
+        unsafe extern "system" fn find_helper_window(hwnd: HWND, context: LPARAM) -> BOOL {
+            let search = &mut *(context as *mut WindowSearch);
+            let mut pid = 0_u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == search.pid && IsWindowVisible(hwnd) != 0 {
+                search.hwnd = hwnd;
+                FALSE
+            } else {
+                TRUE
+            }
+        }
+        fn helper_window(pid: u32) -> HWND {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let mut search = WindowSearch {
+                    pid,
+                    hwnd: std::ptr::null_mut(),
+                };
+                unsafe {
+                    EnumWindows(
+                        Some(find_helper_window),
+                        (&mut search as *mut WindowSearch) as LPARAM,
+                    );
+                }
+                if !search.hwnd.is_null() {
+                    return search.hwnd;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "helper editor window did not appear"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        fn click(hwnd: HWND, x: i32, y: i32) {
+            let packed = (u32::from(x as u16) | (u32::from(y as u16) << 16)) as LPARAM;
+            unsafe { PostMessageW(hwnd, WM_LBUTTONUP, 0, packed) };
+        }
+
         let executable = PathBuf::from(
             std::env::var_os("MINISTUDIO_SELF_HOST_EXE")
                 .expect("MINISTUDIO_SELF_HOST_EXE must point to ministudio.exe"),
@@ -1576,7 +1767,51 @@ mod isolated_realtime_hardware_tests {
             .open_isolated_editor()
             .expect("open BBC helper-owned editor");
         assert_eq!(plugin.get_editor_size().expect("editor size"), (1083, 917));
-        std::thread::sleep(std::time::Duration::from_millis(800));
+        let hwnd = helper_window(plugin.isolation_pid().expect("helper pid"));
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+            assert_eq!(style & WS_CAPTION, 0, "system caption must stay hidden");
+            let child = GetWindow(hwnd, GW_CHILD);
+            assert!(
+                !child.is_null(),
+                "plug-in editor must have a host-owned child container"
+            );
+            let mut outer = std::mem::zeroed();
+            let mut inner = std::mem::zeroed();
+            assert_ne!(GetWindowRect(hwnd, &mut outer), 0);
+            assert_ne!(GetWindowRect(child, &mut inner), 0);
+            assert!(
+                inner.top > outer.top,
+                "custom chrome must sit above the plug-in pixels"
+            );
+
+            let mut client = std::mem::zeroed();
+            assert_ne!(GetClientRect(hwnd, &mut client), 0);
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let chrome = (64 * dpi as i32 + 48) / 96;
+            let button = (42 * dpi as i32 + 48) / 96;
+            click(hwnd, client.right - button - button / 2, chrome / 2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while IsIconic(hwnd) == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_ne!(
+                IsIconic(hwnd),
+                0,
+                "custom minimize button must minimize the host"
+            );
+            ShowWindow(hwnd, SW_RESTORE);
+            click(hwnd, client.right - button / 2, chrome / 2);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while IsWindow(hwnd) != 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                IsWindow(hwnd),
+                0,
+                "custom close button must tear the editor down"
+            );
+        }
         plugin.close_editor().expect("close BBC editor");
         plugin.stop_processing().expect("stop BBC");
     }

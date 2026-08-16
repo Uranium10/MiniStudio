@@ -8,9 +8,19 @@ const store = () => useProjectStore.getState()
 export async function togglePlayback(engine: IAudioEngine): Promise<void> {
   const state = store()
   try {
-    if (state.project.transport.isPlaying) { await engine.pause(); state.setPlaying(false) }
-    else { await engine.play(state.playheadSec); state.setPlaying(true) }
+    if (state.project.transport.isPlaying) {
+      await engine.pause()
+      state.setPlaying(false)
+      state.setCountInActive(false)
+    } else {
+      const signature = state.project.transport.timeSignature
+      await engine.setMetronome(state.metronomeEnabled, state.metronomeVolumeDb, state.project.transport.bpm, signature.numerator, signature.denominator)
+      state.setCountInActive(state.countInBars > 0)
+      await engine.play(state.playheadSec, state.countInBars)
+      state.setPlaying(true)
+    }
   } catch (error) {
+    state.setCountInActive(false)
     state.showToast(`재생 장치를 시작할 수 없습니다: ${describeEngineError(error)}`)
   }
 }
@@ -18,6 +28,7 @@ export async function togglePlayback(engine: IAudioEngine): Promise<void> {
 export function stopPlayback(engine: IAudioEngine): void {
   void engine.stop()
   store().setPlaying(false)
+  store().setCountInActive(false)
   store().setPlayhead(0)
 }
 
@@ -155,5 +166,5 @@ export function quantizeInContext(): void {
     return
   }
   const selected = new Set(state.selectedClipIds)
-  for (const track of state.project.tracks) for (const clip of [...track.clips, ...track.midiClips]) if (selected.has(clip.id)) state.updateClip(track.id, clip.id, { startSec: snapTimeWithSwing(clip.startSec, state.gridTicks, state.project.transport.bpm, state.arrangementSwing) })
+  for (const track of state.project.tracks) for (const clip of [...track.clips, ...track.midiClips]) if (selected.has(clip.id)) state.updateClip(track.id, clip.id, { startSec: snapTimeWithSwing(clip.startSec, state.gridTicks, state.project.transport.bpm, state.arrangementSwing, state.project.transport.tempoMap) })
 }

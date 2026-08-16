@@ -9,9 +9,10 @@ use cpal::{
     BufferSize, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig, I24,
 };
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
+use std::time::Instant;
 
 pub fn list_backends() -> Vec<AudioBackendInfo> {
     let mut backends = vec![AudioBackendInfo {
@@ -94,6 +95,8 @@ pub fn open_stream(
     core: AudioCore,
     xruns: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    cpu_load: Arc<AtomicU32>,
+    cpu_peak: Arc<AtomicU32>,
 ) -> Result<Stream, String> {
     let host = host_for(&settings.backend_id)?;
     let device = if settings.device_id == "default" {
@@ -156,17 +159,39 @@ pub fn open_stream(
         buffer_size,
     };
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => build::<f32>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::F64 => build::<f64>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::I8 => build::<i8>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::I16 => build::<i16>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::I24 => build::<I24>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::I32 => build::<i32>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::I64 => build::<i64>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::U8 => build::<u8>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::U16 => build::<u16>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::U32 => build::<u32>(&device, &config, channels, core, xruns, failed)?,
-        SampleFormat::U64 => build::<u64>(&device, &config, channels, core, xruns, failed)?,
+        SampleFormat::F32 => build::<f32>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::F64 => build::<f64>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::I8 => build::<i8>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::I16 => build::<i16>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::I24 => build::<I24>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::I32 => build::<i32>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::I64 => build::<i64>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::U8 => build::<u8>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::U16 => build::<u16>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::U32 => build::<u32>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
+        SampleFormat::U64 => build::<u64>(
+            &device, &config, channels, core, xruns, failed, cpu_load, cpu_peak,
+        )?,
         other => return Err(format!("unsupported output sample format: {other:?}")),
     };
     stream
@@ -238,6 +263,8 @@ fn build<T>(
     mut audio_core: AudioCore,
     xruns: Arc<AtomicU64>,
     failed: Arc<AtomicBool>,
+    cpu_load: Arc<AtomicU32>,
+    cpu_peak: Arc<AtomicU32>,
 ) -> Result<Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -245,7 +272,11 @@ where
 {
     let mut scratch = vec![0.0_f32; MAX_BLOCK_SIZE * 2];
     let channel_count = channels as usize;
+    let sample_rate = config.sample_rate.0.max(1) as f64;
     let mut configured = false;
+    let mut load_ema = 0.0_f32;
+    let mut peak_hold = 0.0_f32;
+    let mut peak_hold_blocks = 0_u32;
     device
         .build_output_stream(
             config,
@@ -255,6 +286,7 @@ where
                     configured = true
                 }
                 for slice in data.chunks_mut(MAX_BLOCK_SIZE * channel_count) {
+                    let started = Instant::now();
                     let frames = slice.len() / channel_count;
                     let stereo = &mut scratch[..frames * 2];
                     audio_core.render(stereo, frames);
@@ -271,6 +303,24 @@ where
                             *value = T::from_sample(0.0)
                         }
                     }
+                    let budget = frames as f64 / sample_rate;
+                    let load = if budget > 0.0 {
+                        (started.elapsed().as_secs_f64() / budget).clamp(0.0, 8.0) as f32
+                    } else {
+                        0.0
+                    };
+                    let coefficient = if load > load_ema { 0.32 } else { 0.075 };
+                    load_ema += (load - load_ema) * coefficient;
+                    if load >= peak_hold {
+                        peak_hold = load;
+                        peak_hold_blocks = 90;
+                    } else if peak_hold_blocks > 0 {
+                        peak_hold_blocks -= 1;
+                    } else {
+                        peak_hold += (load - peak_hold) * 0.025;
+                    }
+                    cpu_load.store(load_ema.to_bits(), Ordering::Relaxed);
+                    cpu_peak.store(peak_hold.max(load_ema).to_bits(), Ordering::Relaxed);
                 }
             },
             move |_| {
@@ -326,6 +376,8 @@ mod tests {
             AudioCore::placeholder(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            Arc::new(AtomicU32::new(0.0_f32.to_bits())),
         );
         assert!(result.is_ok(), "default stream failed: {:?}", result.err());
     }

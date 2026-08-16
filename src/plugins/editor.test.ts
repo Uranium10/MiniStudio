@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { IAudioEngine } from '../engine'
-import { openPluginEditorWhenReady, PLUGIN_EDITOR_FOREGROUND_PENDING, type PluginEditorForegroundIntent } from './editor'
+import { openPluginEditorWhenReady, PLUGIN_EDITOR_FOREGROUND_PENDING, pluginEditorGraphSyncPolicy, type PluginEditorForegroundIntent } from './editor'
 
 function installTestWindow(): EventTarget {
   const target = new EventTarget() as EventTarget & Pick<Window, 'setTimeout' | 'clearTimeout'>
@@ -58,5 +58,18 @@ describe('openPluginEditorWhenReady', () => {
     await Promise.resolve()
     expect(openPluginEditor).toHaveBeenCalledOnce()
     expect(openPluginEditor).toHaveBeenCalledWith('instrument', 'track-bbc', true)
+  })
+})
+
+describe('pluginEditorGraphSyncPolicy', () => {
+  it('never resurrects an ordinary editor during background graph sync', () => {
+    expect(pluginEditorGraphSyncPolicy(false, false, false)).toBe('keep')
+    expect(pluginEditorGraphSyncPolicy(false, false, true)).toBe('restore')
+  })
+
+  it('lets foreground intent replace only unpinned competing editors', () => {
+    expect(pluginEditorGraphSyncPolicy(true, true, false)).toBe('keep')
+    expect(pluginEditorGraphSyncPolicy(true, false, false)).toBe('drop')
+    expect(pluginEditorGraphSyncPolicy(true, false, true)).toBe('restore')
   })
 })

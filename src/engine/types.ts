@@ -49,11 +49,19 @@ export type AudioAssetInfo = {
   peaks: Float32Array
 }
 
+/** Stable editable-source identity between arrangement clips and decoded assets. */
+export type AudioSourceRef = {
+  id: string
+  assetId: string
+  name: string
+  modificationId: string | null
+}
+
 export type ClipGainPoint = { id: string; timeSec: number; valueDb: number; /** Outgoing segment bend, -1…1. */ curve?: number }
 
 export type Clip = {
   id: string
-  assetId: string
+  audioSourceRefId: string
   name?: string
   startSec: number
   offsetSec: number
@@ -172,20 +180,27 @@ export type MasterStrip = {
 }
 
 export type TimeSignature = { numerator: number; denominator: number }
+export type TempoCurve = 'jump' | 'linear'
+export type TempoPoint = { tick: number; bpm: number; curve: TempoCurve }
+export type TimeSignaturePoint = { bar: number; numerator: number; denominator: number }
+export type TempoMapData = { tempoPoints: TempoPoint[]; timeSignatures: TimeSignaturePoint[] }
 
 export type Transport = {
+  /** Compatibility readout. Kept equal to the first tempo point. */
   bpm: number
   timeSignature: TimeSignature
+  tempoMap: TempoMapData
   playheadSec: number
   isPlaying: boolean
   loop: { enabled: boolean; startSec: number; endSec: number }
 }
 
 export type ProjectState = {
-  formatVersion: 2
+  formatVersion: 3
   meta: { name: string; sampleRate: number; createdAt: string }
   transport: Transport
   assets: Record<string, AudioAssetInfo>
+  audioSourceRefs: Record<string, AudioSourceRef>
   tracks: Track[]
   buses: Bus[]
   master: MasterStrip
@@ -239,7 +254,7 @@ export function gridLabel(ticks: number): string {
   return GRID_OPTIONS.find((option) => option.ticks === ticks)?.label ?? `${ticks}t`
 }
 
-export type GraphSnapshot = Pick<ProjectState, 'tracks' | 'buses' | 'master' | 'transport'>
+export type GraphSnapshot = Pick<ProjectState, 'tracks' | 'buses' | 'master' | 'transport' | 'audioSourceRefs'>
 
 export type PluginDescriptor = {
   format: PluginFormat
@@ -295,7 +310,7 @@ export type AudioDeviceInfo = {
 }
 export type AudioSettings = { backendId: string; deviceId: string; sampleRate: number; bufferSize: number }
 export type MidiInputPortInfo = { id: string; name: string; connected: boolean; targetTrackId?: string | null }
-export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number }
+export type StreamStatus = { latencyMs: number; xruns: number; running: boolean; error?: string; pdcSamples: number; cpuLoadPercent: number; cpuPeakPercent: number; countInBeatsRemaining: number }
 export type EqFrequencyResponse = { frequencies: number[]; combinedDb: number[]; bandsDb: number[][] }
 export type ExportProgress = { stage: string; renderedFrames: number; totalFrames: number; fraction: number }
 export type ExportSettings = { format: 'wav' | 'mp3'; sampleRate: number; bitDepth: 16 | 24 | 32; mp3BitrateKbps: 128 | 192 | 256 | 320; normalize: boolean }

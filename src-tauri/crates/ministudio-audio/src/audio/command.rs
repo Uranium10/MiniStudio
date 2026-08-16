@@ -13,8 +13,20 @@ pub struct EffectRef {
     pub owner: usize,
     pub effect: usize,
 }
+#[derive(Clone, Copy)]
+pub struct MetronomeSettings {
+    pub enabled: bool,
+    pub gain: f32,
+    pub bpm: f64,
+    pub numerator: u8,
+    pub denominator: u8,
+}
 pub enum AudioCommand {
-    SetPlaying(bool),
+    SetPlaying {
+        playing: bool,
+        count_in_bars: u8,
+    },
+    SetMetronome(MetronomeSettings),
     SeekTo(u64),
     Stop,
     SetTrackGain {

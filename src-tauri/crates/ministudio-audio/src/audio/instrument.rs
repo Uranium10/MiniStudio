@@ -6,31 +6,8 @@ use super::{
 };
 use std::{f32::consts::PI, ops::Range};
 
-pub const MIDI_PPQ: u64 = 960;
+pub use super::tempo::{TempoMap, MIDI_PPQ};
 pub const MAX_VOICES: usize = 32;
-
-#[derive(Clone, Copy, Debug)]
-pub struct TempoMap {
-    bpm: f64,
-    sample_rate: u32,
-}
-impl TempoMap {
-    pub fn new(bpm: f64, sample_rate: u32) -> Self {
-        Self {
-            bpm: bpm.clamp(20.0, 300.0),
-            sample_rate,
-        }
-    }
-    pub fn ticks_to_samples(&self, ticks: u64) -> u64 {
-        ((ticks as f64 * 60.0 * f64::from(self.sample_rate)) / (self.bpm * MIDI_PPQ as f64)).round()
-            as u64
-    }
-    #[allow(dead_code)]
-    pub fn samples_to_ticks(&self, samples: u64) -> u64 {
-        ((samples as f64 * self.bpm * MIDI_PPQ as f64) / (60.0 * f64::from(self.sample_rate)))
-            .round() as u64
-    }
-}
 
 pub use ministudio_dsp::{Instrument, NoteEvent, NoteEventKind};
 

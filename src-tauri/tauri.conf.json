@@ -17,6 +17,7 @@
         "height": 900,
         "minWidth": 900,
         "minHeight": 620,
+        "backgroundColor": "#11171d",
         "resizable": true,
         "fullscreen": false
       }

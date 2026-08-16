@@ -71,6 +71,32 @@ selective crash recovery.
   executable and keeps plug-in creation, state, native GUI message dispatch,
   editor teardown and final destruction on the Windows helper process main
   thread. The application checks this mode before Tauri/WebView/audio startup.
+- On Windows, that helper now owns a frameless native host window instead of
+  exposing the operating-system caption. Its lightweight GDI chrome provides a
+  draggable title area, power/pin/minimize/close controls and a second row for
+  bypass, preset save/load, conditional sidechain and four automation modes.
+  User actions cross the helper boundary as a bounded control-plane intent
+  queue; project mutation and file dialogs stay in the main process. The VST3
+  view is attached to a dedicated child HWND immediately below it on the same
+  message-pumped UI thread. DPI changes and plug-in-requested editor resizing
+  resize the wrapper and child together; close requests still detach the
+  vendor view before either HWND is destroyed.
+- The production Windows chrome uses Korean control labels and keeps the four
+  automation-mode colors anchored to the right edge. Hover state is cached per
+  HWND: only the old/new button rectangles are invalidated, interactive
+  move/size suppresses hover repaint, and GDI stock brushes/pens plus stack
+  text buffers avoid per-frame heap/GDI-object churn. The parent never paints
+  the vendor-owned client region below the toolbar.
+- Opening an ordinary editor closes every previously tracked unpinned editor.
+  Pinned editors are exempt, and a generation token closes a slow editor if an
+  even newer request won while it was still opening. Slow vendor open/close
+  calls never execute under the global engine mutex.
+- Standalone editor registrations survive graph swaps only while their external
+  plug-in target still exists. Graph synchronization never background-reopens
+  an ordinary editor; only a pinned editor carries explicit restoration intent.
+  Native and application close requests install a target-local cancellation
+  fence so an editor that finishes opening late is closed instead of flashing
+  back on screen.
 - Windows VST3 instances use the self-hosted process server by default.
   `MINISTUDIO_VST3_PROCESS_ISOLATION=0` is an explicit diagnostic escape hatch.
   CLAP and non-Windows realtime isolation remain separate follow-up work.
@@ -92,8 +118,10 @@ selective crash recovery.
 
 - MiniStudio's effect chain still consumes the plug-in's main output as stereo. Additional output buses are negotiated and processed, but independent stem routing for those outputs is a later mixer feature.
 - Native standalone editor windows, parameter enumeration, automation and
-  opaque state persistence are implemented. A host-chrome embedded editor is
-  still experimental; compatibility takes priority over a toolbar frame.
+  opaque state persistence are implemented. The Windows compatibility wrapper
+  provides the production preset/sidechain/automation/pin controls without
+  placing WebView UI inside the helper. Full vendor-view embedding in a Tauri
+  child remains experimental.
 - CLAP latency/tail extensions are not yet included in graph compensation.
 - CLAP and non-Windows native plug-ins can still crash the application while
   actively processing. Windows VST3 processing is isolated; the remaining
@@ -126,6 +154,37 @@ realtime playback uses:
 Timeouts are watchdog diagnostics, not lifecycle state transitions. A slow
 sample library may remain `Loading` while the DAW stays responsive; it is not
 silently discarded merely because a fixed UI timer elapsed.
+
+### Event-driven editor supervisor
+
+- A lightweight main-process supervisor owns editor identity, pin/foreground policy, generation
+  tokens, helper leases and resource budgets. It does not create, destroy or repaint vendor HWNDs.
+- Each helper remains the sole owner of its VST3/CLAP instance, native window and format-required
+  GUI thread. The supervisor sends lifecycle intent; the helper reports opened, closed, resized,
+  crashed and toolbar-action events.
+- Control messages use request IDs and unsolicited event envelopes (or a bounded shared-memory
+  action ring plus a Windows event). The current 100 ms WebView action poll is transitional and
+  must not merely be relocated to a Rust timer.
+- Lease/generation tokens make resource reclamation deterministic: helper death releases every
+  window and instance lease, while a late response from an obsolete open request is discarded.
+  Realtime audio shared memory remains a separate, allocation-free data plane.
+
+### Required grouping policy
+
+- The grouping key is the canonical plug-in module/binary identity plus its
+  fingerprint, never the display vendor string. Different binaries from one
+  company must not share a failure domain accidentally.
+- A module group admits at most four live instances by default. Additional
+  instances open a new group for that same module; heavy/ARA instances remain
+  individually isolated.
+- One group crash promotes every member of that failed group to individual
+  isolation for the rest of the session. The offending module fingerprint is
+  persisted as quarantined and starts individually on the next launch; a
+  changed binary fingerprint gets a fresh probation period.
+- This policy becomes active only with a multiplexed helper protocol carrying
+  an instance ID on every control request, a helper-side instance/realtime map,
+  and coordinated group recovery. The present one-slot helper must not pretend
+  to group instances merely by attaching policy metadata.
 
 ### Verified Windows control-plane baseline
 

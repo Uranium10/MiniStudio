@@ -1,0 +1,8 @@
+{
+  "meta": { "name": "Legacy v1", "sampleRate": 48000, "createdAt": "2024-01-01T00:00:00.000Z" },
+  "transport": { "bpm": 120, "playheadSec": 0, "isPlaying": false, "loop": { "enabled": false, "startSec": 0, "endSec": 8 } },
+  "assets": { "legacy-audio": { "id": "legacy-audio", "path": "", "name": "legacy.wav", "durationSec": 2, "sampleRate": 48000, "numChannels": 2, "peaks": [0, 0.5] } },
+  "tracks": [{ "id": "legacy-track", "name": "Legacy", "color": "#fff", "clips": [{ "id": "clip-a", "assetId": "legacy-audio", "startSec": 0, "offsetSec": 0, "durationSec": 2, "gainDb": 0, "fadeInSec": 0, "fadeOutSec": 0 }], "volumeDb": 0, "pan": 0, "muted": false, "solo": false, "armed": false, "effects": [], "sends": [] }],
+  "buses": [],
+  "master": { "volumeDb": 0, "effects": [] }
+}

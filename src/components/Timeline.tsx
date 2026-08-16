@@ -2,15 +2,15 @@
 import { ChevronDown, GripVertical, Headphones, Layers3, MoreHorizontal, Piano, Plus, Radio, X } from 'lucide-react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { useShallow } from 'zustand/react/shallow'
-import { describeEngineError, gridLabel, secondsPerBar, secondsPerBeat, type AutomationLane, type Clip, type MidiClip, type TimeSignature, type Track } from '../engine'
+import { describeEngineError, gridLabel, secondsPerBar, secondsPerBeat, TempoMap, type AutomationLane, type Clip, type MidiClip, type TempoMapData, type TimeSignature, type Track } from '../engine'
 import { useEngine } from '../hooks/useEngine'
 import { seekTo } from '../store/commands'
-import { automationOptionsForTrack, clipSourceStep, snapSeconds, snapTimeWithSwing, useProjectStore, type ClipGainPointRef } from '../store/projectStore'
+import { automationOptionsForTrack, clipSourceStep, snapTimeWithSwing, useProjectStore, type ClipGainPointRef } from '../store/projectStore'
 import { getEffectiveTool, type ToolId, useToolStore } from '../store/toolStore'
 import { FloatingPanel, MenuPanel, type MenuItem } from './Menu'
 import { EditableNumber, SignalBar } from './controls'
 import { hexToHsp, hspToHex, type HspColor } from './colorMath'
-import { adaptiveGridStepSec, buildRulerTicks } from './rulerMath'
+import { adaptiveGridStepSec, buildMusicalGridLines, buildRulerTicks } from './rulerMath'
 import { beginPointerReorder } from './pointerReorder'
 import { subscribeBrowserDrag } from './browserPayload'
 import { openPluginEditorWhenReady } from '../plugins/editor'
@@ -50,8 +50,8 @@ export function Timeline() {
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
   const arrangementSwing = useProjectStore((state) => state.arrangementSwing)
-  const bpm = useProjectStore((state) => state.project.transport.bpm)
-  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
   const focused = useProjectStore((state) => state.editFocus === 'arrangement')
   const setEditFocus = useProjectStore((state) => state.setEditFocus)
   const selectTrack = useProjectStore((state) => state.selectTrack)
@@ -60,10 +60,10 @@ export function Timeline() {
   const [instrumentDropPreview, setInstrumentDropPreview] = useState<InstrumentDropPreview | null>(null)
   const [arrangementMenu, setArrangementMenu] = useState<{ x: number; y: number } | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
-  const barSec = secondsPerBar(bpm, signature)
   const contentEnd = Math.max(0, ...tracks.flatMap((track) => [...track.clips, ...track.midiClips].map((clip) => clip.startSec + clip.durationSec)))
-  const expandedEnd = Math.ceil((contentEnd + barSec * 4) / (barSec * 4)) * barSec * 4
-  const maxEnd = Math.max(barSec * 172, expandedEnd)
+  const contentBar = tempoMap.tickToBarBeat(tempoMap.secondsToTicks(contentEnd)).bar
+  const expandedEnd = tempoMap.ticksToSeconds(tempoMap.barStartTicks(contentBar + 5))
+  const maxEnd = Math.max(tempoMap.ticksToSeconds(tempoMap.barStartTicks(173)), expandedEnd)
   const timelineWidth = Math.ceil(maxEnd * pixelsPerSecond)
 
   useFollowPlayhead(scrollRef)
@@ -78,7 +78,7 @@ export function Timeline() {
       const target = document.elementFromPoint(detail.x, detail.y)
       if (!target?.closest('.arrangement')) { setAudioDropPreview(null); return }
       const name = detail.paths[0]!.split(/[\\/]/).at(-1) ?? 'Audio'
-      const placement = resolveAudioDrop({ clientX: detail.x, clientY: detail.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, useProjectStore.getState().project.transport.bpm, arrangementSwing, name)
+      const placement = resolveAudioDrop({ clientX: detail.x, clientY: detail.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, useProjectStore.getState().project.transport.bpm, arrangementSwing, name, tempoMapData)
       setBrowserDragOver(true)
       setAudioDropPreview(placement)
       if (detail.type !== 'drop') return
@@ -88,7 +88,7 @@ export function Timeline() {
     }
     window.addEventListener('ministudio-native-audio-drag', handleNativeDrag)
     return () => window.removeEventListener('ministudio-native-audio-drag', handleNativeDrag)
-  }, [arrangementSwing, engine, gridTicks, pixelsPerSecond, tracks])
+  }, [arrangementSwing, engine, gridTicks, pixelsPerSecond, tempoMapData, tracks])
 
   useEffect(() => subscribeBrowserDrag((state) => {
     const hit = document.elementFromPoint(state.x, state.y)
@@ -99,7 +99,7 @@ export function Timeline() {
 
     if (state.payload.kind === 'media') {
       const media = state.payload
-      const placement = resolveAudioDrop({ clientX: state.x, clientY: state.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, arrangementSwing, media.name)
+      const placement = resolveAudioDrop({ clientX: state.x, clientY: state.y, shiftKey: false, target }, tracks, scrollRef.current, pixelsPerSecond, gridTicks, store.project.transport.bpm, arrangementSwing, media.name, store.project.transport.tempoMap)
       setInstrumentDropPreview(null)
       setAudioDropPreview(placement)
       setBrowserDragOver(true)
@@ -190,11 +190,11 @@ export function Timeline() {
   )
 }
 
-function resolveAudioDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientX' | 'clientY' | 'shiftKey' | 'target'>, tracks: Track[], scroll: HTMLDivElement | null, pixelsPerSecond: number, gridTicks: number, bpm: number, swing: number, name = 'Audio'): AudioDropPreview {
+function resolveAudioDrop(event: Pick<ReactDragEvent<HTMLElement>, 'clientX' | 'clientY' | 'shiftKey' | 'target'>, tracks: Track[], scroll: HTMLDivElement | null, pixelsPerSecond: number, gridTicks: number, bpm: number, swing: number, name = 'Audio', tempoMap?: TempoMapData): AudioDropPreview {
   const content = scroll?.querySelector<HTMLElement>('.timeline-content')
   const contentRect = content?.getBoundingClientRect()
   const rawSec = Math.max(0, ((event.clientX - (contentRect?.left ?? 0)) - HEADER_WIDTH) / pixelsPerSecond)
-  const startSec = event.shiftKey ? rawSec : snapTimeWithSwing(rawSec, gridTicks, bpm, swing)
+  const startSec = event.shiftKey ? rawSec : snapTimeWithSwing(rawSec, gridTicks, bpm, swing, tempoMap)
   const left = HEADER_WIDTH + startSec * pixelsPerSecond
   const element = event.target instanceof Element ? event.target : null
   const stack = element?.closest<HTMLElement>('.track-stack')
@@ -317,10 +317,12 @@ function LoopStrip({ width, pixelsPerSecond }: { width: number; pixelsPerSecond:
   const loop = useProjectStore((state) => state.project.transport.loop)
   const setLoopRange = useProjectStore((state) => state.setLoopRange)
   const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
   const snapEnabled = useProjectStore((state) => state.snapEnabled)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const swing = useProjectStore((state) => state.arrangementSwing)
-  const snap = (sec: number, bypass = false) => snapEnabled && !bypass ? snapTimeWithSwing(sec, gridTicks, bpm, swing) : sec
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
+  const snap = (sec: number, bypass = false) => snapEnabled && !bypass ? snapTimeWithSwing(sec, gridTicks, bpm, swing, tempoMapData) : sec
 
   const begin = (event: ReactPointerEvent<HTMLElement>, mode: 'start' | 'end' | 'move' | 'draw') => {
     event.preventDefault()
@@ -330,8 +332,9 @@ function LoopStrip({ width, pixelsPerSecond }: { width: number; pixelsPerSecond:
     const laneLeft = lane.getBoundingClientRect().left
     const originSec = Math.max(0, (event.clientX - laneLeft) / pixelsPerSecond)
     const { startSec, endSec } = loop
-    const step = snapSeconds(gridTicks, bpm)
     const pointedSec = snap(originSec, event.shiftKey)
+    const pointedTick = tempoMap.secondsToTicks(pointedSec)
+    const step = tempoMap.ticksToSeconds(pointedTick + gridTicks) - tempoMap.ticksToSeconds(pointedTick)
     if (event.ctrlKey || event.metaKey || useToolStore.getState().isModifierHeld) {
       setLoopRange(pointedSec, Math.max(endSec, pointedSec + step))
       return
@@ -380,14 +383,17 @@ function Ruler({ width, pixelsPerSecond }: { width: number; pixelsPerSecond: num
   const engine = useEngine()
   const bpm = useProjectStore((state) => state.project.transport.bpm)
   const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const swing = useProjectStore((state) => state.arrangementSwing)
   const loop = useProjectStore((state) => state.project.transport.loop)
-  const ticks = useMemo(() => buildRulerTicks(width, pixelsPerSecond, bpm, signature), [width, pixelsPerSecond, bpm, signature])
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
+  const ticks = useMemo(() => buildRulerTicks(width, pixelsPerSecond, bpm, signature, tempoMapData), [width, pixelsPerSecond, bpm, signature, tempoMapData])
   const point = (event: ReactPointerEvent<HTMLDivElement>) => {
     const rawSec = Math.max(0, (event.clientX - event.currentTarget.getBoundingClientRect().left) / pixelsPerSecond)
-    const step = snapSeconds(gridTicks, bpm)
-    const sec = snapTimeWithSwing(rawSec, gridTicks, bpm, swing)
+    const sec = snapTimeWithSwing(rawSec, gridTicks, bpm, swing, tempoMapData)
+    const tick = tempoMap.secondsToTicks(sec)
+    const step = tempoMap.ticksToSeconds(tick + gridTicks) - tempoMap.ticksToSeconds(tick)
     if (event.ctrlKey || event.metaKey || useToolStore.getState().isModifierHeld) { event.preventDefault(); event.stopPropagation(); useProjectStore.getState().setLoopRange(sec, Math.max(loop.endSec, sec + step)); return }
     if (event.altKey) { event.preventDefault(); useProjectStore.getState().setLoopRange(Math.min(loop.startSec, Math.max(0, sec - step)), sec); return }
     seekTo(engine, rawSec)
@@ -461,9 +467,12 @@ function TrackHeaderView({ track, index }: { track: Track; index: number }) {
         <button title="트랙 메뉴" aria-haspopup="menu" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); setMenu({ x: rect.left, y: rect.bottom + 2 }) }}><MoreHorizontal size={13} /></button>
         {menu && <MenuPanel items={menuItems()} anchor={menu} onClose={() => setMenu(null)} />}
       </div>
+      <div className="track-volume-row">
+        <input className="track-volume-slider" type="range" min="-60" max="12" step="0.1" value={track.volumeDb} aria-label={`${track.name} 볼륨`} title={`볼륨 ${track.volumeDb.toFixed(1)} dB`} style={{ '--track-volume': `${Math.max(0, Math.min(100, (track.volumeDb + 60) / 72 * 100))}%` } as React.CSSProperties} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); updateTrack(track.id, { volumeDb: 0 }); engine.setTrackVolume(track.id, 0) }} onChange={(event) => { const volumeDb = Number(event.target.value); updateTrack(track.id, { volumeDb }); engine.setTrackVolume(track.id, volumeDb) }} />
+        <output>{track.volumeDb <= -59.9 ? '-∞' : track.volumeDb.toFixed(1)}</output>
+      </div>
       <div className="track-header-controls">
         <button className={`automation-toggle ${track.automationOpen ? 'active' : ''}`} title="오토메이션 레인 토글" onClick={(event) => { event.stopPropagation(); const store = useProjectStore.getState(); if (!track.automationOpen && !(track.automationLanes?.length)) { const volume = automationOptionsForTrack(track).find((option) => option.parameterId === 'volumeDb'); if (volume) store.addAutomationLane(track.id, volume) } setAutomationOpen(track.id, !track.automationOpen) }}><ChevronDown size={10} /></button>
-        <input className="track-volume-slider" type="range" min="-60" max="12" step="0.1" value={track.volumeDb} aria-label={`${track.name} 볼륨`} title={`볼륨 ${track.volumeDb.toFixed(1)} dB`} style={{ '--track-volume': `${Math.max(0, Math.min(100, (track.volumeDb + 60) / 72 * 100))}%` } as React.CSSProperties} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => { event.stopPropagation(); updateTrack(track.id, { volumeDb: 0 }); engine.setTrackVolume(track.id, 0) }} onChange={(event) => { const volumeDb = Number(event.target.value); updateTrack(track.id, { volumeDb }); engine.setTrackVolume(track.id, volumeDb) }} />
         {track.kind === 'instrument' && <button className="instrument-button" title={`${track.instrument?.type ?? 'VST / Instrument'} 악기 창 열기`} onClick={(event) => { event.stopPropagation(); selectTrack(track.id); const store = useProjectStore.getState(); store.setRackTarget({ kind: 'track', id: track.id }); if (track.instrument?.plugin && track.instrument.plugin.hasEditor !== false) void engine.openPluginEditor('instrument', track.id).catch((error) => store.showToast(`${track.instrument!.plugin!.name} 편집기를 열 수 없습니다: ${describeEngineError(error)}`)) }}><Piano size={11} /></button>}
         <button className={track.muted ? 'active mute' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { muted: !track.muted }); engine.setTrackMute(track.id, !track.muted) }}>M</button>
         <button className={track.solo ? 'active solo' : ''} onClick={(event) => { event.stopPropagation(); updateTrack(track.id, { solo: !track.solo }); engine.setTrackSolo(track.id, !track.solo) }}>S</button>
@@ -524,8 +533,7 @@ const AUTOMATION_HEIGHT = 54
 
 function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; width: number; pixelsPerSecond: number }) {
   const lanes = useMemo(() => track.automationLanes ?? [], [track.automationLanes])
-  const bpm = useProjectStore((state) => state.project.transport.bpm)
-  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const addLane = useProjectStore((state) => state.addAutomationLane)
   const removeLane = useProjectStore((state) => state.removeAutomationLane)
@@ -544,9 +552,9 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
     groups.set(option.category, items)
     return groups
   }, new Map<string, typeof options>()), [options])
-  const emptyGridStyle = { width, '--automation-grid-step': `${Math.max(1, adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond)}px`, '--automation-bar-step': `${Math.max(1, secondsPerBar(bpm, signature) * pixelsPerSecond)}px` } as React.CSSProperties
+  const emptyGridLines = useMemo(() => buildMusicalGridLines(width, pixelsPerSecond, gridTicks, tempoMapData), [gridTicks, pixelsPerSecond, tempoMapData, width])
   return <div className="automation-section">
-    {!lanes.length && <div className="automation-row automation-empty-row" style={{ height: AUTOMATION_HEIGHT }}><div className="automation-lane-header"><span className="automation-color" style={{ background: track.color }} /><div><small>AUTOMATION</small><strong>레인을 추가하세요</strong></div><button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button></div><div className="automation-empty-canvas" style={emptyGridStyle} /></div>}
+    {!lanes.length && <div className="automation-row automation-empty-row" style={{ height: AUTOMATION_HEIGHT }}><div className="automation-lane-header"><span className="automation-color" style={{ background: track.color }} /><div><small>AUTOMATION</small><strong>레인을 추가하세요</strong></div><button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button></div><div className="automation-empty-canvas" style={{ width }}>{emptyGridLines.map((line) => <i key={line.sec} className={line.strong ? 'strong' : ''} style={{ left: line.sec * pixelsPerSecond }} />)}</div></div>}
     {lanes.map((lane, index) => { const laneHeight = lane.height ?? AUTOMATION_HEIGHT; return <div className="automation-row" data-automation-lane-id={lane.id} key={lane.id} style={{ height: laneHeight }}>
       <div className="automation-lane-header">
         <span className="automation-color" style={{ background: track.color }} />
@@ -589,8 +597,7 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
   const upsert = useProjectStore((state) => state.upsertAutomationPoint)
   const setCurve = useProjectStore((state) => state.setAutomationCurve)
   const selectedPoints = useProjectStore((state) => state.selectedAutomationPoints)
-  const bpm = useProjectStore((state) => state.project.transport.bpm)
-  const signature = useProjectStore((state) => state.project.transport.timeSignature)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const svgRef = useRef<SVGSVGElement>(null)
   const dragging = useRef<{ kind: 'point'; id: string; pointerId: number } | { kind: 'curve'; id: string; pointerId: number; linearY: number } | null>(null)
@@ -605,7 +612,7 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     const y = Math.max(5, Math.min(height - 5, clientY - bounds.top))
     const rawTime = x / pixelsPerSecond
     const state = useProjectStore.getState()
-    const timeSec = state.snapEnabled && !bypassSnap ? snapTimeWithSwing(rawTime, state.gridTicks, state.project.transport.bpm, state.arrangementSwing) : rawTime
+    const timeSec = state.snapEnabled && !bypassSnap ? snapTimeWithSwing(rawTime, state.gridTicks, state.project.transport.bpm, state.arrangementSwing, state.project.transport.tempoMap) : rawTime
     const value = lane.max - (y - 5) / (height - 10) * (lane.max - lane.min)
     return { timeSec, value }
   }, [height, lane.defaultValue, lane.max, lane.min, pixelsPerSecond])
@@ -648,9 +655,7 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     }, 160)
   }
   const selected = new Set(selectedPoints.filter((point) => point.trackId === trackId && point.laneId === lane.id).map((point) => point.pointId))
-  const gridPx = adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond
-  const barPx = secondsPerBar(bpm, signature) * pixelsPerSecond
-  const gridStyle = { '--automation-grid-step': `${Math.max(1, gridPx)}px`, '--automation-bar-step': `${Math.max(1, barPx)}px` } as React.CSSProperties
+  const gridLines = useMemo(() => buildMusicalGridLines(width, pixelsPerSecond, gridTicks, tempoMapData), [gridTicks, pixelsPerSecond, tempoMapData, width])
   const menuPoint = pointMenu ? lane.points.find((point) => point.id === pointMenu.pointId) : undefined
   const pointMenuItems: MenuItem[] = menuPoint ? [
     { kind: 'label', label: lane.label },
@@ -659,7 +664,8 @@ function AutomationCurve({ trackId, lane, width, height, pixelsPerSecond }: { tr
     { kind: 'separator' },
     { kind: 'item', label: '포인트 삭제', keys: 'Delete', danger: true, run: () => useProjectStore.getState().deleteSelectedAutomationPoints() },
   ] : []
-  return <><svg ref={svgRef} className="automation-curve" width={width} height={height} style={gridStyle} onDoubleClick={(event) => { if ((event.target as Element).closest('circle')) return; const id = upsert(trackId, lane.id, pointAt(event.clientX, event.clientY, event.shiftKey)); if (id) useProjectStore.getState().selectAutomationPoint({ trackId, laneId: lane.id, pointId: id }) }} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} onPointerLeave={() => { window.clearTimeout(hoverTimer.current) }}>
+  return <><svg ref={svgRef} className="automation-curve" width={width} height={height} onDoubleClick={(event) => { if ((event.target as Element).closest('circle')) return; const id = upsert(trackId, lane.id, pointAt(event.clientX, event.clientY, event.shiftKey)); if (id) useProjectStore.getState().selectAutomationPoint({ trackId, laneId: lane.id, pointId: id }) }} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish} onPointerLeave={() => { window.clearTimeout(hoverTimer.current) }}>
+    <g className="automation-time-grid" pointerEvents="none">{gridLines.map((line) => <line key={line.sec} className={line.strong ? 'strong' : ''} x1={line.sec * pixelsPerSecond} x2={line.sec * pixelsPerSecond} y1="0" y2={height} />)}</g>
     <path d={path} />
     {segments.map((segment) => <path key={`hit:${segment.from.id}`} className="automation-segment-hit" d={segment.path} onPointerEnter={() => beginSegmentHover(segment.from.id)} onPointerLeave={() => endSegmentHover(segment.from.id)} />)}
     {segments.map((segment) => <g key={`curve:${segment.from.id}`}>
@@ -681,6 +687,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const [clipProperties, setClipProperties] = useState<{ x: number; y: number; clipId: string } | null>(null)
   const trackClipIds = useMemo(() => new Set([...track.clips, ...track.midiClips].map((clip) => clip.id)), [track.clips, track.midiClips])
   const assets = useProjectStore((state) => state.project.assets)
+  const audioSourceRefs = useProjectStore((state) => state.project.audioSourceRefs)
   const selectedClipIds = useProjectStore(useShallow((state) => state.selectedClipIds.filter((id) => trackClipIds.has(id))))
   const selectedClipGainPoint = useProjectStore((state) => state.selectedClipGainPoint?.trackId === track.id ? state.selectedClipGainPoint : null)
   const pixelsPerSecond = useProjectStore((state) => state.pixelsPerSecond)
@@ -688,6 +695,8 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const gridTicks = useProjectStore((state) => state.gridTicks)
   const swing = useProjectStore((state) => state.arrangementSwing)
   const bpm = useProjectStore((state) => state.project.transport.bpm)
+  const tempoMapData = useProjectStore((state) => state.project.transport.tempoMap)
+  const tempoMap = useMemo(() => new TempoMap(tempoMapData), [tempoMapData])
   const signature = useProjectStore((state) => state.project.transport.timeSignature)
   const loop = useProjectStore((state) => state.project.transport.loop)
   const gridStepPx = useMemo(() => Math.max(1, adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pixelsPerSecond) * pixelsPerSecond), [bpm, gridTicks, pixelsPerSecond])
@@ -697,7 +706,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const latestDrawRef = useRef<() => void>(() => undefined)
   latestDrawRef.current = () => {
     const canvas = canvasRef.current
-    if (canvas) drawTrackLane(canvas, track, assets, selectedClipIds, selectedClipGainPoint, pixelsPerSecond, bpm, signature, gridTicks, scrollRef.current)
+    if (canvas) drawTrackLane(canvas, track, assets, audioSourceRefs, selectedClipIds, selectedClipGainPoint, pixelsPerSecond, bpm, signature, gridTicks, tempoMap, scrollRef.current)
   }
   const requestDraw = useCallback(() => {
     if (drawFrameRef.current) return
@@ -706,7 +715,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
 
   useEffect(() => {
     requestDraw()
-  }, [track, assets, selectedClipIds, selectedClipGainPoint, pixelsPerSecond, bpm, signature, gridTicks, width, height, scrollRef, requestDraw])
+  }, [track, assets, audioSourceRefs, selectedClipIds, selectedClipGainPoint, pixelsPerSecond, bpm, signature, gridTicks, tempoMap, width, height, scrollRef, requestDraw])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -728,7 +737,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
   const xToSec = (x: number) => x / pixelsPerSecond
   const snap = (sec: number, bypass = false) => {
     if (!snapEnabled || bypass) return sec
-    return snapTimeWithSwing(sec, gridTicks, bpm, swing)
+    return snapTimeWithSwing(sec, gridTicks, bpm, swing, tempoMapData)
   }
   const pointX = (event: ReactPointerEvent<HTMLCanvasElement>) => event.clientX - event.currentTarget.getBoundingClientRect().left
   const setDropLane = (lane: HTMLElement | null, valid: boolean) => {
@@ -850,7 +859,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     if (gesture.mode === 'trim-left') {
       const nextStart = Math.min(original.startSec + original.durationSec - 0.1, Math.max(0, snap(original.startSec + delta, event.shiftKey)))
       const consumed = nextStart - original.startSec
-      const sourceStep = !gesture.midi && 'offsetSec' in original ? clipSourceStep(original, bpm) : 1
+      const sourceStep = !gesture.midi && 'offsetSec' in original ? clipSourceStep(original, bpm, tempoMapData) : 1
       store.updateClip(track.id, gesture.clipId, { startSec: nextStart, ...(!gesture.midi && 'offsetSec' in original ? { offsetSec: Math.max(0, original.offsetSec + consumed * sourceStep), gainPoints: (original.gainPoints ?? []).filter((point) => point.timeSec >= consumed).map((point) => ({ ...point, timeSec: point.timeSec - consumed })) } : {}), durationSec: original.durationSec - consumed })
     }
     if (gesture.mode === 'trim-right') { const durationSec = Math.max(0.1, snap(original.startSec + original.durationSec + delta, event.shiftKey) - original.startSec); store.updateClip(track.id, gesture.clipId, { durationSec, ...(!gesture.midi && 'gainPoints' in original ? { gainPoints: (original.gainPoints ?? []).filter((point) => point.timeSec <= durationSec) } : {}) }) }
@@ -869,7 +878,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     if (gesture.mode === 'gain-base' && !gesture.midi && 'gainDb' in original) store.updateClipGain(track.id, gesture.clipId, Math.max(-60, Math.min(0, original.gainDb - (event.clientY - event.currentTarget.getBoundingClientRect().top - (gesture.startY ?? 0)) * 60 / Math.max(1, height - 10))))
     if (gesture.mode === 'gain-point' && !gesture.midi && gesture.pointId && 'gainDb' in original) {
       const rawLocal = Math.max(0, Math.min(original.durationSec, xToSec(x) - original.startSec))
-      const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(rawLocal, gridTicks, bpm, swing) : rawLocal
+      const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(rawLocal, gridTicks, bpm, swing, tempoMapData) : rawLocal
       store.upsertClipGainPoint(track.id, gesture.clipId, { id: gesture.pointId, timeSec, valueDb: yToClipGainDb(original, timeSec, event.clientY - event.currentTarget.getBoundingClientRect().top, height) })
     }
     if (gesture.mode === 'gain-curve' && !gesture.midi && gesture.pointId) {
@@ -930,7 +939,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     if (hitTestClipEnvelope(track, x, y, pixelsPerSecond, height, selectedClipIds)) return
     const localSec = Math.max(0, Math.min(audio.durationSec, x / pixelsPerSecond - audio.startSec))
     if (Math.abs(y - envelopeYAt(audio, localSec, height)) > 8) return
-    const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(localSec, gridTicks, bpm, swing) : localSec
+    const timeSec = snapEnabled && !event.shiftKey ? snapTimeWithSwing(localSec, gridTicks, bpm, swing, tempoMapData) : localSec
     const id = useProjectStore.getState().upsertClipGainPoint(track.id, audio.id, { timeSec, valueDb: sampleClipGainDb(prepareClipGainNodes(audio), localSec) })
     if (id) useProjectStore.getState().selectClipGainPoint({ trackId: track.id, clipId: audio.id, pointId: id })
   }
@@ -971,7 +980,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
     ...(!contextMenu.hit.midi ? [{ kind: 'item' as const, label: '피치 · 파인 · 배속…', run: () => setClipProperties({ x: contextMenu.x, y: contextMenu.y, clipId: contextMenu.hit!.clip.id }) }, {
       kind: 'submenu' as const, label: '프로세싱', children: [
         { kind: 'item' as const, label: (contextMenu.hit.clip as Clip).reversed ? '리버스 해제' : '리버스', checked: Boolean((contextMenu.hit.clip as Clip).reversed), run: () => useProjectStore.getState().updateClip(track.id, contextMenu.hit!.clip.id, { reversed: !(contextMenu.hit!.clip as Clip).reversed }) },
-        { kind: 'item' as const, label: '노멀라이즈', run: () => { const clip = contextMenu.hit!.clip as Clip; useProjectStore.getState().updateClipGain(track.id, clip.id, normalizeGain(assets[clip.assetId]?.peaks)) } },
+        { kind: 'item' as const, label: '노멀라이즈', run: () => { const clip = contextMenu.hit!.clip as Clip; useProjectStore.getState().updateClipGain(track.id, clip.id, normalizeGain(assets[audioSourceRefs[clip.audioSourceRefId]?.assetId ?? '']?.peaks)) } },
         { kind: 'item' as const, label: '피치/배속 초기화', run: () => useProjectStore.getState().updateClip(track.id, contextMenu.hit!.clip.id, { playbackRate: 1, pitchSemitones: 0, fineCents: 0, reversed: false }) },
       ],
     }, {
@@ -983,7 +992,7 @@ function TrackLaneView({ track, width, height, scrollRef }: { track: Track; widt
         { kind: 'separator' as const },
         { kind: 'item' as const, label: `소스 템포 ${((contextMenu.hit.clip as Clip).warpSourceBpm ?? bpm).toFixed(1)} BPM…`, run: () => { const clip = contextMenu.hit!.clip as Clip; const value = promptClippedNumber('원본 오디오 템포 (BPM)', clip.warpSourceBpm ?? bpm, 20, 300); if (value !== null) useProjectStore.getState().updateClip(track.id, clip.id, { warpSourceBpm: value }) } },
       ],
-    }] : []),
+    }, { kind: 'item' as const, label: '독립된 사본으로 만들기', run: () => useProjectStore.getState().makeAudioSourceUnique(track.id, contextMenu.hit!.clip.id) }] : []),
     { kind: 'item', label: '선택 트랙으로 버스 채널 생성', disabled: useProjectStore.getState().selectedTrackIds.length < 2, run: () => { useProjectStore.getState().createBusFromSelectedTracks() } },
     { kind: 'separator' },
     { kind: 'item', label: '클립 삭제', keys: 'Delete', danger: true, run: () => { const store = useProjectStore.getState(); store.selectClip(contextMenu.hit!.clip.id); store.deleteSelectedClips() } },
@@ -1061,7 +1070,7 @@ const TrackLane = memo(TrackLaneView, (previous, next) => (
   && previous.scrollRef === next.scrollRef
 ))
 
-function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<string, { durationSec: number; peaks: Float32Array }>, selected: string[], selectedGainPoint: ClipGainPointRef | null, pps: number, bpm: number, signature: TimeSignature, gridTicks: number, scroll: HTMLDivElement | null): void {
+function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<string, { durationSec: number; peaks: Float32Array }>, audioSourceRefs: Record<string, { assetId: string }>, selected: string[], selectedGainPoint: ClipGainPointRef | null, pps: number, bpm: number, signature: TimeSignature, gridTicks: number, tempoMap: TempoMap, scroll: HTMLDivElement | null): void {
   const ratioY = Math.min(window.devicePixelRatio || 1, 1.5)
   const width = canvas.clientWidth
   const height = canvas.clientHeight
@@ -1078,12 +1087,19 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
   context.fillStyle = '#151d24'
   context.fillRect(visibleStart, 0, visibleEnd - visibleStart, height)
   // Grid lines follow the shared musical grid, with bar lines drawn brightest.
-  const barWidth = secondsPerBar(bpm, signature) * pps
-  const gridStep = adaptiveGridStepSec(gridTicks / 960 * secondsPerBeat(bpm), pps) * pps
-  for (let x = Math.floor(visibleStart / gridStep) * gridStep; x < visibleEnd; x += gridStep) {
-    const onBar = barWidth > 0 && Math.abs(x / barWidth - Math.round(x / barWidth)) < 1e-6
+  let paintedGridTicks = Math.max(1, gridTicks)
+  while ((tempoMap.ticksToSeconds(paintedGridTicks) - tempoMap.ticksToSeconds(0)) * pps < 8) paintedGridTicks *= 2
+  const firstTick = Math.floor(tempoMap.secondsToTicks(visibleStart / pps) / paintedGridTicks) * paintedGridTicks
+  const endTick = tempoMap.secondsToTicks(visibleEnd / pps) + paintedGridTicks
+  let lastX = Number.NEGATIVE_INFINITY
+  for (let tick = firstTick, count = 0; tick <= endTick && count < 4_000; tick += paintedGridTicks, count += 1) {
+    const x = tempoMap.ticksToSeconds(tick) * pps
+    if (x - lastX < 3) continue
+    const position = tempoMap.tickToBarBeat(tick)
+    const onBar = Math.abs(position.beat) < 1e-6
     context.fillStyle = onBar ? '#65798a' : '#354652'
     context.fillRect(Math.round(x), 0, onBar ? 2 : 1, height)
+    lastX = x
   }
   for (const clip of track.clips) {
     const x = clip.startSec * pps
@@ -1100,7 +1116,7 @@ function drawTrackLane(canvas: HTMLCanvasElement, track: Track, assets: Record<s
     context.font = '600 10px Inter, sans-serif'
     context.fillText(clip.name ?? 'Audio clip', x + 7, 17, Math.max(0, clipWidth - 14))
     const gainNodes = prepareClipGainNodes(clip)
-    const peaks = assets[clip.assetId]?.peaks
+    const peaks = assets[audioSourceRefs[clip.audioSourceRefId]?.assetId ?? '']?.peaks
     if (peaks && peaks.length) {
       context.strokeStyle = 'rgba(225, 246, 255, .74)'
       context.lineWidth = 1

@@ -8,6 +8,7 @@ pub mod error;
 pub mod graph;
 pub mod instrument;
 pub mod plugin;
+pub mod tempo;
 pub mod types;
 
 pub const MAX_CHANNELS: usize = 2;

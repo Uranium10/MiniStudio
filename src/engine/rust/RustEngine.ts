@@ -8,11 +8,12 @@ import type {
   ExportProgress as UiExportProgress,
 } from '../types'
 import { NotSupportedError } from '../types'
+import { TempoMap } from '../tempoMap'
 import { commands } from './bindings'
 import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot, PluginDescriptor as NativePluginDescriptor } from './bindings'
 import { getAssetPeaks } from './binary'
 
-const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0 }
+const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0, cpuLoadPercent: 0, cpuPeakPercent: 0, countInBeatsRemaining: 0 }
 
 export class RustEngine implements IAudioEngine {
   private initialized = false
@@ -145,7 +146,8 @@ export class RustEngine implements IAudioEngine {
     }
   }
 
-  async play(fromSec?: number): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.enginePlay(fromSec ?? null)) }
+  async play(fromSec?: number, countInBars = 0): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.enginePlay(fromSec ?? null, Math.max(0, Math.min(4, Math.round(countInBars))))) }
+  async setMetronome(enabled: boolean, gainDb: number, bpm: number, numerator: number, denominator: number): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.engineSetMetronome(enabled, gainDb, bpm, numerator, denominator)) }
   async pause(): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.enginePause()) }
   async stop(): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.engineStop()) }
   async seek(sec: number): Promise<void> { await this.init(); if (isTauriRuntime()) await unwrapCommand(commands.engineSeek(sec)) }
@@ -333,6 +335,9 @@ export class RustEngine implements IAudioEngine {
       this.streamStatus.running = state.stream.running
       this.streamStatus.error = state.stream.error ?? undefined
       this.streamStatus.pdcSamples = state.stream.pdcSamples
+      this.streamStatus.cpuLoadPercent = finite(state.stream.cpuLoadPercent)
+      this.streamStatus.cpuPeakPercent = finite(state.stream.cpuPeakPercent)
+      this.streamStatus.countInBeatsRemaining = state.stream.countInBeatsRemaining
       for (const listener of this.listeners) listener(this.playheadSec)
     } catch (error) {
       this.streamStatus = { ...this.streamStatus, running: false, error: describeEngineError(error) }
@@ -377,15 +382,18 @@ function finite(value: number | null, fallback = 0): number {
 function isTauriRuntime(): boolean { return '__TAURI_INTERNALS__' in window }
 
 function toNativeSnapshot(snapshot: GraphSnapshot): NativeGraphSnapshot {
+  const tempoMap = new TempoMap(snapshot.transport.tempoMap)
   return {
     tracks: snapshot.tracks.map((track) => ({
       id: track.id,
       kind: track.kind,
       name: track.name,
       clips: track.clips.map((clip) => {
-        const sourceBpm = Math.max(20, clip.warpSourceBpm ?? snapshot.transport.bpm)
-        const warp = clip.warpMode === 'project' ? snapshot.transport.bpm / sourceBpm : clip.warpMode === 'half' ? snapshot.transport.bpm / sourceBpm * .5 : clip.warpMode === 'double' ? snapshot.transport.bpm / sourceBpm * 2 : 1
-        return { ...clip, muted: clip.muted ?? false, playbackRate: (clip.playbackRate ?? 1) * warp, pitchSemitones: clip.pitchSemitones ?? 0, fineCents: clip.fineCents ?? 0, reversed: clip.reversed ?? false, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ timeSec: point.timeSec, valueDb: point.valueDb, curve: point.curve ?? 0 })) }
+        const projectBpm = tempoMap.bpmAtTick(tempoMap.secondsToTicks(clip.startSec))
+        const sourceBpm = Math.max(20, clip.warpSourceBpm ?? projectBpm)
+        const warp = clip.warpMode === 'project' ? projectBpm / sourceBpm : clip.warpMode === 'half' ? projectBpm / sourceBpm * .5 : clip.warpMode === 'double' ? projectBpm / sourceBpm * 2 : 1
+        const { audioSourceRefId: _sourceRef, ...nativeClip } = clip
+        return { ...nativeClip, assetId: snapshot.audioSourceRefs[clip.audioSourceRefId]?.assetId ?? '', muted: clip.muted ?? false, playbackRate: (clip.playbackRate ?? 1) * warp, pitchSemitones: clip.pitchSemitones ?? 0, fineCents: clip.fineCents ?? 0, reversed: clip.reversed ?? false, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ timeSec: point.timeSec, valueDb: point.valueDb, curve: point.curve ?? 0 })) }
       }),
       midiClips: track.midiClips.map((clip) => ({ id: clip.id, name: clip.name, startSec: clip.startSec, durationSec: clip.durationSec, loopEnabled: clip.loopEnabled, loopStartTicks: clip.loopStartTicks, loopLengthTicks: clip.loopLengthTicks, notes: clip.notes, ccLanes: clip.ccLanes, transposeSemitones: clip.transposeSemitones, velocityScale: clip.velocityScale, muted: clip.muted })),
       instrument: track.instrument,
@@ -403,6 +411,8 @@ function toNativeSnapshot(snapshot: GraphSnapshot): NativeGraphSnapshot {
     master: { volumeDb: snapshot.master.volumeDb, effects: snapshot.master.effects },
     transport: {
       bpm: snapshot.transport.bpm,
+      tempoPoints: snapshot.transport.tempoMap.tempoPoints,
+      timeSignatures: snapshot.transport.tempoMap.timeSignatures,
       playheadSec: snapshot.transport.playheadSec,
       isPlaying: snapshot.transport.isPlaying,
       loop: snapshot.transport.loop,

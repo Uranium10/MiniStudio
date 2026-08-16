@@ -17,6 +17,27 @@ pub trait EmbeddedPluginEditor: Send {
     fn set_rect(&mut self, x: f32, y: f32, width: f32, height: f32);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginEditorAction {
+    Closed,
+    TogglePower,
+    TogglePin,
+    ToggleBypass,
+    SavePreset,
+    LoadPreset,
+    ShowSidechain,
+    AutomationOff,
+    AutomationWrite,
+    AutomationRead,
+    AutomationLatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PluginEditorState {
+    pub bypassed: bool,
+    pub automation: u8,
+}
+
 /// Main-thread/control-plane access to an external plug-in instance.
 ///
 /// The realtime graph only keeps an `Arc` to this interface. Implementations
@@ -41,6 +62,16 @@ pub trait PluginControl: Send + Sync {
     fn is_editor_open(&self) -> bool;
     fn save_state(&self) -> Result<Vec<u8>, String>;
     fn load_state(&self, state: Vec<u8>) -> Result<(), String>;
+    /// Drain human-rate actions emitted by host-owned native editor controls.
+    fn take_editor_actions(&self) -> Vec<PluginEditorAction> {
+        Vec::new()
+    }
+    fn set_editor_state(&self, _state: PluginEditorState) {}
+    /// Hints that this instance's track has been silent for a while (`true`) or has started
+    /// producing audio again (`false`). This is only a future graph-suspension seam: a host
+    /// must not trim or page out a helper that is still servicing realtime deadlines. Callers
+    /// never depend on the hint taking effect, and current implementations leave it as a no-op.
+    fn set_idle(&self, _idle: bool) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +112,8 @@ pub trait Instrument: Send {
     fn prepare(&mut self, sample_rate: f32, max_block: usize);
     fn process(&mut self, events: &[NoteEvent], out: &mut AudioBuffer, frames: usize);
     fn set_param(&mut self, id: &str, value: f32);
+    /// Musical tempo at the start of the current processing segment.
+    fn set_tempo(&mut self, _bpm: f64) {}
     fn reset(&mut self);
     fn tail_samples(&self) -> usize;
     fn active_voice_count(&self) -> usize;

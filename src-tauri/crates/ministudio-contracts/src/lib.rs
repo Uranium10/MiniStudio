@@ -107,6 +107,12 @@ pub struct StreamStatus {
     pub running: bool,
     pub error: Option<String>,
     pub pdc_samples: usize,
+    /// Smoothed audio-callback time divided by its realtime buffer budget.
+    pub cpu_load_percent: f64,
+    /// Short peak hold for spotting transient overloads that the average hides.
+    pub cpu_peak_percent: f64,
+    /// Zero outside pre-count; otherwise the number of musical beats still to count.
+    pub count_in_beats_remaining: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Type)]
@@ -137,6 +143,10 @@ pub struct GraphSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct TransportSpec {
     pub bpm: f64,
+    #[serde(default)]
+    pub tempo_points: Vec<TempoPointSpec>,
+    #[serde(default)]
+    pub time_signatures: Vec<TimeSignaturePointSpec>,
     pub playhead_sec: f64,
     pub is_playing: bool,
     #[serde(rename = "loop")]
@@ -332,6 +342,32 @@ pub struct ExternalPluginRef {
     pub has_editor: bool,
     #[serde(default)]
     pub state: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TempoCurveSpec {
+    #[default]
+    Jump,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoPointSpec {
+    pub tick: u64,
+    pub bpm: f64,
+    #[serde(default)]
+    pub curve: TempoCurveSpec,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeSignaturePointSpec {
+    /// One-based bar number. Signature changes are therefore always bar-aligned.
+    pub bar: u32,
+    pub numerator: u8,
+    pub denominator: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]

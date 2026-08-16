@@ -1,0 +1,10 @@
+{
+  "formatVersion": 2,
+  "meta": { "name": "Legacy v2", "sampleRate": 48000, "createdAt": "2025-01-01T00:00:00.000Z" },
+  "transport": { "bpm": 128, "timeSignature": { "numerator": 4, "denominator": 4 }, "playheadSec": 0, "isPlaying": false, "loop": { "enabled": false, "startSec": 0, "endSec": 8 } },
+  "assets": { "shared": { "id": "shared", "path": "", "name": "shared.wav", "durationSec": 4, "sampleRate": 48000, "numChannels": 2, "peaks": [0, 0.25] } },
+  "tracks": [{ "id": "audio", "kind": "audio", "name": "Audio", "color": "#fff", "clips": [{ "id": "clip-a", "assetId": "shared", "startSec": 0, "offsetSec": 0, "durationSec": 2, "gainDb": 0, "fadeInSec": 0, "fadeOutSec": 0 }, { "id": "clip-b", "assetId": "shared", "startSec": 2, "offsetSec": 0, "durationSec": 2, "gainDb": 0, "fadeInSec": 0, "fadeOutSec": 0 }], "midiClips": [], "instrument": null, "volumeDb": 0, "pan": 0, "muted": false, "solo": false, "armed": false, "effects": [], "sends": [] }],
+  "buses": [],
+  "master": { "volumeDb": 0, "effects": [] },
+  "unknownFutureSafeField": { "ignored": true }
+}

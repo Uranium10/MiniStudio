@@ -1,7 +1,7 @@
 // Central Zustand project, selection, view, and undo/redo state.
 import { create } from 'zustand'
-import type { AudioAssetInfo, AutomationLane, Clip, EffectInstance, ExternalPluginRef, MidiClip, MidiControlPoint, MidiNote, ProjectState, TimeSignature, Track } from '../engine'
-import { MIDI_PITCH_BEND_LANE, MIDI_PPQ, secondsPerBeat } from '../engine'
+import type { AudioAssetInfo, AudioSourceRef, AutomationLane, Clip, EffectInstance, ExternalPluginRef, MidiClip, MidiControlPoint, MidiNote, ProjectState, TimeSignature, Track } from '../engine'
+import { MIDI_PITCH_BEND_LANE, MIDI_PPQ, normalizeTempoMap, secondsPerBeat, TempoMap, type TempoMapData } from '../engine'
 import { createEmptyProject } from './demoProject'
 
 export type LowerTab = 'mixer' | 'effects'
@@ -34,7 +34,10 @@ type ProjectStore = {
   browserVisible: boolean
   browserDock: BrowserDock
   recordingEnabled: boolean
+  metronomeEnabled: boolean
+  metronomeVolumeDb: number
   countInBars: 0 | 1 | 2
+  countInActive: boolean
   overdubMode: 'merge' | 'new'
   pixelsPerSecond: number
   pianoRollZoom: number
@@ -79,6 +82,10 @@ type ProjectStore = {
   replaceAsset(oldId: string, asset: AudioAssetInfo): void
   setPlayhead(sec: number): void
   setPlaying(value: boolean): void
+  setMetronomeEnabled(enabled: boolean): void
+  setMetronomeVolumeDb(gainDb: number): void
+  setCountInBars(bars: 0 | 1 | 2): void
+  setCountInActive(active: boolean): void
   selectTrack(id: string | null, range?: boolean): void
   setEditFocus(focus: EditFocus): void
   selectClip(id: string, additive?: boolean): void
@@ -117,7 +124,8 @@ type ProjectStore = {
   toggleMasterMute(): void
   toggleMasterDim(): void
   reorderTrack(fromIndex: number, toIndex: number): void
-  updateClip(trackId: string, clipId: string, patch: Partial<Omit<Clip, 'id' | 'assetId'>>): void
+  updateClip(trackId: string, clipId: string, patch: Partial<Omit<Clip, 'id' | 'audioSourceRefId'>>): void
+  makeAudioSourceUnique(trackId: string, clipId: string): void
   upsertClipGainPoint(trackId: string, clipId: string, point: { id?: string; timeSec: number; valueDb: number; curve?: number }): string | null
   removeClipGainPoint(trackId: string, clipId: string, pointId: string): void
   selectClipGainPoint(point: ClipGainPointRef | null): void
@@ -212,12 +220,29 @@ export function snapTicksWithSwing(ticks: number, gridTicks: number, swing = 0):
   return Math.max(0, Math.round(step * size + delayed))
 }
 
-export function snapTimeWithSwing(seconds: number, gridTicks: number, bpm: number, swing = 0): number {
+export function snapTimeWithSwing(seconds: number, gridTicks: number, bpm: number, swing = 0, tempoMap?: TempoMapData): number {
+  if (tempoMap) {
+    const map = preparedTempoMap(tempoMap)
+    return map.ticksToSeconds(snapTicksWithSwing(map.secondsToTicks(seconds), gridTicks, swing))
+  }
   const ticks = seconds / secondsPerBeat(bpm) * MIDI_PPQ
   return snapTicksWithSwing(ticks, gridTicks, swing) / MIDI_PPQ * secondsPerBeat(bpm)
 }
 
-export function clipSourceStep(clip: Clip, projectBpm: number): number {
+const tempoMapCache = new WeakMap<TempoMapData, TempoMap>()
+function preparedTempoMap(data: TempoMapData): TempoMap {
+  const existing = tempoMapCache.get(data)
+  if (existing) return existing
+  const map = new TempoMap(data)
+  tempoMapCache.set(data, map)
+  return map
+}
+
+export function clipSourceStep(clip: Clip, projectBpm: number, tempoMapData?: TempoMapData): number {
+  if (tempoMapData) {
+    const map = preparedTempoMap(tempoMapData)
+    projectBpm = map.bpmAtTick(map.secondsToTicks(clip.startSec))
+  }
   const sourceBpm = Math.max(20, clip.warpSourceBpm ?? projectBpm)
   const warp = clip.warpMode === 'project' ? projectBpm / sourceBpm : clip.warpMode === 'half' ? projectBpm / sourceBpm * .5 : clip.warpMode === 'double' ? projectBpm / sourceBpm * 2 : 1
   return (clip.playbackRate ?? 1) * warp * 2 ** (((clip.pitchSemitones ?? 0) + (clip.fineCents ?? 0) / 100) / 12)
@@ -248,13 +273,15 @@ export function midiDuplicateStepTicks(notes: readonly Pick<MidiNote, 'startTick
  * to keep that material visible; explicit arrangement trimming still owns
  * shrinking behavior.
  */
-function extendMidiClipToContent(clip: MidiClip, bpm: number): MidiClip {
+function extendMidiClipToContent(clip: MidiClip, bpm: number, tempoMapData?: TempoMapData): MidiClip {
   const noteEnd = clip.notes.reduce((end, note) => Math.max(end, note.startTicks + note.lengthTicks), 0)
   const controllerEnd = clip.ccLanes.reduce((end, lane) => lane.points.reduce((laneEnd, point) => Math.max(laneEnd, point.ticks + 1), end), 0)
   const contentEnd = Math.max(noteEnd, controllerEnd)
-  const durationTicks = Math.max(1, Math.round(clip.durationSec / secondsPerBeat(bpm) * MIDI_PPQ))
+  const map = tempoMapData ? preparedTempoMap(tempoMapData) : null
+  const startTick = map?.secondsToTicks(clip.startSec) ?? 0
+  const durationTicks = map ? Math.max(1, map.secondsToTicks(clip.startSec + clip.durationSec) - startTick) : Math.max(1, Math.round(clip.durationSec / secondsPerBeat(bpm) * MIDI_PPQ))
   if (contentEnd <= durationTicks) return clip
-  return { ...clip, durationSec: contentEnd / MIDI_PPQ * secondsPerBeat(bpm), loopLengthTicks: Math.max(clip.loopLengthTicks, contentEnd) }
+  return { ...clip, durationSec: map ? map.ticksToSeconds(startTick + contentEnd) - clip.startSec : contentEnd / MIDI_PPQ * secondsPerBeat(bpm), loopLengthTicks: Math.max(clip.loopLengthTicks, contentEnd) }
 }
 
 // Audio peaks are large immutable Float32Arrays. Project edits clone only the
@@ -262,8 +289,9 @@ function extendMidiClipToContent(clip: MidiClip, bpm: number): MidiClip {
 const cloneProject = (project: ProjectState, copyAssets = false): ProjectState => ({
   ...project,
   meta: { ...project.meta },
-  transport: { ...project.transport, loop: { ...project.transport.loop } },
+  transport: { ...project.transport, loop: { ...project.transport.loop }, tempoMap: { tempoPoints: project.transport.tempoMap.tempoPoints.map((point) => ({ ...point })), timeSignatures: project.transport.tempoMap.timeSignatures.map((point) => ({ ...point })) } },
   assets: copyAssets ? { ...project.assets } : project.assets,
+  audioSourceRefs: Object.fromEntries(Object.entries(project.audioSourceRefs).map(([id, ref]) => [id, { ...ref }])),
   tracks: project.tracks.map((track) => ({
     ...track,
     clips: track.clips.map((clip) => ({ ...clip, gainPoints: clip.gainPoints?.map((point) => ({ ...point })) })),
@@ -282,6 +310,23 @@ const cloneProject = (project: ProjectState, copyAssets = false): ProjectState =
     effects: project.master.effects.map((effect) => ({ ...effect, params: { ...effect.params }, sidechain: effect.sidechain ? { ...effect.sidechain } : undefined })),
   },
 })
+
+function createAudioSourceRef(project: ProjectState, asset: AudioAssetInfo, name = asset.name): AudioSourceRef {
+  const id = `source-${crypto.randomUUID()}`
+  const matching = Object.values(project.assets).find((candidate) => candidate.path && candidate.path.localeCompare(asset.path, undefined, { sensitivity: 'accent' }) === 0)
+  const resolved = matching ?? asset
+  project.assets[resolved.id] = resolved
+  const ref = { id, assetId: resolved.id, name, modificationId: null }
+  project.audioSourceRefs[id] = ref
+  return ref
+}
+
+function collectUnusedAudioSources(project: ProjectState): void {
+  const usedRefs = new Set(project.tracks.flatMap((track) => track.clips.map((clip) => clip.audioSourceRefId)))
+  for (const id of Object.keys(project.audioSourceRefs)) if (!usedRefs.has(id)) delete project.audioSourceRefs[id]
+  const usedAssets = new Set(Object.values(project.audioSourceRefs).map((ref) => ref.assetId))
+  for (const id of Object.keys(project.assets)) if (!usedAssets.has(id)) delete project.assets[id]
+}
 
 function describeHistory(key: string): string {
   if (!key) return '프로젝트 편집'
@@ -330,7 +375,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
   const replaceMidiClip = (current: ProjectState, trackIndex: number, clipIndex: number, clip: MidiClip, historyKey = '') => {
     const sourceTrack = current.tracks[trackIndex]!
     const midiClips = sourceTrack.midiClips.slice()
-    midiClips[clipIndex] = extendMidiClipToContent(clip, current.transport.bpm)
+    midiClips[clipIndex] = extendMidiClipToContent(clip, current.transport.bpm, current.transport.tempoMap)
     const tracks = current.tracks.slice()
     tracks[trackIndex] = { ...sourceTrack, midiClips }
     commitProject(current, { ...current, tracks }, historyKey)
@@ -355,7 +400,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     browserVisible: false,
     browserDock: 'right',
     recordingEnabled: false,
+    metronomeEnabled: false,
+    metronomeVolumeDb: -12,
     countInBars: 0,
+    countInActive: false,
     overdubMode: 'merge',
     pixelsPerSecond: 30,
     pianoRollZoom: 66,
@@ -392,11 +440,16 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       lastHistoryKey = ''
       const migrated: ProjectState = {
         ...project,
-        formatVersion: 2 as const,
-        transport: { ...project.transport, timeSignature: project.transport.timeSignature ?? { numerator: 4, denominator: 4 } },
+        formatVersion: 3 as const,
+        transport: (() => {
+          const timeSignature = project.transport.timeSignature ?? { numerator: 4, denominator: 4 }
+          const tempoMap = normalizeTempoMap(project.transport.tempoMap, project.transport.bpm, timeSignature.numerator, timeSignature.denominator)
+          return { ...project.transport, bpm: tempoMap.tempoPoints[0]!.bpm, timeSignature, tempoMap }
+        })(),
         tracks: project.tracks.map((track) => ({ ...track, kind: track.kind ?? 'audio', clips: (track.clips ?? []).map((clip) => ({ ...clip, fadeInCurve: clip.fadeInCurve ?? 0, fadeOutCurve: clip.fadeOutCurve ?? 0, gainPoints: (clip.gainPoints ?? []).map((point) => ({ ...point })), warpMode: clip.warpMode ?? 'none', warpSourceBpm: clip.warpSourceBpm ?? project.transport.bpm })), midiClips: (track.midiClips ?? []).map((clip) => ({ ...clip, notes: clip.notes ?? [], ccLanes: clip.ccLanes ?? [] })), instrument: track.instrument ?? null, outputBusId: track.outputBusId ?? null, automationOpen: track.automationOpen ?? false, automationLanes: (track.automationLanes ?? []).map((lane) => ({ ...lane, mode: lane.mode ?? 'read', height: lane.height == null ? undefined : Math.max(54, Math.min(240, lane.height)), points: lane.points ?? [] })), height: track.height == null ? undefined : Math.max(46, Math.min(240, track.height)) })),
         buses: project.buses.map((bus) => ({ ...bus, muted: bus.muted ?? false })),
         master: { ...project.master, muted: project.master.muted ?? false, dim: project.master.dim ?? false },
+        audioSourceRefs: Object.fromEntries(Object.entries(project.audioSourceRefs ?? {}).map(([id, ref]) => [id, { ...ref, modificationId: ref.modificationId ?? null }])),
       }
       const selectedTrackId = migrated.tracks[0]?.id ?? null
       set({ project: migrated, playheadSec: migrated.transport.playheadSec, past: [], future: [], history: [], futureHistory: [], selectedTrackId, selectedTrackIds: selectedTrackId ? [selectedTrackId] : [], selectedClipIds: [], selectedNoteIds: [], selectedAutomationPoints: [], selectedClipGainPoint: null, editFocus: 'arrangement', editorClip: null, pianoRollOpen: false, editorMaximized: false, virtualPianoOpen: false, focusedEffectId: null })
@@ -412,11 +465,15 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     replaceAsset: (oldId, asset) => mutateProject((project) => {
       delete project.assets[oldId]
       project.assets[asset.id] = asset
-      for (const track of project.tracks) for (const clip of track.clips) if (clip.assetId === oldId) clip.assetId = asset.id
+      for (const ref of Object.values(project.audioSourceRefs)) if (ref.assetId === oldId) ref.assetId = asset.id
       queueMicrotask(() => set((state) => ({ missingAssets: state.missingAssets.filter((missing) => missing.id !== oldId) })))
     }, { copyAssets: true }),
     setPlayhead: (sec) => set({ playheadSec: Math.max(0, sec) }),
     setPlaying: (value) => set((state) => ({ project: { ...state.project, transport: { ...state.project.transport, isPlaying: value } } })),
+    setMetronomeEnabled: (enabled) => set({ metronomeEnabled: enabled }),
+    setMetronomeVolumeDb: (gainDb) => set({ metronomeVolumeDb: Math.max(-60, Math.min(6, gainDb)) }),
+    setCountInBars: (bars) => set({ countInBars: bars }),
+    setCountInActive: (active) => { if (get().countInActive !== active) set({ countInActive: active }) },
     selectTrack: (id, range = false) => set((state) => {
       if (!id) return { selectedTrackId: null, selectedTrackIds: [], selectedAutomationPoints: [], selectedClipGainPoint: null }
       if (!range || !state.selectedTrackId) return { selectedTrackId: id, selectedTrackIds: [id], selectedClipIds: [], selectedAutomationPoints: [], selectedClipGainPoint: null, editFocus: 'arrangement' as const, rackTarget: { kind: 'track' as const, id } }
@@ -457,7 +514,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     },
     removeTrack: (trackId) => {
       const removedName = get().project.tracks.find((track) => track.id === trackId)?.name ?? '트랙'
-      mutateProject((project) => { project.tracks = project.tracks.filter((track) => track.id !== trackId) }, { historyLabel: `${removedName} 삭제` })
+      mutateProject((project) => { project.tracks = project.tracks.filter((track) => track.id !== trackId); collectUnusedAudioSources(project) }, { copyAssets: true, historyLabel: `${removedName} 삭제` })
       const remaining = get().project.tracks
       set((state) => ({
         selectedTrackId: state.selectedTrackId === trackId ? remaining[0]?.id ?? null : state.selectedTrackId,
@@ -638,14 +695,16 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const lane = state.project.tracks.find((track) => track.id === first.trackId)?.automationLanes?.find((item) => item.id === first.laneId)
       const points = lane?.points.filter((point) => selected.has(point.id)) ?? []
       if (!points.length) return
-      const extent = Math.max(...points.map((point) => point.timeSec)) - Math.min(...points.map((point) => point.timeSec))
-      const ticksPerSecond = MIDI_PPQ / secondsPerBeat(state.project.transport.bpm)
-      const delta = studioOneDuplicateStepTicks(Math.max(1, Math.round(extent * ticksPerSecond)), state.gridTicks, state.snapEnabled) / ticksPerSecond
+      const firstSec = Math.min(...points.map((point) => point.timeSec))
+      const lastSec = Math.max(...points.map((point) => point.timeSec))
+      const map = new TempoMap(state.project.transport.tempoMap)
+      const firstTick = map.secondsToTicks(firstSec)
+      const deltaTicks = studioOneDuplicateStepTicks(Math.max(1, map.secondsToTicks(lastSec) - firstTick), state.gridTicks, state.snapEnabled)
       const ids: AutomationPointRef[] = []
       mutateProject((project) => {
         const target = project.tracks.find((track) => track.id === first.trackId)?.automationLanes?.find((item) => item.id === first.laneId)
         if (!target) return
-        for (const point of points) { const id = crypto.randomUUID(); target.points.push({ ...point, id, timeSec: point.timeSec + delta }); ids.push({ ...first, pointId: id }) }
+        for (const point of points) { const id = crypto.randomUUID(); target.points.push({ ...point, id, timeSec: map.ticksToSeconds(map.secondsToTicks(point.timeSec) + deltaTicks) }); ids.push({ ...first, pointId: id }) }
         target.points.sort((left, right) => left.timeSec - right.timeSec)
       }, { historyLabel: '오토메이션 포인트 복제' })
       if (ids.length) set({ selectedAutomationPoints: ids })
@@ -728,7 +787,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         const source = midiClips[midiIndex]!
         let notes = source.notes
         if (patch.startSec !== undefined && patch.durationSec !== undefined && patch.startSec !== source.startSec) {
-          const deltaTicks = Math.round((patch.startSec - source.startSec) * current.transport.bpm / 60 * 960)
+          const map = new TempoMap(current.transport.tempoMap)
+          const deltaTicks = map.secondsToTicks(patch.startSec) - map.secondsToTicks(source.startSec)
           notes = source.notes.flatMap((note) => {
             const end = note.startTicks + note.lengthTicks - deltaTicks
             if (end <= 0) return []
@@ -818,8 +878,11 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         const midi = track.midiClips.find((candidate) => candidate.id === clipId)
         if (!midi || atSec <= midi.startSec + 0.05 || atSec >= midi.startSec + midi.durationSec - 0.05) return
         const leftDuration = atSec - midi.startSec
-        const splitTicks = Math.round(leftDuration * project.transport.bpm / 60 * 960)
-        const originalEnd = Math.round(midi.durationSec * project.transport.bpm / 60 * 960)
+        const rightDuration = midi.startSec + midi.durationSec - atSec
+        const map = new TempoMap(project.transport.tempoMap)
+        const midiStartTick = map.secondsToTicks(midi.startSec)
+        const splitTicks = map.secondsToTicks(atSec) - midiStartTick
+        const originalEnd = map.secondsToTicks(midi.startSec + midi.durationSec) - midiStartTick
         const rightNotes = midi.notes.flatMap((note) => {
           const end = note.startTicks + note.lengthTicks
           if (end <= splitTicks) return []
@@ -828,13 +891,13 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         })
         midi.notes = midi.notes.flatMap((note) => note.startTicks >= splitTicks ? [] : [{ ...note, lengthTicks: Math.max(1, Math.min(note.lengthTicks, splitTicks - note.startTicks)) }])
         midi.durationSec = leftDuration
-        track.midiClips.push({ ...midi, id: crypto.randomUUID(), name: `${midi.name} B`, startSec: atSec, durationSec: Math.max(.05, originalEnd / 960 * 60 / project.transport.bpm - leftDuration), notes: rightNotes })
+        track.midiClips.push({ ...midi, id: crypto.randomUUID(), name: `${midi.name} B`, startSec: atSec, durationSec: Math.max(.05, rightDuration), notes: rightNotes })
         return
       }
       if (atSec <= source.startSec + 0.05 || atSec >= source.startSec + source.durationSec - 0.05) return
       const leftDuration = atSec - source.startSec
       const rightDuration = source.durationSec - leftDuration
-      const sourceStep = clipSourceStep(source, project.transport.bpm)
+      const sourceStep = clipSourceStep(source, project.transport.bpm, project.transport.tempoMap)
       const right = { ...source, id: crypto.randomUUID(), startSec: atSec, offsetSec: source.reversed ? source.offsetSec : source.offsetSec + leftDuration * sourceStep, durationSec: rightDuration, fadeInSec: 0, gainPoints: (source.gainPoints ?? []).filter((point) => point.timeSec > leftDuration).map((point) => ({ ...point, id: crypto.randomUUID(), timeSec: point.timeSec - leftDuration })) }
       if (source.reversed) source.offsetSec += rightDuration * sourceStep
       source.gainPoints = (source.gainPoints ?? []).filter((point) => point.timeSec <= leftDuration)
@@ -844,7 +907,7 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
     }),
     deleteSelectedClips: () => {
       const selected = new Set(get().selectedClipIds)
-      mutateProject((project) => { for (const track of project.tracks) { track.clips = track.clips.filter((clip) => !selected.has(clip.id)); track.midiClips = track.midiClips.filter((clip) => !selected.has(clip.id)) } })
+      mutateProject((project) => { for (const track of project.tracks) { track.clips = track.clips.filter((clip) => !selected.has(clip.id)); track.midiClips = track.midiClips.filter((clip) => !selected.has(clip.id)) } collectUnusedAudioSources(project) }, { copyAssets: true })
       set({ selectedClipIds: [] })
     },
     duplicateSelectedClips: () => {
@@ -871,17 +934,17 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (!clips.length) return
       const startSec = Math.min(...clips.map((clip) => clip.startSec))
       const endSec = Math.max(...clips.map((clip) => clip.startSec + clip.durationSec))
-      const ticksPerSecond = MIDI_PPQ / secondsPerBeat(state.project.transport.bpm)
-      const extentTicks = Math.max(1, Math.ceil((endSec - startSec) * ticksPerSecond - 1e-6))
+      const tempoMap = new TempoMap(state.project.transport.tempoMap)
+      const startTick = tempoMap.secondsToTicks(startSec)
+      const extentTicks = Math.max(1, tempoMap.secondsToTicks(endSec) - startTick)
       const deltaTicks = studioOneDuplicateStepTicks(extentTicks, state.gridTicks, state.snapEnabled)
-      const deltaSec = deltaTicks / ticksPerSecond
       const nextIds: string[] = []
       // This command used to clone the entire project (assets, effects and all
       // tracks) before adding a handful of clips. Preserve unaffected track
       // references and only copy arrays that actually receive duplicates.
       const tracks = state.project.tracks.map((track) => {
-        const audioCopies = track.clips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec, gainPoints: clip.gainPoints?.map((point) => ({ ...point, id: crypto.randomUUID() })) } })
-        const midiCopies = track.midiClips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: clip.startSec + deltaSec, notes: clip.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: clip.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) } })
+        const audioCopies = track.clips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: tempoMap.ticksToSeconds(tempoMap.secondsToTicks(clip.startSec) + deltaTicks), gainPoints: clip.gainPoints?.map((point) => ({ ...point, id: crypto.randomUUID() })) } })
+        const midiCopies = track.midiClips.filter((clip) => selected.has(clip.id)).map((clip) => { const id = crypto.randomUUID(); nextIds.push(id); return { ...clip, id, startSec: tempoMap.ticksToSeconds(tempoMap.secondsToTicks(clip.startSec) + deltaTicks), notes: clip.notes.map((note) => ({ ...note, id: crypto.randomUUID() })), ccLanes: clip.ccLanes.map((lane) => ({ ...lane, points: lane.points.map((point) => ({ ...point })) })) } })
         if (!audioCopies.length && !midiCopies.length) return track
         return {
           ...track,
@@ -977,23 +1040,34 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       set({ selectedClipIds: [id] })
       return id
     },
+    makeAudioSourceUnique: (trackId, clipId) => mutateProject((project) => {
+      const clip = project.tracks.find((track) => track.id === trackId)?.clips.find((candidate) => candidate.id === clipId)
+      if (!clip) return
+      const source = project.audioSourceRefs[clip.audioSourceRefId]
+      if (!source) return
+      const id = `source-${crypto.randomUUID()}`
+      project.audioSourceRefs[id] = { ...source, id, modificationId: null }
+      clip.audioSourceRefId = id
+    }, { historyLabel: '독립된 오디오 소스 만들기' }),
     addSilentClip: (trackId, startSec, durationSec) => mutateProject((project) => {
-      project.tracks.find((track) => track.id === trackId)?.clips.push({ id: crypto.randomUUID(), assetId: '', name: 'Empty clip', startSec, offsetSec: 0, durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0 })
+      const sourceId = `source-${crypto.randomUUID()}`
+      project.audioSourceRefs[sourceId] = { id: sourceId, assetId: '', name: 'Empty clip', modificationId: null }
+      project.tracks.find((track) => track.id === trackId)?.clips.push({ id: crypto.randomUUID(), audioSourceRefId: sourceId, name: 'Empty clip', startSec, offsetSec: 0, durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0 })
     }),
     addAssetAsTrack: (asset) => {
       const playheadSec = get().playheadSec
       mutateProject((project) => {
-      project.assets[asset.id] = asset
+      const source = createAudioSourceRef(project, asset)
       const id = crypto.randomUUID()
-      project.tracks.push({ id, kind: 'audio', name: asset.name.replace(/\.[^.]+$/, ''), color: '#43c6ac', clips: [{ id: crypto.randomUUID(), assetId: asset.id, name: asset.name, startSec: playheadSec, offsetSec: 0, durationSec: asset.durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0 }], midiClips: [], instrument: null, volumeDb: 0, pan: 0, muted: false, solo: false, armed: false, effects: [], sends: [], height: get().trackHeight })
+      project.tracks.push({ id, kind: 'audio', name: asset.name.replace(/\.[^.]+$/, ''), color: '#43c6ac', clips: [{ id: crypto.randomUUID(), audioSourceRefId: source.id, name: asset.name, startSec: playheadSec, offsetSec: 0, durationSec: asset.durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0 }], midiClips: [], instrument: null, volumeDb: 0, pan: 0, muted: false, solo: false, armed: false, effects: [], sends: [], height: get().trackHeight })
       queueMicrotask(() => set({ selectedTrackId: id, selectedTrackIds: [id] }))
       }, { copyAssets: true })
     },
     insertAudioAsset: (asset, startSec, targetTrackId, insertIndex) => {
       let selectedId = targetTrackId ?? ''
       mutateProject((project) => {
-        project.assets[asset.id] = asset
-        const clip: Clip = { id: crypto.randomUUID(), assetId: asset.id, name: asset.name, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0, playbackRate: 1, pitchSemitones: 0, fineCents: 0, reversed: false }
+        const source = createAudioSourceRef(project, asset)
+        const clip: Clip = { id: crypto.randomUUID(), audioSourceRefId: source.id, name: asset.name, startSec: Math.max(0, startSec), offsetSec: 0, durationSec: asset.durationSec, gainDb: 0, fadeInSec: 0, fadeOutSec: 0, playbackRate: 1, pitchSemitones: 0, fineCents: 0, reversed: false }
         const target = targetTrackId ? project.tracks.find((track) => track.id === targetTrackId && track.kind === 'audio') : undefined
         if (target) { target.clips.push(clip); selectedId = target.id; return }
         selectedId = crypto.randomUUID()
@@ -1009,7 +1083,8 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         const track = project.tracks.find((candidate) => candidate.id === trackId && candidate.kind === 'instrument')
         if (!track) return
         const clippedDuration = Math.max(0.25, durationSec)
-        const loopLengthTicks = Math.max(1, Math.round(clippedDuration / secondsPerBeat(project.transport.bpm) * MIDI_PPQ))
+        const map = new TempoMap(project.transport.tempoMap)
+        const loopLengthTicks = Math.max(1, map.secondsToTicks(Math.max(0, startSec) + clippedDuration) - map.secondsToTicks(Math.max(0, startSec)))
         track.midiClips.push({ id, name: 'MIDI Clip', startSec: Math.max(0, startSec), durationSec: clippedDuration, loopEnabled: false, loopStartTicks: 0, loopLengthTicks, notes: [], ccLanes: [], transposeSemitones: 0, velocityScale: 1, muted: false, color: null })
         created = true
       })
@@ -1103,7 +1178,9 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (!copies.length) return []
       const notes = [...source.notes, ...copies].sort((a, b) => a.startTicks - b.startTicks || a.pitch - b.pitch)
       const copiedEndTicks = Math.max(...copies.map((note) => note.startTicks + note.lengthTicks))
-      const requiredDurationSec = copiedEndTicks / MIDI_PPQ * secondsPerBeat(current.transport.bpm)
+      const map = new TempoMap(current.transport.tempoMap)
+      const clipStartTick = map.secondsToTicks(source.startSec)
+      const requiredDurationSec = map.ticksToSeconds(clipStartTick + copiedEndTicks) - source.startSec
       replaceMidiClip(current, trackIndex, clipIndex, { ...source, notes, loopLengthTicks: Math.max(source.loopLengthTicks, copiedEndTicks), durationSec: Math.max(source.durationSec, requiredDurationSec) })
       const ids = copies.map((note) => note.id)
       set({ selectedNoteIds: ids })
@@ -1294,9 +1371,10 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
         if (effect) effect.sidechain = { enabled, sourceTrackId: sourceId }
       })
     },
-    setBpm: (bpm) => { if (Number.isFinite(bpm)) mutateProject((project) => { project.transport.bpm = Math.round(Math.max(20, Math.min(300, bpm)) * 100) / 100 }, { historyKey: 'transport:bpm' }) },
+    setBpm: (bpm) => { if (Number.isFinite(bpm)) mutateProject((project) => { const value = Math.round(Math.max(20, Math.min(300, bpm)) * 100) / 100; project.transport.bpm = value; project.transport.tempoMap.tempoPoints[0] = { ...(project.transport.tempoMap.tempoPoints[0] ?? { tick: 0, curve: 'jump' as const }), tick: 0, bpm: value } }, { historyKey: 'transport:bpm' }) },
     setTimeSignature: (signature) => mutateProject((project) => {
       project.transport.timeSignature = { numerator: Math.max(1, Math.min(32, Math.round(signature.numerator))), denominator: [1, 2, 4, 8, 16].includes(signature.denominator) ? signature.denominator : 4 }
+      project.transport.tempoMap.timeSignatures[0] = { bar: 1, ...project.transport.timeSignature }
     }),
     toggleLoop: () => mutateProject((project) => { project.transport.loop.enabled = !project.transport.loop.enabled }),
     setLoopRange: (startSec, endSec) => mutateProject((project) => {

@@ -18,6 +18,7 @@ import { useFineRangeControls } from './components/controls'
 import { describeEngineError, effectiveBusGainDb, effectiveMasterGainDb, type AutomationLane, type IAudioEngine, type PluginDescriptor, type ProjectState } from './engine'
 import { useEngine } from './hooks/useEngine'
 import { markSessionClean, writeRecoverySnapshot } from './io/autosave'
+import { installMidiInputCoordinator } from './midi/MidiInputCoordinator'
 import { scanPluginsOnce } from './plugins/scan'
 import { installPluginShellBridge } from './plugins/shellBridge'
 import { useShortcuts } from './shortcuts/useShortcuts'
@@ -79,6 +80,7 @@ export default function App() {
             buses: current.buses.map((bus) => ({ ...bus, volumeDb: effectiveBusGainDb(bus) })),
             master: { ...current.master, volumeDb: effectiveMasterGainDb(current.master) },
             transport: { ...current.transport, playheadSec: 0, isPlaying: false },
+            audioSourceRefs: current.audioSourceRefs,
           })
           // Store/plugin hydration can request another structural graph while
           // the current native rebuild is still running. Consume the latest
@@ -131,71 +133,11 @@ export default function App() {
   useEffect(() => engine.onPlayhead((sec) => {
     const store = useProjectStore.getState()
     store.setPlayhead(sec)
+    store.setCountInActive(engine.getStreamStatus().countInBeatsRemaining > 0)
     applyReadAutomation(engine, store.project, sec)
   }), [engine])
 
-  useEffect(() => {
-    let cancelled = false
-    let checking = false
-    let requestedRevision = 0
-    let resetRequested = false
-    let knownPorts = new Set<string>()
-    const announced = new Set<string>()
-    const reconcileMidi = async (resetConnections = false) => {
-      requestedRevision += 1
-      resetRequested ||= resetConnections
-      if (checking || cancelled) return
-      checking = true
-      try {
-        while (!cancelled) {
-          const revision = requestedRevision
-          const shouldReset = resetRequested
-          resetRequested = false
-          const store = useProjectStore.getState()
-          const target = store.project.tracks.find((track) => track.id === store.selectedTrackId && track.kind === 'instrument')
-            ?? store.project.tracks.find((track) => track.kind === 'instrument' && track.armed)
-            ?? store.project.tracks.find((track) => track.kind === 'instrument')
-          if (!target) {
-            for (const portId of knownPorts) await engine.disconnectMidiInput(portId).catch(() => undefined)
-            knownPorts.clear()
-          } else {
-            if (shouldReset) {
-              engine.midiAllNotesOff(target.id)
-              for (const portId of knownPorts) await engine.disconnectMidiInput(portId).catch(() => undefined)
-            }
-            const ports = await engine.listMidiInputs()
-            const available = new Set(ports.map((port) => port.id))
-            for (const removed of knownPorts) if (!available.has(removed)) await engine.disconnectMidiInput(removed).catch(() => undefined)
-            knownPorts = available
-            for (const port of ports) {
-              if (cancelled || (port.connected && port.targetTrackId === target.id && !shouldReset)) continue
-              try {
-                if (port.targetTrackId && port.targetTrackId !== target.id) engine.midiAllNotesOff(port.targetTrackId)
-                await engine.connectMidiInput(port.id, target.id)
-                if (!announced.has(port.id)) { announced.add(port.id); store.showToast(`${port.name} MIDI 입력을 ${target.name}에 연결했습니다.`) }
-              } catch { /* Graph rebuilds and hot-plug can invalidate a port transiently; the next revision retries. */ }
-            }
-          }
-          if (revision === requestedRevision) break
-        }
-      } finally { checking = false }
-    }
-    void reconcileMidi()
-    let selectedTrackId = useProjectStore.getState().selectedTrackId
-    const unsubscribe = useProjectStore.subscribe((state) => {
-      if (state.selectedTrackId === selectedTrackId) return
-      selectedTrackId = state.selectedTrackId
-      void reconcileMidi()
-    })
-    const refresh = () => void reconcileMidi()
-    const devicesChanged = () => void reconcileMidi(true)
-    window.addEventListener('focus', refresh)
-    window.addEventListener('ministudio:midi-refresh', devicesChanged)
-    window.addEventListener('ministudio:graph-synced', devicesChanged)
-    let access: MIDIAccess | null = null
-    void navigator.requestMIDIAccess?.({ sysex: false }).then((value) => { if (!cancelled) { access = value; value.onstatechange = devicesChanged } }).catch(() => undefined)
-    return () => { cancelled = true; unsubscribe(); window.removeEventListener('focus', refresh); window.removeEventListener('ministudio:midi-refresh', devicesChanged); window.removeEventListener('ministudio:graph-synced', devicesChanged); if (access) access.onstatechange = null }
-  }, [engine])
+  useEffect(() => installMidiInputCoordinator(engine), [engine])
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
@@ -298,9 +240,11 @@ function applyReadAutomation(engine: IAudioEngine, project: ProjectState, sec: n
 
 function graphStructureSignature(project: ProjectState): string {
   const fields: Array<string | number | boolean> = [project.transport.bpm, project.transport.loop.enabled, project.transport.loop.startSec, project.transport.loop.endSec]
+  for (const point of project.transport.tempoMap.tempoPoints) fields.push(point.tick, point.bpm, point.curve)
+  for (const signature of project.transport.tempoMap.timeSignatures) fields.push(signature.bar, signature.numerator, signature.denominator)
   for (const track of project.tracks) {
     fields.push(track.id, track.kind, track.outputBusId ?? '')
-    for (const clip of track.clips) { fields.push(clip.id, clip.assetId, clip.startSec, clip.offsetSec, clip.durationSec, clip.gainDb, clip.fadeInSec, clip.fadeOutSec, clip.fadeInCurve ?? 0, clip.fadeOutCurve ?? 0, clip.muted ?? false, clip.playbackRate ?? 1, clip.pitchSemitones ?? 0, clip.fineCents ?? 0, clip.reversed ?? false, clip.warpMode ?? 'none', clip.warpSourceBpm ?? project.transport.bpm); for (const point of clip.gainPoints ?? []) fields.push(point.id, point.timeSec, point.valueDb, point.curve ?? 0) }
+    for (const clip of track.clips) { const source = project.audioSourceRefs[clip.audioSourceRefId]; fields.push(clip.id, clip.audioSourceRefId, source?.assetId ?? '', clip.startSec, clip.offsetSec, clip.durationSec, clip.gainDb, clip.fadeInSec, clip.fadeOutSec, clip.fadeInCurve ?? 0, clip.fadeOutCurve ?? 0, clip.muted ?? false, clip.playbackRate ?? 1, clip.pitchSemitones ?? 0, clip.fineCents ?? 0, clip.reversed ?? false, clip.warpMode ?? 'none', clip.warpSourceBpm ?? project.transport.bpm); for (const point of clip.gainPoints ?? []) fields.push(point.id, point.timeSec, point.valueDb, point.curve ?? 0) }
     for (const clip of track.midiClips) {
       fields.push(clip.id, clip.startSec, clip.durationSec, clip.loopEnabled, clip.loopStartTicks, clip.loopLengthTicks, clip.transposeSemitones, clip.velocityScale, clip.muted)
       for (const note of clip.notes) fields.push(note.id, note.pitch, note.velocity, note.startTicks, note.lengthTicks, note.releaseVelocity, note.muted)

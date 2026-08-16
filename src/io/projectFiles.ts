@@ -1,7 +1,9 @@
 // Tauri-backed project and audio file dialogs with typed JSON conversion.
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { exists, readTextFile, writeTextFile } from '@tauri-apps/plugin-fs'
-import type { IAudioEngine, ProjectState } from '../engine'
+import { normalizeTempoMap, type AudioSourceRef, type IAudioEngine, type ProjectState } from '../engine'
+
+export const CURRENT_PROJECT_FORMAT = 3 as const
 
 type StoredProject = Omit<ProjectState, 'assets'> & {
   assets: Record<string, Omit<ProjectState['assets'][string], 'peaks'> & { peaks: number[] }>
@@ -47,24 +49,52 @@ export function serializeProject(project: ProjectState): string {
 export function deserializeProject(json: string): ProjectState {
   const value: unknown = JSON.parse(json)
   if (!isStoredProject(value)) throw new Error('올바른 MiniStudio 프로젝트가 아닙니다.')
-  return fromStoredProject(value)
+  return fromStoredProject(value as StoredProject)
 }
 
-export function migrateProject(source: ProjectState | (Omit<ProjectState, 'formatVersion'> & { formatVersion?: number })): ProjectState {
-  const project = source as ProjectState
-  project.formatVersion = 2
-  project.transport = { ...project.transport, timeSignature: project.transport.timeSignature ?? { numerator: 4, denominator: 4 } }
-  project.tracks = project.tracks.map((track) => ({
-    ...track,
-    kind: track.kind ?? 'audio',
-    clips: track.clips ?? [],
-    midiClips: track.midiClips ?? [],
-    instrument: track.instrument ?? null,
-  }))
-  // Mute/dim arrived after format 2 shipped, so older files default to unmuted.
-  project.buses = project.buses.map((bus) => ({ ...bus, muted: bus.muted ?? false }))
-  project.master = { ...project.master, muted: project.master.muted ?? false, dim: project.master.dim ?? false }
-  return project
+export function migrateProject(source: unknown): ProjectState {
+  if (!source || typeof source !== 'object') throw new Error('올바른 MiniStudio 프로젝트가 아닙니다.')
+  const candidate = structuredClone(source) as Record<string, unknown>
+  const version = typeof candidate.formatVersion === 'number' ? candidate.formatVersion : 1
+  if (version > CURRENT_PROJECT_FORMAT) throw new Error(`이 프로젝트는 더 새로운 MiniStudio 형식(v${version})입니다. 이 앱이 지원하는 최신 형식은 v${CURRENT_PROJECT_FORMAT}입니다.`)
+  if (version < 1) throw new Error(`지원하지 않는 MiniStudio 프로젝트 형식(v${version})입니다.`)
+
+  // v1 -> v2: track kinds, MIDI containers and strip mute state became explicit.
+  if (version < 2) candidate.formatVersion = 2
+  const v2 = candidate as unknown as ProjectState
+  v2.transport = { ...v2.transport, timeSignature: v2.transport?.timeSignature ?? { numerator: 4, denominator: 4 } }
+  v2.tracks = (v2.tracks ?? []).map((track) => ({ ...track, kind: track.kind ?? 'audio', clips: track.clips ?? [], midiClips: track.midiClips ?? [], instrument: track.instrument ?? null }))
+  v2.buses = (v2.buses ?? []).map((bus) => ({ ...bus, muted: bus.muted ?? false }))
+  v2.master = { ...v2.master, muted: v2.master?.muted ?? false, dim: v2.master?.dim ?? false }
+
+  // v2 -> v3: add the variable musical-time map and the ARA-ready source identity layer.
+  const legacyTransport = v2.transport
+  legacyTransport.tempoMap = normalizeTempoMap(legacyTransport.tempoMap, legacyTransport.bpm, legacyTransport.timeSignature.numerator, legacyTransport.timeSignature.denominator)
+  legacyTransport.bpm = legacyTransport.tempoMap.tempoPoints[0]!.bpm
+  legacyTransport.timeSignature = { numerator: legacyTransport.tempoMap.timeSignatures[0]!.numerator, denominator: legacyTransport.tempoMap.timeSignatures[0]!.denominator }
+  const refs: Record<string, AudioSourceRef> = { ...(v2.audioSourceRefs ?? {}) }
+  const refByAsset = new Map(Object.values(refs).map((ref) => [ref.assetId, ref.id]))
+  for (const track of v2.tracks) {
+    track.clips = track.clips.map((clip) => {
+      const legacy = clip as typeof clip & { assetId?: string; audioSourceRefId?: string }
+      if (legacy.audioSourceRefId && refs[legacy.audioSourceRefId]) {
+        const { assetId: _discarded, ...current } = legacy
+        return current
+      }
+      const assetId = legacy.assetId ?? ''
+      let refId = refByAsset.get(assetId)
+      if (!refId) {
+        refId = uniqueSourceRefId(refs, assetId)
+        refs[refId] = { id: refId, assetId, name: v2.assets?.[assetId]?.name ?? legacy.name ?? 'Audio source', modificationId: null }
+        refByAsset.set(assetId, refId)
+      }
+      const { assetId: _discarded, ...current } = legacy
+      return { ...current, audioSourceRefId: refId }
+    })
+  }
+  v2.audioSourceRefs = refs
+  v2.formatVersion = CURRENT_PROJECT_FORMAT
+  return v2
 }
 
 export async function saveProject(project: ProjectState): Promise<string | null> {
@@ -79,7 +109,7 @@ export async function openProject(): Promise<{ path: string; project: ProjectSta
   if (!path) return null
   const value: unknown = JSON.parse(await readTextFile(path))
   if (!isStoredProject(value)) throw new Error('올바른 MiniStudio 프로젝트가 아닙니다.')
-  return { path, project: fromStoredProject(value) }
+  return { path, project: fromStoredProject(value as StoredProject) }
 }
 
 export async function chooseAudioFile(): Promise<string | null> {
@@ -129,9 +159,7 @@ export async function hydrateProjectAudio(engine: IAudioEngine, source: ProjectS
       hydratedAssets[oldId] = asset
     }
   }
-  for (const track of project.tracks) {
-    for (const clip of track.clips) clip.assetId = replacementIds.get(clip.assetId) ?? clip.assetId
-  }
+  for (const ref of Object.values(project.audioSourceRefs)) ref.assetId = replacementIds.get(ref.assetId) ?? ref.assetId
   project.assets = hydratedAssets
   return { project, missing }
 }
@@ -140,4 +168,12 @@ function isStoredProject(value: unknown): value is StoredProject {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Record<string, unknown>
   return typeof candidate.meta === 'object' && typeof candidate.transport === 'object' && Array.isArray(candidate.tracks) && typeof candidate.assets === 'object'
+}
+
+function uniqueSourceRefId(refs: Record<string, AudioSourceRef>, assetId: string): string {
+  const base = `source:${assetId || 'silent'}`
+  if (!refs[base]) return base
+  let suffix = 2
+  while (refs[`${base}:${suffix}`]) suffix += 1
+  return `${base}:${suffix}`
 }

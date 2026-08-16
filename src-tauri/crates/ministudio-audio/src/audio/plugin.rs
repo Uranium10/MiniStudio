@@ -143,6 +143,10 @@ impl DspEffect for SharedExternalEffect {
         self.processor().set_param(id, value)
     }
 
+    fn set_tempo(&mut self, bpm: f64) {
+        self.processor().set_tempo(bpm)
+    }
+
     fn set_bypassed(&mut self, bypassed: bool) {
         self.processor().set_bypassed(bypassed)
     }
@@ -202,6 +206,10 @@ impl Instrument for SharedExternalInstrument {
 
     fn set_param(&mut self, id: &str, value: f32) {
         self.processor().set_param(id, value)
+    }
+
+    fn set_tempo(&mut self, bpm: f64) {
+        self.processor().set_tempo(bpm)
     }
 
     fn reset(&mut self) {

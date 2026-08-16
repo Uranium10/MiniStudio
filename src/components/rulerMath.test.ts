@@ -1,6 +1,6 @@
 // Ruler tick layout regression tests.
 import { describe, expect, it } from 'vitest'
-import { adaptiveGridStepSec, buildRulerTicks } from './rulerMath'
+import { adaptiveGridStepSec, buildMusicalGridLines, buildRulerTicks } from './rulerMath'
 
 const FOUR_FOUR = { numerator: 4, denominator: 4 }
 
@@ -54,5 +54,20 @@ describe('buildRulerTicks', () => {
   it('coarsens painted grid lines without changing their musical phase', () => {
     expect(adaptiveGridStepSec(.125, 20)).toBe(.5)
     expect(adaptiveGridStepSec(.125, 100)).toBe(.125)
+  })
+
+  it('maps ruler and editing-grid positions through tempo and signature changes', () => {
+    const tempoMap = {
+      tempoPoints: [{ tick: 0, bpm: 120, curve: 'jump' as const }, { tick: 3_840, bpm: 60, curve: 'jump' as const }],
+      timeSignatures: [{ bar: 1, numerator: 4, denominator: 4 }, { bar: 3, numerator: 3, denominator: 4 }],
+    }
+    const ticks = buildRulerTicks(2_000, 100, 120, FOUR_FOUR, tempoMap)
+    expect(ticks.find((tick) => tick.label === '2')?.sec).toBeCloseTo(2, 6)
+    expect(ticks.find((tick) => tick.label === '3')?.sec).toBeCloseTo(6, 6)
+    const grid = buildMusicalGridLines(2_000, 100, 240, tempoMap)
+    const before = grid[1]!.sec - grid[0]!.sec
+    const afterPoint = grid.findIndex((line) => line.sec >= 6)
+    const after = grid[afterPoint + 1]!.sec - grid[afterPoint]!.sec
+    expect(after).toBeCloseTo(before * 2, 6)
   })
 })

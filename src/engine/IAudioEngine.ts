@@ -30,7 +30,8 @@ export interface IAudioEngine {
   cancelExport(): void
   onExportProgress(cb: (progress: ExportProgress | null) => void): () => void
   syncGraph(snapshot: GraphSnapshot): Promise<void>
-  play(fromSec?: number): Promise<void>
+  play(fromSec?: number, countInBars?: number): Promise<void>
+  setMetronome(enabled: boolean, gainDb: number, bpm: number, numerator: number, denominator: number): Promise<void>
   pause(): Promise<void>
   stop(): Promise<void>
   seek(sec: number): Promise<void>

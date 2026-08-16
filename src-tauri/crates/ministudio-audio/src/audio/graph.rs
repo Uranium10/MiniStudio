@@ -169,6 +169,7 @@ struct BusNode {
 }
 pub struct AudioGraph {
     sample_rate: u32,
+    tempo: TempoMap,
     tracks: Vec<TrackNode>,
     buses: Vec<BusNode>,
     master_effects: Vec<Box<dyn DspEffect>>,
@@ -215,7 +216,15 @@ impl AudioGraph {
         let mut tracks = Vec::new();
         let mut live_effect_ids = HashSet::new();
         let mut live_instrument_ids = HashSet::new();
-        let tempo = TempoMap::new(spec.transport.bpm, sample_rate);
+        let tempo = if spec.transport.tempo_points.is_empty() {
+            TempoMap::new(spec.transport.bpm, sample_rate)
+        } else {
+            TempoMap::from_specs(
+                &spec.transport.tempo_points,
+                &spec.transport.time_signatures,
+                sample_rate,
+            )
+        };
         let mut next_note_id = 1_i32;
         for (ts_idx, ts) in spec.tracks.iter().take(MAX_TRACKS).enumerate() {
             tracks_map.insert(ts.id.clone(), ts_idx);
@@ -341,6 +350,8 @@ impl AudioGraph {
             let mut midi_events = Vec::new();
             for clip in ts.midi_clips.iter().filter(|clip| !clip.muted) {
                 let clip_start = sec_to_samples(clip.start_sec, sample_rate);
+                let clip_start_tick = tempo.samples_to_ticks(clip_start);
+                let clip_tick_sample = tempo.ticks_to_samples(clip_start_tick);
                 let clip_length = sec_to_samples(clip.duration_sec, sample_rate);
                 let loop_length = clip.loop_length_ticks.max(1);
                 // Controller points are scheduled before notes so a point placed on
@@ -355,7 +366,9 @@ impl AudioGraph {
                             } else {
                                 point.ticks
                             };
-                            let relative = tempo.ticks_to_samples(tick);
+                            let relative = tempo
+                                .ticks_to_samples(clip_start_tick.saturating_add(tick))
+                                .saturating_sub(clip_tick_sample);
                             if relative >= clip_length {
                                 break;
                             }
@@ -391,7 +404,10 @@ impl AudioGraph {
                         } else {
                             note.start_ticks
                         };
-                        let relative = tempo.ticks_to_samples(tick);
+                        let event_tick = clip_start_tick.saturating_add(tick);
+                        let relative = tempo
+                            .ticks_to_samples(event_tick)
+                            .saturating_sub(clip_tick_sample);
                         if relative >= clip_length {
                             break;
                         }
@@ -410,8 +426,10 @@ impl AudioGraph {
                                 tuning_cents: 0.0,
                             },
                         });
-                        let off =
-                            (relative + tempo.ticks_to_samples(note.length_ticks)).min(clip_length);
+                        let off = tempo
+                            .ticks_to_samples(event_tick.saturating_add(note.length_ticks))
+                            .saturating_sub(clip_tick_sample)
+                            .min(clip_length);
                         midi_events.push(ScheduledNoteEvent {
                             sample: clip_start + off,
                             kind: NoteEventKind::NoteOff {
@@ -610,6 +628,7 @@ impl AudioGraph {
         Ok((
             Box::new(Self {
                 sample_rate,
+                tempo,
                 tracks,
                 buses,
                 master_effects,
@@ -648,6 +667,8 @@ impl AudioGraph {
             },
             transport: super::types::TransportSpec {
                 bpm: 120.0,
+                tempo_points: Vec::new(),
+                time_signatures: Vec::new(),
                 playhead_sec: 0.0,
                 is_playing: false,
                 loop_: super::types::LoopSpec {
@@ -670,6 +691,25 @@ impl AudioGraph {
         master: &mut Level,
         timeline: bool,
     ) {
+        let tempo_bpm = self
+            .tempo
+            .bpm_at_tick(self.tempo.samples_to_ticks(position));
+        for track in &mut self.tracks {
+            if let Some(instrument) = &mut track.instrument {
+                instrument.set_tempo(tempo_bpm);
+            }
+            for effect in &mut track.effects {
+                effect.set_tempo(tempo_bpm);
+            }
+        }
+        for bus in &mut self.buses {
+            for effect in &mut bus.effects {
+                effect.set_tempo(tempo_bpm);
+            }
+        }
+        for effect in &mut self.master_effects {
+            effect.set_tempo(tempo_bpm);
+        }
         self.master_buffer.clear(frames);
         for b in &mut self.buses {
             b.buffer.clear(frames)
@@ -1063,6 +1103,10 @@ impl AudioGraph {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    pub fn tempo_map(&self) -> &TempoMap {
+        &self.tempo
+    }
 }
 fn render_clip(c: &ClipEvent, pos: u64, n: usize, b: &mut AudioBuffer) {
     let from = pos.max(c.start);
@@ -1241,6 +1285,8 @@ mod tests {
             },
             transport: TransportSpec {
                 bpm: 120.0,
+                tempo_points: Vec::new(),
+                time_signatures: Vec::new(),
                 playhead_sec: 0.0,
                 is_playing: true,
                 loop_: LoopSpec {
@@ -1267,7 +1313,11 @@ mod tests {
     }
 
     fn render_midi(block_size: usize) -> Vec<f32> {
-        let (mut graph, _) = AudioGraph::build(&midi_snapshot(), &HashMap::new(), 48_000).unwrap();
+        render_midi_snapshot(&midi_snapshot(), block_size)
+    }
+
+    fn render_midi_snapshot(snapshot: &GraphSnapshot, block_size: usize) -> Vec<f32> {
+        let (mut graph, _) = AudioGraph::build(snapshot, &HashMap::new(), 48_000).unwrap();
         let mut rendered = Vec::with_capacity(48_000 * 2);
         let mut position = 0_u64;
         let mut levels = [Level::default(); MAX_TRACKS];
@@ -1364,6 +1414,40 @@ mod tests {
         let large = render_midi(1_024);
         assert!(small.iter().any(|sample| sample.abs() > 0.001));
         assert_eq!(small.len(), large.len());
+        assert!(small
+            .iter()
+            .zip(&large)
+            .all(|(left, right)| left.to_bits() == right.to_bits()));
+    }
+
+    #[test]
+    fn variable_tempo_schedules_notes_at_the_analytic_sample() {
+        use ministudio_contracts::{TempoCurveSpec, TempoPointSpec};
+        let mut snapshot = midi_snapshot();
+        snapshot.transport.tempo_points = vec![
+            TempoPointSpec {
+                tick: 0,
+                bpm: 60.0,
+                curve: TempoCurveSpec::Linear,
+            },
+            TempoPointSpec {
+                tick: 1_920,
+                bpm: 180.0,
+                curve: TempoCurveSpec::Jump,
+            },
+        ];
+        snapshot.tracks[0].midi_clips[0].notes[0].start_ticks = 960;
+        let expected = TempoMap::from_specs(&snapshot.transport.tempo_points, &[], 48_000)
+            .ticks_to_samples(960);
+        let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let note_on = graph.tracks[0]
+            .midi_events
+            .iter()
+            .find(|event| matches!(event.kind, NoteEventKind::NoteOn { .. }))
+            .unwrap();
+        assert_eq!(note_on.sample, expected);
+        let small = render_midi_snapshot(&snapshot, 32);
+        let large = render_midi_snapshot(&snapshot, 1_024);
         assert!(small
             .iter()
             .zip(&large)
