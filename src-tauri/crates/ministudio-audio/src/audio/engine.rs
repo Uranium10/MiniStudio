@@ -14,7 +14,8 @@ use super::{
     instrument::{LiveMidiMessage, NoteEvent, NoteEventKind},
     metrics::RealtimeMetrics,
     midi_service::MidiService,
-    plugin::ExternalPluginRegistry,
+    plugin::StableProcessorRegistry,
+    runtime::{SchedulerSnapshot, SleepPolicy, WakeReason},
     types::{
         db_to_gain, AudioBackendInfo, AudioDeviceInfo, AudioSettings, DecodeProgress, EffectSpec,
         EngineSnapshot, EqFrequencyResponse, ExportProgress, ExportRequest, ExportResult,
@@ -216,6 +217,7 @@ pub struct MeterFrame {
     pub multiband_levels: [[[f32; 2]; 3]; MAX_EFFECT_METERS],
     pub distortion_spectra: [[f32; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
     pub limiter_metrics: [[f32; LIMITER_METER_VALUES]; MAX_EFFECT_METERS],
+    pub scheduler: SchedulerSnapshot,
 }
 impl Default for MeterFrame {
     fn default() -> Self {
@@ -234,6 +236,7 @@ impl Default for MeterFrame {
             distortion_spectra: [[0.0; DISTORTION_SPECTRUM_BINS]; MAX_EFFECT_METERS],
             limiter_metrics: [[-120.0, -120.0, 0.0, -120.0, -120.0, -120.0, -120.0];
                 MAX_EFFECT_METERS],
+            scheduler: SchedulerSnapshot::default(),
         }
     }
 }
@@ -443,20 +446,14 @@ impl AudioCore {
             frame.pdc = self.graph.max_latency();
             frame.playing = true;
             frame.count_in_beats_remaining = 0;
-            for (index, count) in self
-                .graph
-                .active_voice_counts()
-                .into_iter()
-                .take(MAX_TRACKS)
-                .enumerate()
-            {
-                frame.active_voice_counts[index] = count;
-            }
+            self.graph
+                .write_active_voice_counts(&mut frame.active_voice_counts);
             self.graph
                 .write_multiband_levels(&mut frame.multiband_levels);
             self.graph
                 .write_distortion_spectra(&mut frame.distortion_spectra);
             self.graph.write_limiter_metrics(&mut frame.limiter_metrics);
+            frame.scheduler = self.graph.scheduler_snapshot();
             self.meters.publish();
         }
     }
@@ -560,6 +557,9 @@ impl AudioCore {
                         0
                     };
                     self.count_in_elapsed = 0;
+                    if playing {
+                        self.graph.wake_all(WakeReason::Transport);
+                    }
                 }
                 AudioCommand::SetMetronome(settings) => self.metronome = settings,
                 AudioCommand::SeekTo(v) => {
@@ -629,6 +629,13 @@ impl AudioCore {
                         self.graph.set_instrument_param(track, key, value)
                     }
                 }
+                AudioCommand::SetSchedulerEnabled(enabled) => {
+                    self.graph.set_scheduler_enabled(enabled)
+                }
+                AudioCommand::SetEffectSleepPolicy { target, policy } => {
+                    self.graph.set_effect_sleep_policy(target, policy)
+                }
+                AudioCommand::WakeAll(reason) => self.graph.wake_all(reason),
                 AudioCommand::LiveMidi { track, event } => self.graph.push_live_event(track, event),
                 AudioCommand::SwapGraph(new_graph) => {
                     if self.retired.is_full() {
@@ -636,7 +643,7 @@ impl AudioCore {
                     } else {
                         let old = std::mem::replace(&mut self.graph, new_graph);
                         let _ = self.retired.push(old);
-                        self.graph.reset(self.position)
+                        self.graph.activate(self.position)
                     }
                 }
             }
@@ -655,20 +662,14 @@ impl AudioCore {
         frame.playing = self.playing;
         frame.count_in_beats_remaining = count_in_beats_remaining;
         frame.pdc = self.graph.max_latency();
-        for (index, count) in self
-            .graph
-            .active_voice_counts()
-            .into_iter()
-            .take(MAX_TRACKS)
-            .enumerate()
-        {
-            frame.active_voice_counts[index] = count;
-        }
+        self.graph
+            .write_active_voice_counts(&mut frame.active_voice_counts);
         self.graph
             .write_multiband_levels(&mut frame.multiband_levels);
         self.graph
             .write_distortion_spectra(&mut frame.distortion_spectra);
         self.graph.write_limiter_metrics(&mut frame.limiter_metrics);
+        frame.scheduler = self.graph.scheduler_snapshot();
         self.meters.publish();
     }
 }
@@ -709,7 +710,7 @@ pub struct NativeEngine {
     last_error: Option<String>,
     graph_revision: u64,
     midi_service: MidiService,
-    plugin_instances: ExternalPluginRegistry,
+    stable_processors: StableProcessorRegistry,
     idle_trackers: HashMap<String, IdleTracker>,
 }
 impl Default for NativeEngine {
@@ -733,7 +734,7 @@ impl Default for NativeEngine {
             last_error: None,
             graph_revision: 0,
             midi_service: MidiService::default(),
-            plugin_instances: ExternalPluginRegistry::default(),
+            stable_processors: StableProcessorRegistry::default(),
             idle_trackers: HashMap::new(),
         }
     }
@@ -749,7 +750,7 @@ impl NativeEngine {
         self.close_all_plugin_editors();
         self.runtime = None;
         let routes = self.midi_service.detach_all();
-        self.plugin_instances.clear();
+        self.stable_processors.clear();
         routes
     }
     fn restart_stream(&mut self) -> Result<(), String> {
@@ -771,7 +772,7 @@ impl NativeEngine {
                 spec,
                 &self.assets,
                 self.settings.sample_rate,
-                &mut self.plugin_instances,
+                &mut self.stable_processors,
             )?;
             self.bindings = b;
             self.midi_service.refresh_routes(&self.bindings.tracks);
@@ -830,7 +831,7 @@ impl NativeEngine {
                         spec,
                         &self.assets,
                         self.settings.sample_rate,
-                        &mut self.plugin_instances,
+                        &mut self.stable_processors,
                     )?;
                     self.bindings = bindings;
                     self.midi_service.refresh_routes(&self.bindings.tracks);
@@ -952,7 +953,7 @@ impl NativeEngine {
             &spec,
             &self.assets,
             self.settings.sample_rate,
-            &mut self.plugin_instances,
+            &mut self.stable_processors,
         )?;
         // Commit control-plane bindings only after the realtime queue accepts
         // the graph. If the bounded queue is full, the currently audible graph
@@ -1147,6 +1148,23 @@ impl NativeEngine {
             spec.bypassed = bypassed;
         }
         self.push(AudioCommand::SetEffectBypass { target, bypassed })
+    }
+    /// Diagnostic global kill switch used for scheduler A/B rendering.
+    pub fn set_scheduler_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        self.push(AudioCommand::SetSchedulerEnabled(enabled))
+    }
+    /// Per-node compatibility escape hatch. External plug-ins remain conservative
+    /// by default; this API also lets diagnostics force a native node to run.
+    pub fn set_effect_sleep_policy(&mut self, id: &str, policy: SleepPolicy) -> Result<(), String> {
+        let target = *self.bindings.effects.get(id).ok_or("unknown effect")?;
+        self.push(AudioCommand::SetEffectSleepPolicy { target, policy })
+    }
+    pub fn notify_automation_or_modulation(&mut self, modulation: bool) -> Result<(), String> {
+        self.push(AudioCommand::WakeAll(if modulation {
+            WakeReason::Modulation
+        } else {
+            WakeReason::Automation
+        }))
     }
     pub fn set_instrument_param(
         &mut self,
@@ -1363,6 +1381,13 @@ impl NativeEngine {
                 command_queue_high_water: realtime_metrics.command_high_water,
                 command_queue_overflow: realtime_metrics.command_overflow,
                 plugin_deadline_misses,
+                scheduler_running_nodes: frame.scheduler.running_nodes,
+                scheduler_tail_nodes: frame.scheduler.tail_nodes,
+                scheduler_sleeping_nodes: frame.scheduler.sleeping_nodes,
+                scheduler_total_nodes: frame.scheduler.total_nodes,
+                scheduler_skipped_process_calls: frame.scheduler.skipped_process_calls,
+                scheduler_wake_count: frame.scheduler.wake_count,
+                scheduler_sleep_count: frame.scheduler.sleep_count,
             },
             graph_revision: self.graph_revision,
             playing: frame.playing,
@@ -1615,9 +1640,57 @@ fn find_effect_mut<'a>(graph: &'a mut GraphSnapshot, id: &str) -> Option<&'a mut
 mod realtime_tests {
     use super::*;
     use crate::audio::types::{
-        InstrumentSpec, LoopSpec, MasterSpec, MidiClipSpec, MidiNoteSpec, TrackSpec, TransportSpec,
+        EffectSpec, InstrumentSpec, LoopSpec, MasterSpec, MidiClipSpec, MidiNoteSpec, TrackSpec,
+        TransportSpec,
     };
-    use std::{thread, time::Duration};
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+        thread,
+        time::Duration,
+    };
+
+    struct TrackingAllocator;
+
+    thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+        static DEALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            TRACK_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            TRACK_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    DEALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    fn track_allocations<T>(callback: impl FnOnce() -> T) -> (T, usize, usize) {
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        DEALLOCATION_COUNT.with(|count| count.set(0));
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(true));
+        let result = callback();
+        TRACK_ALLOCATIONS.with(|enabled| enabled.set(false));
+        let allocations = ALLOCATION_COUNT.with(Cell::get);
+        let deallocations = DEALLOCATION_COUNT.with(Cell::get);
+        (result, allocations, deallocations)
+    }
 
     fn metronome_test_core() -> (AudioCore, Producer<AudioCommand>, Output<MeterFrame>) {
         let (command_tx, command_rx) = RingBuffer::new(16);
@@ -1668,6 +1741,106 @@ mod realtime_tests {
         let frame = *meters.output_buffer_mut();
         assert!(frame.position > 0, "timeline must start after the count-in");
         assert_eq!(frame.count_in_beats_remaining, 0);
+    }
+
+    #[test]
+    fn full_render_call_graph_is_allocation_and_deallocation_free() {
+        let graph_spec = GraphSnapshot {
+            tracks: vec![TrackSpec {
+                id: "rt-allocation-track".into(),
+                kind: "instrument".into(),
+                name: "RT allocation probe".into(),
+                clips: Vec::new(),
+                midi_clips: Vec::new(),
+                instrument: Some(InstrumentSpec {
+                    id: "rt-allocation-synth".into(),
+                    kind: "builtin:testtone".into(),
+                    plugin: None,
+                    params: HashMap::new(),
+                    bypassed: false,
+                }),
+                volume_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                effects: vec![
+                    EffectSpec {
+                        id: "rt-utility".into(),
+                        kind: "builtin:utility".into(),
+                        bypassed: false,
+                        plugin: None,
+                        sidechain: None,
+                        params: HashMap::new(),
+                    },
+                    EffectSpec {
+                        id: "rt-clipper".into(),
+                        kind: "builtin:clipper".into(),
+                        bypassed: false,
+                        plugin: None,
+                        sidechain: None,
+                        params: HashMap::new(),
+                    },
+                ],
+                sends: Vec::new(),
+                output_bus_id: None,
+            }],
+            buses: Vec::new(),
+            master: MasterSpec {
+                volume_db: 0.0,
+                effects: Vec::new(),
+            },
+            transport: TransportSpec {
+                bpm: 120.0,
+                tempo_points: Vec::new(),
+                time_signatures: Vec::new(),
+                playhead_sec: 0.0,
+                is_playing: false,
+                loop_: LoopSpec {
+                    enabled: false,
+                    start_sec: 0.0,
+                    end_sec: 0.0,
+                },
+            },
+        };
+        let (graph, _) = AudioGraph::build(&graph_spec, &HashMap::new(), 48_000).unwrap();
+        let (mut command_tx, command_rx) = RingBuffer::new(128);
+        let (retired_tx, _) = RingBuffer::new(1);
+        let (meter_tx, _) = triple_buffer(&MeterFrame::default());
+        let mut core = AudioCore::new(
+            command_rx,
+            retired_tx,
+            graph,
+            meter_tx,
+            Arc::new(ArrayQueue::new(16)),
+        );
+        let mut output = [0.0; 512];
+        core.render(&mut output, 256);
+        let (_, allocations, deallocations) = track_allocations(|| {
+            for index in 0..32 {
+                assert!(command_tx
+                    .push(AudioCommand::LiveMidi {
+                        track: 0,
+                        event: NoteEvent {
+                            sample_offset: (index % 16) as u32,
+                            kind: NoteEventKind::Controller {
+                                cc: 1,
+                                value: index as f32 / 31.0,
+                            },
+                        },
+                    })
+                    .is_ok());
+                core.render(&mut output, 256);
+            }
+        });
+        drop(command_tx);
+        assert_eq!(
+            allocations, 0,
+            "AudioCore::render allocated on its call graph"
+        );
+        assert_eq!(
+            deallocations, 0,
+            "AudioCore::render deallocated on its call graph"
+        );
     }
 
     #[test]

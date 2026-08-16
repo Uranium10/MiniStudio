@@ -42,6 +42,11 @@ export function Knob({ value, min, max, step, scale = 'linear', label, format = 
     if (event.button !== 0) return
     event.preventDefault()
     event.stopPropagation()
+    if (event.ctrlKey || event.metaKey) {
+      endDrag()
+      onChange(clampStep(defaultValue, min, max, step))
+      return
+    }
     const element = event.currentTarget
     element.focus({ preventScroll: true })
     element.setPointerCapture(event.pointerId)
@@ -95,9 +100,8 @@ export function Knob({ value, min, max, step, scale = 'linear', label, format = 
         onLostPointerCapture={endDrag}
         onDragStart={(event) => event.preventDefault()}
         onKeyDown={onKeyDown}
-        onDoubleClick={() => onChange(defaultValue)}
         onContextMenu={automation ? (event) => { event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY }) } : undefined}
-        title="세로 드래그 · Shift 미세 조절 · 더블클릭/Home 리셋 · 방향키 조절"
+        title="세로 드래그 · Shift 미세 조절 · Ctrl+클릭/Home 초기화 · 방향키 조절"
       ><i /></button>
       <EditableNumber value={value} min={min} max={max} step={step} onChange={onChange} format={format} ariaLabel={`${label} 값`} />
       <span>{label}</span>

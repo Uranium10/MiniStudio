@@ -2025,6 +2025,7 @@ name = "ministudio-dsp"
 version = "0.1.0"
 dependencies = [
  "ministudio-contracts",
+ "realfft",
  "rustfft",
 ]
 

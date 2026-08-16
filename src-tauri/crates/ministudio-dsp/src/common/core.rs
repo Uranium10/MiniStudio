@@ -73,6 +73,9 @@ pub trait DspEffect: Send {
     fn wants_midi(&self) -> bool {
         false
     }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::always_process()
+    }
     fn response(&self, _points: usize) -> Option<EqFrequencyResponse> {
         None
     }

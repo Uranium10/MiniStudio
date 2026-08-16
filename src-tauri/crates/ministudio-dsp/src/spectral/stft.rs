@@ -1,4 +1,5 @@
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use rustfft::num_complex::Complex32;
 use std::{f32::consts::PI, sync::Arc};
 
 use crate::MAX_CHANNELS;
@@ -20,16 +21,22 @@ impl StftConfig {
 /// Shareable transform plan and a numerically derived WOLA window pair.
 ///
 /// Planning and allocation happen on the control thread. The synthesis window
-/// includes both RustFFT's inverse normalization and the exact overlap sum, so
-/// the streaming loop needs no divisions and reconstructs unity independently
-/// of the selected valid overlap factor.
+/// includes both the inverse transform's normalization and the exact overlap
+/// sum, so the streaming loop needs no divisions and reconstructs unity
+/// independently of the selected valid overlap factor.
+///
+/// The transform is real-to-complex/complex-to-real (`realfft`), not a complex
+/// FFT fed a zero imaginary half. A real transform performs roughly half the
+/// arithmetic of the equivalent complex one and needs no manual Hermitian
+/// (negative-frequency) fill-in before the inverse pass.
 pub(crate) struct StftPlan {
     config: StftConfig,
     analysis_window: Vec<f32>,
     synthesis_window: Vec<f32>,
-    forward: Arc<dyn Fft<f32>>,
-    inverse: Arc<dyn Fft<f32>>,
-    scratch_len: usize,
+    forward: Arc<dyn RealToComplex<f32>>,
+    inverse: Arc<dyn ComplexToReal<f32>>,
+    forward_scratch_len: usize,
+    inverse_scratch_len: usize,
 }
 
 impl StftPlan {
@@ -43,12 +50,11 @@ impl StftPlan {
             return Err("STFT hop must be a non-zero divisor of the FFT size");
         }
 
-        let mut planner = FftPlanner::<f32>::new();
+        let mut planner = RealFftPlanner::<f32>::new();
         let forward = planner.plan_fft_forward(size);
         let inverse = planner.plan_fft_inverse(size);
-        let scratch_len = forward
-            .get_inplace_scratch_len()
-            .max(inverse.get_inplace_scratch_len());
+        let forward_scratch_len = forward.get_scratch_len();
+        let inverse_scratch_len = inverse.get_scratch_len();
 
         // A periodic sqrt-Hann analysis/synthesis pair gives a Hann product.
         // Derive the phase-dependent overlap sum instead of relying on a magic
@@ -67,6 +73,9 @@ impl StftPlan {
         if overlap_sum.iter().any(|value| *value <= f32::EPSILON) {
             return Err("STFT window/hop pair cannot be perfectly reconstructed");
         }
+        // realfft's inverse transform is unnormalized (like a raw IDFT sum),
+        // so the synthesis window still absorbs the same `size` factor as the
+        // previous complex-FFT implementation.
         let synthesis_window = (0..size)
             .map(|index| analysis_window[index] / (size as f32 * overlap_sum[index % hop]))
             .collect();
@@ -77,7 +86,8 @@ impl StftPlan {
             synthesis_window,
             forward,
             inverse,
-            scratch_len,
+            forward_scratch_len,
+            inverse_scratch_len,
         }))
     }
 
@@ -93,8 +103,9 @@ impl StftPlan {
 }
 
 /// Positive-frequency view presented to an effect once per analysis hop.
-/// Negative bins are rebuilt automatically before synthesis, so processors
-/// cannot accidentally violate the Hermitian symmetry required for real audio.
+/// A real transform has no negative-frequency bins to violate: the `size/2+1`
+/// bins here are the entire spectrum, and the inverse transform reconstructs
+/// a real signal from them unconditionally.
 pub(crate) struct SpectralFrame<'a> {
     spectra: &'a mut [Vec<Complex32>; MAX_CHANNELS],
     positive_bins: usize,
@@ -120,8 +131,15 @@ pub(crate) struct StftEngine {
     plan: Arc<StftPlan>,
     input_ring: [Vec<f32>; MAX_CHANNELS],
     ola_ring: [Vec<f32>; MAX_CHANNELS],
+    /// Windowed real analysis frame, consumed (and overwritten) in place by
+    /// the forward real transform.
+    analysis_frame: [Vec<f32>; MAX_CHANNELS],
+    /// Raw real output of the inverse transform, before the synthesis window
+    /// and overlap-add.
+    synthesis_frame: [Vec<f32>; MAX_CHANNELS],
     spectra: [Vec<Complex32>; MAX_CHANNELS],
-    scratch: [Vec<Complex32>; MAX_CHANNELS],
+    forward_scratch: [Vec<Complex32>; MAX_CHANNELS],
+    inverse_scratch: [Vec<Complex32>; MAX_CHANNELS],
     ring_position: usize,
     samples_until_frame: usize,
 }
@@ -130,13 +148,22 @@ impl StftEngine {
     pub(crate) fn new(plan: Arc<StftPlan>) -> Self {
         let size = plan.config.fft_size;
         let hop_size = plan.config.hop_size;
-        let scratch_len = plan.scratch_len;
+        let bins = size / 2 + 1;
+        let forward_scratch_len = plan.forward_scratch_len;
+        let inverse_scratch_len = plan.inverse_scratch_len;
         Self {
             plan,
             input_ring: std::array::from_fn(|_| vec![0.0; size]),
             ola_ring: std::array::from_fn(|_| vec![0.0; size]),
-            spectra: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); size]),
-            scratch: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); scratch_len]),
+            analysis_frame: std::array::from_fn(|_| vec![0.0; size]),
+            synthesis_frame: std::array::from_fn(|_| vec![0.0; size]),
+            spectra: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); bins]),
+            forward_scratch: std::array::from_fn(|_| {
+                vec![Complex32::new(0.0, 0.0); forward_scratch_len]
+            }),
+            inverse_scratch: std::array::from_fn(|_| {
+                vec![Complex32::new(0.0, 0.0); inverse_scratch_len]
+            }),
             ring_position: 0,
             // Start after one hop with zero-padded history. Waiting a complete
             // window would attenuate/loss the stream's first transient.
@@ -152,8 +179,11 @@ impl StftEngine {
         for channel in 0..MAX_CHANNELS {
             self.input_ring[channel].fill(0.0);
             self.ola_ring[channel].fill(0.0);
+            self.analysis_frame[channel].fill(0.0);
+            self.synthesis_frame[channel].fill(0.0);
             self.spectra[channel].fill(Complex32::new(0.0, 0.0));
-            self.scratch[channel].fill(Complex32::new(0.0, 0.0));
+            self.forward_scratch[channel].fill(Complex32::new(0.0, 0.0));
+            self.inverse_scratch[channel].fill(Complex32::new(0.0, 0.0));
         }
         self.ring_position = 0;
         self.samples_until_frame = self.plan.config.hop_size;
@@ -204,14 +234,14 @@ impl StftEngine {
                 } else {
                     input_index
                 };
-                self.spectra[channel][index] = Complex32::new(
-                    self.input_ring[channel][input_index] * self.plan.analysis_window[index],
-                    0.0,
-                );
+                self.analysis_frame[channel][index] =
+                    self.input_ring[channel][input_index] * self.plan.analysis_window[index];
             }
-            self.plan
-                .forward
-                .process_with_scratch(&mut self.spectra[channel], &mut self.scratch[channel]);
+            let _ = self.plan.forward.process_with_scratch(
+                &mut self.analysis_frame[channel],
+                &mut self.spectra[channel],
+                &mut self.forward_scratch[channel],
+            );
         }
 
         process_frame(&mut SpectralFrame {
@@ -220,14 +250,16 @@ impl StftEngine {
         });
 
         for channel in 0..MAX_CHANNELS {
+            // A real inverse transform requires DC and Nyquist to be purely
+            // real; a processor that wrote arbitrary complex gains into every
+            // bin could otherwise leave a residual imaginary part there.
             self.spectra[channel][0].im = 0.0;
             self.spectra[channel][bins - 1].im = 0.0;
-            for bin in 1..bins - 1 {
-                self.spectra[channel][size - bin] = self.spectra[channel][bin].conj();
-            }
-            self.plan
-                .inverse
-                .process_with_scratch(&mut self.spectra[channel], &mut self.scratch[channel]);
+            let _ = self.plan.inverse.process_with_scratch(
+                &mut self.spectra[channel],
+                &mut self.synthesis_frame[channel],
+                &mut self.inverse_scratch[channel],
+            );
             for index in 0..size {
                 let output_index = position + index;
                 let output_index = if output_index >= size {
@@ -236,7 +268,7 @@ impl StftEngine {
                     output_index
                 };
                 self.ola_ring[channel][output_index] +=
-                    self.spectra[channel][index].re * self.plan.synthesis_window[index];
+                    self.synthesis_frame[channel][index] * self.plan.synthesis_window[index];
             }
         }
     }
@@ -300,5 +332,17 @@ mod tests {
             });
         }
         assert!(visited);
+    }
+
+    #[test]
+    fn small_and_large_sizes_round_trip_without_scratch_overrun() {
+        for &(size, hop) in &[(16_usize, 4_usize), (4096, 512)] {
+            let plan = StftPlan::new(StftConfig::new(size, hop)).unwrap();
+            let mut engine = StftEngine::new(plan);
+            for sample in 0..size * 3 {
+                let value = (sample as f32 * 0.1).sin() * 0.2;
+                let _ = engine.process_sample([value, value], |_| {});
+            }
+        }
     }
 }

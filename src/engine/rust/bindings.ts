@@ -384,6 +384,15 @@ export type StreamStatus = {
 	commandQueueOverflow: number,
 	/**  Realtime plug-in endpoint deadline misses. */
 	pluginDeadlineMisses: number,
+	/**  Current scheduler node-state gauges. */
+	schedulerRunningNodes: number,
+	schedulerTailNodes: number,
+	schedulerSleepingNodes: number,
+	schedulerTotalNodes: number,
+	/**  Cumulative scheduler transitions/process skips for diagnostics. */
+	schedulerSkippedProcessCalls: number,
+	schedulerWakeCount: number,
+	schedulerSleepCount: number,
 };
 
 export type TempoCurveSpec = "jump" | "linear";

@@ -369,24 +369,35 @@ function TransientShaperPanel({ params, setParam }: { params: Record<string, num
   const sustain = params.sustain ?? 0
   const threshold = params.thresholdDb ?? -36
   const speed = params.speed ?? .5
+  const resetDetector = () => { setParam('speed', .5); setParam('thresholdDb', -36) }
   const updatePad = (event: React.PointerEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect()
-    setParam('speed', Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width))))
-    setParam('thresholdDb', Math.max(-72, Math.min(0, -(event.clientY - bounds.top) / Math.max(1, bounds.height) * 72)))
+    const graphLeft = bounds.left + 8
+    const graphTop = bounds.top + 10
+    const graphWidth = Math.max(1, bounds.width - 16)
+    const graphHeight = Math.max(1, bounds.height - 30)
+    setParam('speed', Math.max(0, Math.min(1, (event.clientX - graphLeft) / graphWidth)))
+    setParam('thresholdDb', Math.max(-72, Math.min(0, -(event.clientY - graphTop) / graphHeight * 72)))
   }
-  const down = (event: React.PointerEvent<HTMLDivElement>) => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); updatePad(event) }
+  const down = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.ctrlKey || event.metaKey) { resetDetector(); return }
+    event.currentTarget.setPointerCapture(event.pointerId)
+    updatePad(event)
+  }
   const up = (event: React.PointerEvent<HTMLDivElement>) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
   const peakX = 28 + (1 - speed) * 25
   const baseline = 61
   const thresholdY = 7 + (-threshold / 72) * 57
   const path = `M 4 ${baseline} C ${peakX * .45} ${baseline}, ${peakX * .72} ${baseline - attack * 25}, ${peakX} ${baseline - attack * 32} C ${peakX + 10 + (1 - speed) * 13} ${baseline + attack * 8}, ${82 + (1 - speed) * 9} ${baseline - sustain * 17}, 112 ${baseline - sustain * 17}`
   return <div className="transient-panel">
-    <div className="transient-display"><svg viewBox="0 0 116 76" preserveAspectRatio="none"><line className="baseline" x1="4" y1={baseline} x2="112" y2={baseline} /><line className="detector-threshold" x1="4" y1={thresholdY} x2="112" y2={thresholdY} /><path d={path} /></svg><span>ENVELOPE CONTOUR</span><b>{threshold.toFixed(1)} dB · {Math.round(speed * 100)}%</b></div>
+    <div className="transient-display" role="application" aria-label="Speed and threshold XY control" tabIndex={0} title="X: Speed · Y: Threshold · Ctrl+클릭 초기화" onPointerDown={down} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updatePad(event) }} onPointerUp={up} onPointerCancel={up}><svg viewBox="0 0 116 76" preserveAspectRatio="none"><line className="baseline" x1="4" y1={baseline} x2="112" y2={baseline} /><line className="detector-threshold" x1="4" y1={thresholdY} x2="112" y2={thresholdY} /><path d={path} /></svg><div className="transient-xy-plane"><i style={{ left: `${speed * 100}%`, top: `${-threshold / 72 * 100}%` }} /></div><span>DETECTOR · X SPEED / Y THRESHOLD</span><b>{threshold.toFixed(1)} dB · {Math.round(speed * 100)}%</b></div>
     <div className="transient-main-controls">
       <Knob parameterId="attack" value={attack} min={-1} max={1} step={.01} defaultValue={0} label="ATTACK" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('attack', value)} />
       <Knob parameterId="sustain" value={sustain} min={-1} max={1} step={.01} defaultValue={0} label="SUSTAIN" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('sustain', value)} />
     </div>
-    <div className="transient-pad-wrap"><b>DETECTOR · X SPEED / Y THRESHOLD</b><div className="transient-pad" role="application" aria-label="Speed and threshold XY control" onPointerDown={down} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updatePad(event) }} onPointerUp={up} onPointerCancel={up}><i style={{ left: `${speed * 100}%`, top: `${-threshold / 72 * 100}%` }} /></div><div><span>{threshold.toFixed(1)} dB</span><span>{Math.round(speed * 100)}%</span></div></div>
     <AutomationButton parameterId="clip" label="Clip" value={params.clip ?? 0} className={`transient-clip ${(params.clip ?? 0) >= .5 ? 'active' : ''}`} onClick={() => setParam('clip', (params.clip ?? 0) >= .5 ? 0 : 1)}><CirclePower size={13} /> CLIP</AutomationButton>
   </div>
 }
@@ -587,11 +598,11 @@ function ColorizerPanel({ params, setParam }: { params: Record<string, number>; 
   }
   return <div className="colorizer-panel">
     <div className="colorizer-source">
-      <div className="colorizer-selects"><label>ENGINE<select value={quality} onChange={(event) => setParam('quality', Number(event.target.value))}><option value="0">Live</option><option value="1">Map</option></select></label><label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
+      <div className="colorizer-selects"><label>ENGINE<select value={quality} onChange={(event) => setParam('quality', Number(event.target.value))}><option value="0">Live</option><option value="1">Map</option></select></label>{mapMode && <label>QUALITY<select value={Math.round(params.mapQuality ?? 1)} onChange={(event) => setParam('mapQuality', Number(event.target.value))}><option value="0">Fast (512, ~11 ms)</option><option value="1">Clean (1024, ~21 ms)</option></select></label>}<label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
       <PitchClassKeyboard disabled={midi} active={COLORIZER_NOTES.map((_, pitch) => (params[`pitch${pitch}`] ?? 0) >= .5)} onToggle={(pitch) => { setParam(`pitch${pitch}`, (params[`pitch${pitch}`] ?? 0) >= .5 ? 0 : 1); setParam('scale', COLORIZER_CUSTOM_SCALE) }} />
       {midi && <div className="colorizer-midi-note">MIDI ROUTING NOT AVAILABLE YET · WAITING FOR NOTES</div>}
     </div>
-    <div className="colorizer-controls parameter-row"><Knob value={params.resonance ?? .62} min={0} max={1} step={.01} defaultValue={.62} label={mapMode ? 'COLOR' : 'RESONANCE'} format={percentFormat} onChange={(value) => setParam('resonance', value)} />{mapMode ? <Knob value={params.transient ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="TRANSIENT" format={percentFormat} onChange={(value) => setParam('transient', value)} /> : <Knob value={params.decay ?? .45} min={0} max={1} step={.01} defaultValue={.45} label="DECAY" format={percentFormat} onChange={(value) => setParam('decay', value)} />}<Knob value={params.depth ?? .82} min={0} max={1} step={.01} defaultValue={.82} label={mapMode ? 'MAP' : 'DEPTH'} format={percentFormat} onChange={(value) => setParam('depth', value)} /><Knob value={params.mix ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div>
+    <div className="colorizer-controls parameter-row"><Knob value={params.resonance ?? .62} min={0} max={1} step={.01} defaultValue={.62} label={mapMode ? 'COLOR' : 'RESONANCE'} format={percentFormat} onChange={(value) => setParam('resonance', value)} />{mapMode ? <Knob value={params.transient ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MORPH" format={percentFormat} onChange={(value) => setParam('transient', value)} /> : <Knob value={params.decay ?? .45} min={0} max={1} step={.01} defaultValue={.45} label="DECAY" format={percentFormat} onChange={(value) => setParam('decay', value)} />}<Knob value={params.depth ?? .82} min={0} max={1} step={.01} defaultValue={.82} label={mapMode ? 'MAP' : 'DEPTH'} format={percentFormat} onChange={(value) => setParam('depth', value)} />{mapMode && <Knob value={params.gate ?? 0} min={0} max={1} step={.01} defaultValue={0} label="GATE" format={percentFormat} onChange={(value) => setParam('gate', value)} />}<Knob value={params.mix ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div>
   </div>
 }
 

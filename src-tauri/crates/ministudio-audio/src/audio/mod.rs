@@ -10,6 +10,7 @@ pub mod instrument;
 pub mod metrics;
 pub mod midi_service;
 pub mod plugin;
+pub mod runtime;
 pub mod tempo;
 pub mod types;
 

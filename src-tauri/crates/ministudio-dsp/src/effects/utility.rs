@@ -126,4 +126,11 @@ impl DspEffect for Utility {
         self.dc_x = [0.0; MAX_CHANNELS];
         self.dc_y = [0.0; MAX_CHANNELS]
     }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        if self.bass_mono || self.dc_block {
+            RuntimeCapabilities::always_process()
+        } else {
+            RuntimeCapabilities::no_tail()
+        }
+    }
 }

@@ -2,8 +2,19 @@ const COLORIZER_MAX_MODES: usize = 96;
 const COLORIZER_LOWEST_MIDI: usize = 36;
 const COLORIZER_HIGHEST_MIDI: usize = 119;
 const MAX_ACTIVE_PITCHES: usize = 12;
-const COLORIZER_MAP_FFT_SIZE: usize = 1024;
-const COLORIZER_MAP_HOP_SIZE: usize = 256;
+
+/// `QUALITY = Fast`: lower latency, appropriate for upper-band/synth material
+/// where responsiveness matters more than dense low-end separation.
+const COLORIZER_MAP_FAST_FFT_SIZE: usize = 512;
+const COLORIZER_MAP_FAST_HOP_SIZE: usize = 128;
+/// `QUALITY = Clean`: the default. Matches the previous fixed 1024-point path.
+const COLORIZER_MAP_CLEAN_FFT_SIZE: usize = 1024;
+const COLORIZER_MAP_CLEAN_HOP_SIZE: usize = 256;
+
+/// Both `ColorizerMap` engines run during this window on a `QUALITY` switch.
+/// Their outputs are linearly crossfaded so the FFT-size change (and the
+/// resulting jump in algorithmic latency) is inaudible instead of a click.
+const MAP_QUALITY_CROSSFADE_MS: f32 = 12.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColorizerQuality {
@@ -13,30 +24,40 @@ enum ColorizerQuality {
     Map,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapQuality {
+    Fast,
+    Clean,
+}
+impl MapQuality {
+    fn fft_size(self) -> usize {
+        match self {
+            Self::Fast => COLORIZER_MAP_FAST_FFT_SIZE,
+            Self::Clean => COLORIZER_MAP_CLEAN_FFT_SIZE,
+        }
+    }
+}
+
 struct ColorizerMap {
     engine: spectral::stft::StftEngine,
     processor: spectral::pitch_map::PitchMapProcessor,
     dry_delay: [Vec<f32>; MAX_CHANNELS],
     dry_position: usize,
+    fft_size: usize,
     meter: [f32; DISTORTION_SPECTRUM_BINS],
 }
 
 impl ColorizerMap {
-    fn new(sample_rate: f32) -> Self {
-        let plan = spectral::stft::StftPlan::new(spectral::stft::StftConfig::new(
-            COLORIZER_MAP_FFT_SIZE,
-            COLORIZER_MAP_HOP_SIZE,
-        ))
-        .expect("Colorizer uses a compile-time validated STFT configuration");
+    fn new(sample_rate: f32, fft_size: usize, hop_size: usize) -> Self {
+        let plan =
+            spectral::stft::StftPlan::new(spectral::stft::StftConfig::new(fft_size, hop_size))
+                .expect("Colorizer uses a compile-time validated STFT configuration");
         Self {
             engine: spectral::stft::StftEngine::new(plan),
-            processor: spectral::pitch_map::PitchMapProcessor::new(
-                sample_rate,
-                COLORIZER_MAP_FFT_SIZE,
-                COLORIZER_MAP_HOP_SIZE,
-            ),
-            dry_delay: std::array::from_fn(|_| vec![0.0; COLORIZER_MAP_FFT_SIZE]),
+            processor: spectral::pitch_map::PitchMapProcessor::new(sample_rate, fft_size, hop_size),
+            dry_delay: std::array::from_fn(|_| vec![0.0; fft_size]),
             dry_position: 0,
+            fft_size,
             meter: [0.0; DISTORTION_SPECTRUM_BINS],
         }
     }
@@ -52,6 +73,7 @@ impl ColorizerMap {
     }
 
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn process_sample(
         &mut self,
         input: [f32; MAX_CHANNELS],
@@ -59,6 +81,7 @@ impl ColorizerMap {
         amount: f32,
         transient_preserve: f32,
         color: f32,
+        gate: f32,
     ) -> ([f32; MAX_CHANNELS], [f32; MAX_CHANNELS]) {
         let mut delayed = [0.0; MAX_CHANNELS];
         for channel in 0..MAX_CHANNELS {
@@ -66,14 +89,14 @@ impl ColorizerMap {
             self.dry_delay[channel][self.dry_position] = input[channel];
         }
         self.dry_position += 1;
-        if self.dry_position == COLORIZER_MAP_FFT_SIZE {
+        if self.dry_position == self.fft_size {
             self.dry_position = 0;
         }
 
         let processor = &mut self.processor;
         let meter = &mut self.meter;
         let mapped = self.engine.process_sample(input, |frame| {
-            processor.process(frame, target_mask, amount, transient_preserve, color);
+            processor.process(frame, target_mask, amount, transient_preserve, color, gate);
             meter.fill(0.0);
             meter[..spectral::analysis::HPCP_BINS]
                 .copy_from_slice(processor.analyzer().hpcp());
@@ -176,9 +199,20 @@ struct Colorizer {
     decay: f32,
     depth: f32,
     transient_preserve: f32,
+    /// Spectral gate amount for `Map` mode; 0 fully skips the gate stage.
+    gate: f32,
     mix: Smoother,
     quality: ColorizerQuality,
-    map: ColorizerMap,
+    map_quality: MapQuality,
+    map_fast: ColorizerMap,
+    map_clean: ColorizerMap,
+    /// Nonzero while a `QUALITY` switch is being crossfaded in; both engines
+    /// run during this window. See `MAP_QUALITY_CROSSFADE_MS`.
+    map_crossfade_remaining: u32,
+    map_crossfade_total: u32,
+    /// The engine fading *out* of a crossfade (the one active before the
+    /// switch). `map_quality` already holds the incoming target.
+    map_crossfade_from: MapQuality,
     modes: [ColorizerMode; COLORIZER_MAX_MODES],
     active_modes: usize,
 }
@@ -196,14 +230,67 @@ impl Colorizer {
             decay: 0.45,
             depth: 0.82,
             transient_preserve: 0.72,
+            gate: 0.0,
             mix: Smoother::new(0.72, 48_000.0, 0.015),
             quality: ColorizerQuality::Live,
-            map: ColorizerMap::new(48_000.0),
+            map_quality: MapQuality::Clean,
+            map_fast: ColorizerMap::new(
+                48_000.0,
+                COLORIZER_MAP_FAST_FFT_SIZE,
+                COLORIZER_MAP_FAST_HOP_SIZE,
+            ),
+            map_clean: ColorizerMap::new(
+                48_000.0,
+                COLORIZER_MAP_CLEAN_FFT_SIZE,
+                COLORIZER_MAP_CLEAN_HOP_SIZE,
+            ),
+            map_crossfade_remaining: 0,
+            map_crossfade_total: 1,
+            map_crossfade_from: MapQuality::Clean,
             modes: [ColorizerMode::EMPTY; COLORIZER_MAX_MODES],
             active_modes: 0,
         };
         effect.rebuild_modes();
         effect
+    }
+    /// Runs whichever `ColorizerMap` engine(s) are currently live: just the
+    /// active one at rest, or both (linearly crossfaded) while `QUALITY` is
+    /// switching so the FFT-size/latency change never clicks.
+    fn process_map_sample(
+        &mut self,
+        dry: [f32; MAX_CHANNELS],
+    ) -> ([f32; MAX_CHANNELS], [f32; MAX_CHANNELS]) {
+        let target_mask = self.active_mask();
+        let (depth, transient, color, gate) =
+            (self.depth, self.transient_preserve, self.resonance, self.gate);
+        if self.map_crossfade_remaining == 0 {
+            let active = match self.map_quality {
+                MapQuality::Fast => &mut self.map_fast,
+                MapQuality::Clean => &mut self.map_clean,
+            };
+            return active.process_sample(dry, target_mask, depth, transient, color, gate);
+        }
+        let (from, to) = match self.map_crossfade_from {
+            MapQuality::Fast => (&mut self.map_fast, &mut self.map_clean),
+            MapQuality::Clean => (&mut self.map_clean, &mut self.map_fast),
+        };
+        let (delayed_from, wet_from) =
+            from.process_sample(dry, target_mask, depth, transient, color, gate);
+        let (delayed_to, wet_to) = to.process_sample(dry, target_mask, depth, transient, color, gate);
+        let progress =
+            1.0 - self.map_crossfade_remaining as f32 / self.map_crossfade_total.max(1) as f32;
+        self.map_crossfade_remaining -= 1;
+        let delayed = std::array::from_fn(|c| {
+            delayed_from[c] + (delayed_to[c] - delayed_from[c]) * progress
+        });
+        let wet = std::array::from_fn(|c| wet_from[c] + (wet_to[c] - wet_from[c]) * progress);
+        (delayed, wet)
+    }
+    fn active_map(&self) -> &ColorizerMap {
+        match self.map_quality {
+            MapQuality::Fast => &self.map_fast,
+            MapQuality::Clean => &self.map_clean,
+        }
     }
     fn active_mask(&self) -> u16 {
         match self.source {
@@ -327,7 +414,21 @@ impl DspEffect for Colorizer {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, _channels: usize) {
         self.sample_rate = sample_rate.max(8_000.0);
         self.mix = Smoother::new(self.mix.target, self.sample_rate, 0.015);
-        self.map = ColorizerMap::new(self.sample_rate);
+        // Both QUALITY engines are prepared up front so switching at runtime
+        // is a pointer flip plus a crossfade, never an audio-thread allocation.
+        self.map_fast = ColorizerMap::new(
+            self.sample_rate,
+            COLORIZER_MAP_FAST_FFT_SIZE,
+            COLORIZER_MAP_FAST_HOP_SIZE,
+        );
+        self.map_clean = ColorizerMap::new(
+            self.sample_rate,
+            COLORIZER_MAP_CLEAN_FFT_SIZE,
+            COLORIZER_MAP_CLEAN_HOP_SIZE,
+        );
+        self.map_crossfade_remaining = 0;
+        self.map_crossfade_total =
+            ((self.sample_rate * MAP_QUALITY_CROSSFADE_MS / 1000.0) as u32).max(1);
         self.rebuild_modes();
         self.reset();
     }
@@ -365,14 +466,7 @@ impl DspEffect for Colorizer {
                     }
                 }
                 ColorizerQuality::Map => {
-                    let target_mask = self.active_mask();
-                    let (delayed, wet) = self.map.process_sample(
-                        dry,
-                        target_mask,
-                        self.depth,
-                        self.transient_preserve,
-                        self.resonance,
-                    );
+                    let (delayed, wet) = self.process_map_sample(dry);
                     for channel in 0..MAX_CHANNELS {
                         buffer.channels[channel][frame] = if self.bypassed {
                             delayed[channel]
@@ -408,11 +502,29 @@ impl DspEffect for Colorizer {
             }
             "depth" => self.depth = value.clamp(0.0, 1.0),
             "transient" => self.transient_preserve = value.clamp(0.0, 1.0),
+            "gate" => self.gate = value.clamp(0.0, 1.0),
             "quality" => {
                 self.quality = if value >= 0.5 {
                     ColorizerQuality::Map
                 } else {
                     ColorizerQuality::Live
+                }
+            }
+            "mapQuality" => {
+                let requested = if value >= 0.5 {
+                    MapQuality::Clean
+                } else {
+                    MapQuality::Fast
+                };
+                // A switch mid-crossfade is ignored rather than reflown: the
+                // in-flight fade already commits to a `from`/`to` pair, and
+                // resolving a second request before it lands would need to
+                // re-derive a consistent blend from three engines instead of
+                // two. The next `set_param` after it settles picks it up.
+                if requested != self.map_quality && self.map_crossfade_remaining == 0 {
+                    self.map_crossfade_from = self.map_quality;
+                    self.map_quality = requested;
+                    self.map_crossfade_remaining = self.map_crossfade_total;
                 }
             }
             "mix" => self.mix.set_target(value.clamp(0.0, 1.0)),
@@ -440,25 +552,33 @@ impl DspEffect for Colorizer {
         }
         self.midi_notes.fill(0);
         self.midi_mask = 0;
-        self.map.reset();
+        self.map_fast.reset();
+        self.map_clean.reset();
+        self.map_crossfade_remaining = 0;
         self.rebuild_modes();
     }
     fn tail_samples(&self) -> usize {
         match self.quality {
             ColorizerQuality::Live => (self.decay_seconds() * 9.21 * self.sample_rate) as usize,
-            ColorizerQuality::Map => COLORIZER_MAP_FFT_SIZE,
+            ColorizerQuality::Map => self.active_map().fft_size,
         }
     }
     fn latency_samples(&self) -> usize {
         match self.quality {
             ColorizerQuality::Live => 0,
-            ColorizerQuality::Map => COLORIZER_MAP_FFT_SIZE,
+            // Reflects the settled/target engine. A `QUALITY` switch changes
+            // this declared value without a matching PDC graph rebuild, the
+            // same accepted trade-off Formant Shifter's Mono/Poly toggle
+            // already makes (see `formant.rs::latency_samples`) — the audible
+            // FFT-size transition is handled by the crossfade above, not by
+            // this contract.
+            ColorizerQuality::Map => self.map_quality.fft_size(),
         }
     }
     fn wants_midi(&self) -> bool {
         self.source == ChordSource::MidiInput
     }
     fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
-        (self.quality == ColorizerQuality::Map).then_some(self.map.meter)
+        (self.quality == ColorizerQuality::Map).then_some(self.active_map().meter)
     }
 }

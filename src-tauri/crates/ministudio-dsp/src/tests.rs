@@ -1,4 +1,72 @@
 use super::*;
+
+/// Not a correctness test: prints measured per-callback CPU cost for
+/// `Colorizer`'s `Map` quality mode at both FFT sizes, for
+/// `docs/colorizer-algorithm.md`'s F-5 performance record. Run explicitly
+/// with `cargo test -p ministudio-dsp --release colorizer_map_bench --
+/// --ignored --nocapture`; excluded from the normal suite because wall-clock
+/// timing is not a deterministic pass/fail signal.
+#[test]
+#[ignore]
+fn colorizer_map_bench_reports_callback_cost() {
+    let sample_rate = 48_000.0_f32;
+    let block = 256_usize; // representative low-latency live buffer
+    for (label, map_quality) in [("Fast/512", 0.0_f32), ("Clean/1024", 1.0_f32)] {
+        let mut effect = Colorizer::new();
+        effect.set_param("quality", 1.0);
+        effect.set_param("mapQuality", map_quality);
+        effect.set_param("mix", 1.0);
+        effect.set_param("depth", 0.8);
+        effect.set_param("transient", 0.5);
+        effect.set_param("gate", 0.3);
+        for pitch in [0, 2, 4, 5, 7, 9, 11] {
+            effect.set_param(&format!("pitch{pitch}"), 1.0);
+        }
+        effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+
+        // Dense material: a chord plus noise, closer to the "polyphonic
+        // pad/drum loop" material the design doc calls for than a bare tone.
+        let mut buffers: Vec<AudioBuffer> = (0..64)
+            .map(|block_index| {
+                let mut buffer = AudioBuffer::new();
+                for frame in 0..block {
+                    let sample = (block_index * block + frame) as f32;
+                    let t = sample / sample_rate;
+                    let mut value = 0.0;
+                    for freq in [220.0, 277.18, 329.63, 440.0] {
+                        value += (2.0 * PI * freq * t).sin() * 0.12;
+                    }
+                    let noise = ((sample * 12.9898).sin() * 43758.5453).fract() * 0.02;
+                    buffer.channels[0][frame] = value + noise;
+                    buffer.channels[1][frame] = value - noise;
+                }
+                buffer
+            })
+            .collect();
+
+        // Warm up (fills STFT rings, avoids measuring cold-start branches).
+        for buffer in &mut buffers {
+            effect.process(&[], buffer, block);
+        }
+
+        let iterations = 400;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            for buffer in &mut buffers {
+                effect.process(&[], buffer, block);
+            }
+        }
+        let elapsed = started.elapsed();
+        let callbacks = iterations * buffers.len();
+        let per_callback = elapsed / callbacks as u32;
+        let deadline = std::time::Duration::from_secs_f32(block as f32 / sample_rate);
+        let load_percent = 100.0 * per_callback.as_secs_f64() / deadline.as_secs_f64();
+        println!(
+            "Colorizer Map/{label}: {per_callback:?}/callback, {block}-frame deadline {deadline:?}, {load_percent:.2}% of budget"
+        );
+    }
+}
+
 #[test]
 fn smoother_converges() {
     let mut s = Smoother::new(0.0, 48000.0, 0.01);
@@ -887,7 +955,7 @@ fn colorizer_map_reports_and_preserves_its_fixed_bypass_latency() {
     effect.set_param("quality", 1.0);
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
     effect.set_bypassed(true);
-    assert_eq!(effect.latency_samples(), COLORIZER_MAP_FFT_SIZE);
+    assert_eq!(effect.latency_samples(), COLORIZER_MAP_CLEAN_FFT_SIZE);
 
     let mut rendered = Vec::with_capacity(MAX_BLOCK_SIZE * 2);
     for block in 0..2 {
@@ -904,7 +972,7 @@ fn colorizer_map_reports_and_preserves_its_fixed_bypass_latency() {
         .enumerate()
         .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
         .unwrap();
-    assert_eq!(peak.0, COLORIZER_MAP_FFT_SIZE);
+    assert_eq!(peak.0, COLORIZER_MAP_CLEAN_FFT_SIZE);
     assert!((*peak.1 - 0.75).abs() < 1e-6);
 }
 
@@ -992,7 +1060,7 @@ fn colorizer_map_keeps_linked_stereo_polarity_and_level_relationship() {
         }
     }
     assert!(maximum_level > 0.05);
-    let spectral_error = effect.map.processor.stereo_relation_error(-0.5);
+    let spectral_error = effect.map_clean.processor.stereo_relation_error(-0.5);
     assert!(
         spectral_error.1 < 1e-4,
         "spectral frame itself lost the linked-stereo relationship: {spectral_error:?}"
@@ -1000,6 +1068,154 @@ fn colorizer_map_keeps_linked_stereo_polarity_and_level_relationship() {
     assert!(
         maximum_error < maximum_level * 2e-4,
         "stereo relationship drifted: error={maximum_error} level={maximum_level} worst={worst:?}"
+    );
+}
+
+#[test]
+fn colorizer_map_gate_shortens_ringing_after_the_source_releases() {
+    let sample_rate = 48_000.0;
+    // A C#4 tone shifted onto the enabled C class builds phase-locked mapper
+    // state, then cuts to silence: GATE should pull the shifted (and now
+    // source-less) tail down faster than leaving it ungated.
+    let render = |gate: f32| {
+        let mut effect = Colorizer::new();
+        effect.set_param("quality", 1.0);
+        effect.set_param("mix", 1.0);
+        effect.set_param("depth", 1.0);
+        effect.set_param("transient", 0.0);
+        effect.set_param("resonance", 1.0);
+        effect.set_param("gate", gate);
+        for pitch in 0..12 {
+            effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
+        }
+        effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        let mut tail = Vec::with_capacity(MAX_BLOCK_SIZE * 8);
+        for block in 0..20 {
+            let mut buffer = AudioBuffer::new();
+            let sounding = block < 12;
+            if sounding {
+                for frame in 0..MAX_BLOCK_SIZE {
+                    let sample = block * MAX_BLOCK_SIZE + frame;
+                    let value = (2.0 * PI * 277.182_65 * sample as f32 / sample_rate).sin() * 0.3;
+                    buffer.channels[0][frame] = value;
+                    buffer.channels[1][frame] = value;
+                }
+            }
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            // Capture only well after the release, once the STFT's own
+            // latency has flushed any dry tail out of the window.
+            if block >= 15 {
+                tail.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
+            }
+        }
+        assert!(tail.iter().all(|sample| sample.is_finite()));
+        tail
+    };
+    let ungated = render(0.0);
+    let gated = render(1.0);
+    let rms = |signal: &[f32]| -> f64 {
+        (signal
+            .iter()
+            .map(|s| (*s as f64) * (*s as f64))
+            .sum::<f64>()
+            / signal.len() as f64)
+            .sqrt()
+    };
+    let ungated_rms = rms(&ungated);
+    let gated_rms = rms(&gated);
+    assert!(
+        gated_rms <= ungated_rms * 0.7,
+        "gate did not shorten the post-release tail: ungated={ungated_rms} gated={gated_rms}"
+    );
+}
+
+#[test]
+fn colorizer_map_leaves_sub_60hz_content_unshifted() {
+    let sample_rate = 48_000.0;
+    let mut effect = Colorizer::new();
+    effect.set_param("quality", 1.0);
+    effect.set_param("mix", 1.0);
+    effect.set_param("depth", 1.0);
+    effect.set_param("transient", 0.0);
+    // Only a pitch class far from 55 Hz's own class (A) is enabled, so an
+    // unshifted low peak is unambiguous: any measured movement is the guard
+    // failing, not coincidental agreement with the target scale.
+    for pitch in 0..12 {
+        effect.set_param(&format!("pitch{pitch}"), if pitch == 6 { 1.0 } else { 0.0 });
+    }
+    effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+
+    let mut output = Vec::with_capacity(MAX_BLOCK_SIZE * 24);
+    for block in 0..24 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            let sample = block * MAX_BLOCK_SIZE + frame;
+            let value = (2.0 * PI * 55.0 * sample as f32 / sample_rate).sin() * 0.3;
+            buffer.channels[0][frame] = value;
+            buffer.channels[1][frame] = value;
+        }
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        if block >= 8 {
+            output.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
+        }
+    }
+    let tone_energy = |signal: &[f32], frequency: f32| -> f64 {
+        let mut real = 0.0_f64;
+        let mut imaginary = 0.0_f64;
+        for (index, sample) in signal.iter().enumerate() {
+            let phase =
+                2.0 * std::f64::consts::PI * frequency as f64 * index as f64 / sample_rate as f64;
+            real += f64::from(*sample) * phase.cos();
+            imaginary -= f64::from(*sample) * phase.sin();
+        }
+        (real * real + imaginary * imaginary).sqrt()
+    };
+    let source = tone_energy(&output, 55.0);
+    // F#1 (~46.2 Hz), the nearest note the enabled class could pull this
+    // peak toward.
+    let target = tone_energy(&output, 46.25);
+    assert!(
+        source > target * 4.0,
+        "sub-60Hz peak moved toward the target class: source={source} target={target}"
+    );
+}
+
+#[test]
+fn colorizer_map_quality_switch_has_no_audible_click() {
+    let sample_rate = 48_000.0;
+    let mut effect = Colorizer::new();
+    effect.set_param("quality", 1.0);
+    effect.set_param("mix", 1.0);
+    effect.set_param("mapQuality", 0.0); // start on Fast
+    effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+
+    let mut previous = 0.0_f32;
+    let mut worst_step = 0.0_f32;
+    for block in 0..12 {
+        if block == 6 {
+            effect.set_param("mapQuality", 1.0); // switch to Clean mid-stream
+        }
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            let sample = block * MAX_BLOCK_SIZE + frame;
+            let value = (2.0 * PI * 330.0 * sample as f32 / sample_rate).sin() * 0.25;
+            buffer.channels[0][frame] = value;
+            buffer.channels[1][frame] = value;
+        }
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        for frame in 0..MAX_BLOCK_SIZE {
+            let sample = buffer.channels[0][frame];
+            assert!(sample.is_finite());
+            worst_step = worst_step.max((sample - previous).abs());
+            previous = sample;
+        }
+    }
+    // A 330 Hz tone at 0.25 amplitude has a sample-to-sample delta well under
+    // this bound in steady state; a discontinuous engine swap would blow far
+    // past it.
+    assert!(
+        worst_step < 0.2,
+        "quality switch produced a click: {worst_step}"
     );
 }
 

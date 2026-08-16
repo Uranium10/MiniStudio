@@ -319,6 +319,9 @@ impl Instrument for TestTone {
             .filter(|voice| voice.stage != Stage::Idle)
             .count()
     }
+    fn runtime_capabilities(&self) -> ministudio_dsp::RuntimeCapabilities {
+        ministudio_dsp::RuntimeCapabilities::instrument(self.tail_samples())
+    }
 }
 impl TestTone {
     fn handle(&mut self, event: NoteEventKind) {

@@ -1,5 +1,9 @@
 // Fixed-shape commands crossing the control-to-audio SPSC queue.
-use super::{graph::AudioGraph, instrument::NoteEvent};
+use super::{
+    graph::AudioGraph,
+    instrument::NoteEvent,
+    runtime::{SleepPolicy, WakeReason},
+};
 
 #[derive(Clone, Copy)]
 pub enum ChainKind {
@@ -73,6 +77,12 @@ pub enum AudioCommand {
         len: usize,
         value: f32,
     },
+    SetSchedulerEnabled(bool),
+    SetEffectSleepPolicy {
+        target: EffectRef,
+        policy: SleepPolicy,
+    },
+    WakeAll(WakeReason),
     LiveMidi {
         track: usize,
         event: NoteEvent,

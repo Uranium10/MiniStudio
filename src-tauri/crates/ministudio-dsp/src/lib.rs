@@ -10,6 +10,83 @@ pub const MAX_BLOCK_SIZE: usize = 2048;
 pub const DISTORTION_SPECTRUM_BINS: usize = 48;
 pub const LIMITER_METER_VALUES: usize = 7;
 
+/// Format-neutral tail declaration consumed by the audio graph scheduler.
+/// Unknown is deliberately different from infinite: both keep processing, but
+/// Unknown can later be refined by a plug-in adapter or compatibility record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeTail {
+    None,
+    Finite(usize),
+    Infinite,
+    Unknown,
+}
+
+/// Conservative processing traits shared by native DSP and plug-in adapters.
+/// A node is eligible for host-managed sleep only when `sleep_safe` is true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    pub tail: RuntimeTail,
+    pub sleep_safe: bool,
+    pub generator: bool,
+    pub requires_continuous_time: bool,
+    pub wakes_on_midi: bool,
+    pub wakes_on_automation: bool,
+    pub wakes_on_modulation: bool,
+    pub wakes_on_transport: bool,
+    pub wakes_on_sidechain: bool,
+}
+
+impl RuntimeCapabilities {
+    pub const fn always_process() -> Self {
+        Self {
+            tail: RuntimeTail::Unknown,
+            sleep_safe: false,
+            generator: false,
+            requires_continuous_time: true,
+            wakes_on_midi: true,
+            wakes_on_automation: true,
+            wakes_on_modulation: true,
+            wakes_on_transport: true,
+            wakes_on_sidechain: true,
+        }
+    }
+
+    pub const fn no_tail() -> Self {
+        Self {
+            tail: RuntimeTail::None,
+            sleep_safe: true,
+            generator: false,
+            requires_continuous_time: false,
+            wakes_on_midi: false,
+            wakes_on_automation: true,
+            wakes_on_modulation: true,
+            wakes_on_transport: false,
+            wakes_on_sidechain: true,
+        }
+    }
+
+    pub const fn finite_tail(samples: usize) -> Self {
+        Self {
+            tail: RuntimeTail::Finite(samples),
+            ..Self::no_tail()
+        }
+    }
+
+    pub const fn instrument(tail_samples: usize) -> Self {
+        Self {
+            tail: RuntimeTail::Finite(tail_samples),
+            sleep_safe: true,
+            generator: true,
+            requires_continuous_time: false,
+            wakes_on_midi: true,
+            wakes_on_automation: true,
+            wakes_on_modulation: true,
+            wakes_on_transport: true,
+            wakes_on_sidechain: false,
+        }
+    }
+}
+
 /// A host-side handle for a native plug-in view. The actual thread-affine GUI
 /// object may live on a dedicated message-pumped UI worker; this Send handle
 /// only forwards lifecycle and coalesced resize requests to that owner.
@@ -146,6 +223,9 @@ pub trait Instrument: Send {
     fn reset(&mut self);
     fn tail_samples(&self) -> usize;
     fn active_voice_count(&self) -> usize;
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::always_process()
+    }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         None
     }

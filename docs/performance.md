@@ -16,6 +16,10 @@ project rebuild path.
   pan, mute, solo, send, bus, master, and effect parameter changes use
   coalesced realtime IPC commands. Store-level diffing also keeps undo/redo and
   project loading synchronized with the native engine.
+- Structural graph builds reuse stable built-in and external processor cells by
+  target ID. The callback swaps immutable routing graphs at a block boundary and
+  only repositions timeline cursors; it does not reset held MIDI voices or
+  existing effect state. Seek/stop retain the separate destructive reset path.
 - All level meters share one 30 Hz animation scheduler and update DOM styles
   directly instead of scheduling React renders per meter.
 - Timeline canvases cap device pixel ratio at 1.5, redraw only the visible
@@ -118,6 +122,11 @@ The entry baseline was verified on 2026-08-16 at 48 kHz / 256 frames:
 P1 may introduce scheduler-owned Running/Tail/Sleeping states. It must not revive the old
 working-set-trim loop: a helper may reclaim resources only after the graph has put its node into a
 real Sleeping state and preserved PDC, wake events and plug-in lifetime.
+
+The P1 callback guard is call-graph based as well as textual. Unit tests run the complete
+`AudioCore::render` path under a thread-local counting allocator, while the source guard also scans
+`AudioGraph::process`. Stable per-block event sorting was replaced by bounded in-place unstable
+sorting, and active voice metering writes into a fixed array instead of collecting a `Vec`.
 
 ## P1 preflight usability boundary
 

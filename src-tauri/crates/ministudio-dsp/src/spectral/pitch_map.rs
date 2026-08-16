@@ -12,6 +12,34 @@ use super::analysis::SpectralPeak;
 
 const MAX_FUNDAMENTALS: usize = 8;
 
+/// Pitch judgment is unstable below this frequency (too few cycles per
+/// analysis window, and the ear localizes bass pitch poorly anyway). Peaks
+/// down here are left at their source frequency instead of chasing a target
+/// pitch class.
+const MIN_MAPPABLE_HZ: f32 = 60.0;
+
+/// A peak that would have to move further than this to reach an enabled
+/// pitch class is more likely a different note entirely than an out-of-tune
+/// one. Forcing it onto the grid anyway produces an audible, un-musical
+/// jump, so it is left unshifted instead.
+const MAX_SHIFT_CENTS: f32 = 400.0;
+
+/// The phase-locked mapped component (never the residual pass-through, which
+/// already exactly tracks the dry signal) is gated toward silence once the
+/// dry source's own broadband envelope has dropped well below its recent
+/// level. This is what actually shortens ringing: the mapped signal can be
+/// frequency-shifted well away from wherever the dry signal still has
+/// energy, so gating bin-for-bin against dry would just erase the shift
+/// itself instead of the tail left behind after the source releases.
+/// Fraction of the remaining gap to `target` covered per hop: attack (gate
+/// opening) is fast so ringing does not linger, release (gate closing) is
+/// slow so a genuine decaying tone does not chatter through the gate.
+const GATE_ATTACK_STEP: f32 = 0.35;
+const GATE_RELEASE_STEP: f32 = 0.05;
+/// Decay rate of the slow reference envelope that the current dry level is
+/// compared against, applied once per hop.
+const GATE_REFERENCE_DECAY: f32 = 0.995;
+
 #[derive(Clone, Copy)]
 struct Fundamental {
     frequency_hz: f32,
@@ -61,6 +89,10 @@ pub(crate) struct PitchMapProcessor {
     mapped_peaks: [usize; MAX_SPECTRAL_PEAKS],
     fundamentals: [Fundamental; MAX_FUNDAMENTALS],
     fundamental_count: usize,
+    /// Current smoothed gain applied to the mapped component only.
+    gate_gain: f32,
+    /// Slow envelope of recent dry broadband energy; the gate's threshold.
+    gate_reference: f32,
 }
 
 impl PitchMapProcessor {
@@ -94,6 +126,8 @@ impl PitchMapProcessor {
             mapped_peaks: [0; MAX_SPECTRAL_PEAKS],
             fundamentals: [Fundamental::EMPTY; MAX_FUNDAMENTALS],
             fundamental_count: 0,
+            gate_gain: 1.0,
+            gate_reference: 0.0,
         }
     }
 
@@ -116,6 +150,8 @@ impl PitchMapProcessor {
         self.next_phase_anchor.fill(false);
         self.fundamentals.fill(Fundamental::EMPTY);
         self.fundamental_count = 0;
+        self.gate_gain = 1.0;
+        self.gate_reference = 0.0;
     }
 
     pub(crate) fn analyzer(&self) -> &SpectralAnalyzer {
@@ -152,6 +188,7 @@ impl PitchMapProcessor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn process(
         &mut self,
         frame: &mut SpectralFrame<'_>,
@@ -159,6 +196,7 @@ impl PitchMapProcessor {
         map_amount: f32,
         transient_preserve: f32,
         color: f32,
+        gate: f32,
     ) {
         self.analyzer.analyze(frame);
         let bins = frame.positive_bins();
@@ -265,6 +303,16 @@ impl PitchMapProcessor {
             }
         }
 
+        let gate = gate.clamp(0.0, 1.0);
+        if gate > 1e-5 {
+            self.apply_spectral_gate(bins, gate);
+        } else {
+            // Gate fully open when the control is at zero: skip the
+            // envelope/threshold work entirely and let it re-settle to unity
+            // so a later re-enable does not resume from a stale gain.
+            self.gate_gain = 1.0;
+        }
+
         for bin in 0..bins {
             self.mapped_linked[bin] = (0.5
                 * (self.mapped_magnitude[0][bin].powi(2) + self.mapped_magnitude[1][bin].powi(2)))
@@ -320,7 +368,10 @@ impl PitchMapProcessor {
             let fundamental = Fundamental {
                 frequency_hz: candidate.frequency_hz,
                 score,
-                ratio: nearest_allowed_ratio(candidate.frequency_hz, target_mask),
+                ratio: constrained_ratio(
+                    candidate.frequency_hz,
+                    nearest_allowed_ratio(candidate.frequency_hz, target_mask),
+                ),
             };
             let insertion = (0..self.fundamental_count)
                 .find(|index| score > self.fundamentals[*index].score)
@@ -350,7 +401,7 @@ impl PitchMapProcessor {
                     ratio = fundamental.ratio;
                 }
             }
-            self.peak_ratios[index] = ratio;
+            self.peak_ratios[index] = constrained_ratio(peak.frequency_hz, ratio);
             self.peak_frequencies[index] = peak.frequency_hz;
             let exponent = 1.75 - color.clamp(0.0, 1.0) * 1.25;
             // Prominence distinguishes a tonal peak from its floor, but must
@@ -390,6 +441,42 @@ impl PitchMapProcessor {
                 2.0 * std::f32::consts::PI * mapped_frequency / self.sample_rate;
         }
         self.next_active[destination] = true;
+    }
+
+    /// Shortens ringing left over after the dry source releases, by gating
+    /// the phase-locked mapped component against the dry signal's own
+    /// broadband envelope. Deliberately not a per-bin dry-vs-wet comparison:
+    /// the mapped content is frequency-*shifted*, so it legitimately lands
+    /// where dry has nothing, and gating that bin-for-bin would erase the
+    /// pitch correction itself instead of just its tail.
+    fn apply_spectral_gate(&mut self, bins: usize, gate: f32) {
+        let dry = self.analyzer.magnitudes();
+        let frame_energy: f32 = dry[..bins].iter().sum();
+        self.gate_reference = if frame_energy > self.gate_reference {
+            frame_energy
+        } else {
+            self.gate_reference * GATE_REFERENCE_DECAY + frame_energy * (1.0 - GATE_REFERENCE_DECAY)
+        };
+        // `gate` sweeps the relative threshold from barely-there (only once
+        // the source has nearly fully released) to aggressive (closes as
+        // soon as the source dips modestly below its recent level).
+        let threshold = self.gate_reference * (0.02 + gate * 0.6) + 1e-12;
+        let headroom = (frame_energy / threshold).min(1.0);
+        // Cubic soft knee: unity once the source is present, an inaudible
+        // taper rather than a hard chop as it falls toward silence.
+        let target = headroom * headroom * headroom;
+        let step = if target > self.gate_gain {
+            GATE_ATTACK_STEP
+        } else {
+            GATE_RELEASE_STEP
+        };
+        self.gate_gain += (target - self.gate_gain) * step;
+        let applied = self.gate_gain;
+        for channel in 0..MAX_CHANNELS {
+            for bin in 0..bins {
+                self.mapped_magnitude[channel][bin] *= applied;
+            }
+        }
     }
 
     fn assign_mapped_phase_regions(&mut self) -> usize {
@@ -489,6 +576,20 @@ fn nearest_allowed_ratio(frequency_hz: f32, target_mask: u16) -> f32 {
         }
     }
     2.0_f32.powf((best as f32 - pitch) / 12.0)
+}
+
+/// Refuses a shift that isn't musically defensible: unstable low-frequency
+/// pitch judgment, or a target so far away it reads as a different note
+/// rather than a correction. See `MIN_MAPPABLE_HZ`/`MAX_SHIFT_CENTS`.
+fn constrained_ratio(frequency_hz: f32, ratio: f32) -> f32 {
+    if frequency_hz < MIN_MAPPABLE_HZ {
+        return 1.0;
+    }
+    let cents = 1200.0 * ratio.log2().abs();
+    if cents > MAX_SHIFT_CENTS {
+        return 1.0;
+    }
+    ratio
 }
 
 #[cfg(test)]

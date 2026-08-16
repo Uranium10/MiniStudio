@@ -124,6 +124,15 @@ pub struct StreamStatus {
     pub command_queue_overflow: u64,
     /// Realtime plug-in endpoint deadline misses.
     pub plugin_deadline_misses: u64,
+    /// Current scheduler node-state gauges.
+    pub scheduler_running_nodes: u32,
+    pub scheduler_tail_nodes: u32,
+    pub scheduler_sleeping_nodes: u32,
+    pub scheduler_total_nodes: u32,
+    /// Cumulative scheduler transitions/process skips for diagnostics.
+    pub scheduler_skipped_process_calls: u64,
+    pub scheduler_wake_count: u64,
+    pub scheduler_sleep_count: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Type)]

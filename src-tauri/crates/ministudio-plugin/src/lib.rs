@@ -21,7 +21,8 @@ use clack_host::{
 use ministudio_contracts::{EffectSpec, InstrumentSpec};
 use ministudio_dsp::{
     AudioBuffer, DspEffect, EmbeddedPluginEditor, Instrument, NoteEvent, NoteEventKind,
-    PluginControl, PluginEditorAction, PluginEditorState, MAX_BLOCK_SIZE, MAX_CHANNELS,
+    PluginControl, PluginEditorAction, PluginEditorState, RuntimeCapabilities, MAX_BLOCK_SIZE,
+    MAX_CHANNELS,
 };
 use raw_window_handle::{RawWindowHandle, Win32WindowHandle};
 use serde::{Deserialize, Serialize};
@@ -1509,6 +1510,11 @@ impl DspEffect for Vst3Effect {
     fn latency_samples(&self) -> usize {
         self.latency
     }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        // VST3 tail metadata is retained for offline render, but host-managed
+        // sleep stays opt-in until the module is qualified for silence safety.
+        RuntimeCapabilities::always_process()
+    }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         Some(self.control.clone())
     }
@@ -1754,6 +1760,9 @@ impl Instrument for Vst3Instrument {
     }
     fn active_voice_count(&self) -> usize {
         self.active_notes.len() + self.realtime_active_notes.len()
+    }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::always_process()
     }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         Some(self.control.clone())
@@ -3137,6 +3146,11 @@ impl DspEffect for ClapEffect {
     fn reset(&mut self) {
         self.runtime.reset();
     }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        // CLAP remains in-process and its process-status/tail extension is not
+        // yet promoted into the common endpoint. Never infer silence here.
+        RuntimeCapabilities::always_process()
+    }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         Some(self.runtime.control.clone())
     }
@@ -3253,6 +3267,9 @@ impl Instrument for ClapInstrument {
     }
     fn active_voice_count(&self) -> usize {
         self.active_notes.len()
+    }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::always_process()
     }
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         Some(self.runtime.control.clone())

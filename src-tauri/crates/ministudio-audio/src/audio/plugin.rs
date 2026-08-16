@@ -1,4 +1,4 @@
-//! Stable external plug-in instances shared by immutable realtime graphs.
+//! Stable processor instances shared by immutable realtime graphs.
 //!
 //! A structural project edit builds a replacement `AudioGraph` while the old
 //! graph is still rendering. Reconstructing every VST3/CLAP instance during
@@ -10,49 +10,66 @@
 pub use ministudio_plugin::*;
 
 use super::{
-    dsp::{AudioBuffer, DspEffect, PluginControl},
-    instrument::{Instrument, NoteEvent},
+    dsp::{create_effect, AudioBuffer, DspEffect, PluginControl},
+    instrument::{create_instrument, Instrument, NoteEvent},
     types::{EffectSpec, InstrumentSpec},
 };
 use std::{
     cell::UnsafeCell,
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
+use ministudio_dsp::{RuntimeCapabilities, RuntimeTail};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PluginIdentity {
+struct ProcessorIdentity {
     format: String,
     path: String,
     uid: String,
     sample_rate_bits: u32,
 }
 
-impl PluginIdentity {
-    fn effect(spec: &EffectSpec, sample_rate: f32) -> Result<Self, String> {
-        let plugin = spec
-            .plugin
-            .as_ref()
-            .ok_or("external effect is missing its plugin reference")?;
-        Ok(Self {
-            format: plugin.format.clone(),
-            path: plugin.path.clone(),
-            uid: plugin.uid.clone(),
+impl ProcessorIdentity {
+    fn effect(spec: &EffectSpec, sample_rate: f32) -> Self {
+        let (format, path, uid) = spec.plugin.as_ref().map_or_else(
+            || ("builtin".into(), String::new(), spec.kind.clone()),
+            |plugin| {
+                (
+                    plugin.format.clone(),
+                    plugin.path.clone(),
+                    plugin.uid.clone(),
+                )
+            },
+        );
+        Self {
+            format,
+            path,
+            uid,
             sample_rate_bits: sample_rate.to_bits(),
-        })
+        }
     }
 
-    fn instrument(spec: &InstrumentSpec, sample_rate: f32) -> Result<Self, String> {
-        let plugin = spec
-            .plugin
-            .as_ref()
-            .ok_or("external instrument is missing its plugin reference")?;
-        Ok(Self {
-            format: plugin.format.clone(),
-            path: plugin.path.clone(),
-            uid: plugin.uid.clone(),
+    fn instrument(spec: &InstrumentSpec, sample_rate: f32) -> Self {
+        let (format, path, uid) = spec.plugin.as_ref().map_or_else(
+            || ("builtin".into(), String::new(), spec.kind.clone()),
+            |plugin| {
+                (
+                    plugin.format.clone(),
+                    plugin.path.clone(),
+                    plugin.uid.clone(),
+                )
+            },
+        );
+        Self {
+            format,
+            path,
+            uid,
             sample_rate_bits: sample_rate.to_bits(),
-        })
+        }
     }
 }
 
@@ -86,27 +103,91 @@ impl<T> RealtimeCell<T> {
     }
 }
 
+struct CapabilityCell {
+    flags: AtomicU64,
+    tail_samples: AtomicUsize,
+}
+
+impl CapabilityCell {
+    fn new(value: RuntimeCapabilities) -> Self {
+        let cell = Self {
+            flags: AtomicU64::new(0),
+            tail_samples: AtomicUsize::new(0),
+        };
+        cell.store(value);
+        cell
+    }
+
+    #[inline]
+    fn store(&self, value: RuntimeCapabilities) {
+        let tail = match value.tail {
+            RuntimeTail::None => 0,
+            RuntimeTail::Finite(_) => 1,
+            RuntimeTail::Infinite => 2,
+            RuntimeTail::Unknown => 3,
+        };
+        let flags = tail
+            | (u64::from(value.sleep_safe) << 2)
+            | (u64::from(value.generator) << 3)
+            | (u64::from(value.requires_continuous_time) << 4)
+            | (u64::from(value.wakes_on_midi) << 5)
+            | (u64::from(value.wakes_on_automation) << 6)
+            | (u64::from(value.wakes_on_modulation) << 7)
+            | (u64::from(value.wakes_on_transport) << 8)
+            | (u64::from(value.wakes_on_sidechain) << 9);
+        if let RuntimeTail::Finite(samples) = value.tail {
+            self.tail_samples.store(samples, Ordering::Relaxed);
+        }
+        self.flags.store(flags, Ordering::Release);
+    }
+
+    #[inline]
+    fn load(&self) -> RuntimeCapabilities {
+        let flags = self.flags.load(Ordering::Acquire);
+        let tail = match flags & 0b11 {
+            0 => RuntimeTail::None,
+            1 => RuntimeTail::Finite(self.tail_samples.load(Ordering::Relaxed)),
+            2 => RuntimeTail::Infinite,
+            _ => RuntimeTail::Unknown,
+        };
+        RuntimeCapabilities {
+            tail,
+            sleep_safe: flags & (1 << 2) != 0,
+            generator: flags & (1 << 3) != 0,
+            requires_continuous_time: flags & (1 << 4) != 0,
+            wakes_on_midi: flags & (1 << 5) != 0,
+            wakes_on_automation: flags & (1 << 6) != 0,
+            wakes_on_modulation: flags & (1 << 7) != 0,
+            wakes_on_transport: flags & (1 << 8) != 0,
+            wakes_on_sidechain: flags & (1 << 9) != 0,
+        }
+    }
+}
+
 #[derive(Clone)]
-struct SharedExternalEffect {
+struct SharedEffect {
     processor: Arc<RealtimeCell<Box<dyn DspEffect>>>,
     control: Option<Arc<dyn PluginControl>>,
     latency: usize,
     tail: usize,
     wants_midi: bool,
+    capabilities: Arc<CapabilityCell>,
 }
 
-impl SharedExternalEffect {
+impl SharedEffect {
     fn new(effect: Box<dyn DspEffect>) -> Self {
         let control = effect.plugin_control();
         let latency = effect.latency_samples();
         let tail = effect.tail_samples();
         let wants_midi = effect.wants_midi();
+        let capabilities = Arc::new(CapabilityCell::new(effect.runtime_capabilities()));
         Self {
             processor: Arc::new(RealtimeCell::new(effect)),
             control,
             latency,
             tail,
             wants_midi,
+            capabilities,
         }
     }
 
@@ -118,7 +199,7 @@ impl SharedExternalEffect {
     }
 }
 
-impl DspEffect for SharedExternalEffect {
+impl DspEffect for SharedEffect {
     fn prepare(&mut self, _sample_rate: f32, _max_block: usize, _channels: usize) {
         // The native instance was prepared once when inserted into the
         // registry. A graph proxy must not reactivate it during every rebuild.
@@ -140,7 +221,9 @@ impl DspEffect for SharedExternalEffect {
     }
 
     fn set_param(&mut self, id: &str, value: f32) {
-        self.processor().set_param(id, value)
+        self.processor().set_param(id, value);
+        let capabilities = self.processor().runtime_capabilities();
+        self.capabilities.store(capabilities)
     }
 
     fn set_tempo(&mut self, bpm: f64) {
@@ -167,26 +250,51 @@ impl DspEffect for SharedExternalEffect {
         self.wants_midi
     }
 
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        self.capabilities.load()
+    }
+
+    fn response(&self, points: usize) -> Option<ministudio_contracts::EqFrequencyResponse> {
+        // SAFETY: graph metering/response reads happen on the same callback
+        // owner as processing; the registry never dereferences this cell.
+        unsafe { self.processor.get_ref().response(points) }
+    }
+
+    fn multiband_levels(&self) -> Option<[[f32; crate::audio::MAX_CHANNELS]; 3]> {
+        unsafe { self.processor.get_ref().multiband_levels() }
+    }
+
+    fn effect_spectrum(&self) -> Option<[f32; ministudio_dsp::DISTORTION_SPECTRUM_BINS]> {
+        unsafe { self.processor.get_ref().effect_spectrum() }
+    }
+
+    fn limiter_metrics(&self) -> Option<[f32; ministudio_dsp::LIMITER_METER_VALUES]> {
+        unsafe { self.processor.get_ref().limiter_metrics() }
+    }
+
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         self.control.clone()
     }
 }
 
 #[derive(Clone)]
-struct SharedExternalInstrument {
+struct SharedInstrument {
     processor: Arc<RealtimeCell<Box<dyn Instrument>>>,
     control: Option<Arc<dyn PluginControl>>,
     tail: usize,
+    capabilities: Arc<CapabilityCell>,
 }
 
-impl SharedExternalInstrument {
+impl SharedInstrument {
     fn new(instrument: Box<dyn Instrument>) -> Self {
         let control = instrument.plugin_control();
         let tail = instrument.tail_samples();
+        let capabilities = Arc::new(CapabilityCell::new(instrument.runtime_capabilities()));
         Self {
             processor: Arc::new(RealtimeCell::new(instrument)),
             control,
             tail,
+            capabilities,
         }
     }
 
@@ -197,7 +305,7 @@ impl SharedExternalInstrument {
     }
 }
 
-impl Instrument for SharedExternalInstrument {
+impl Instrument for SharedInstrument {
     fn prepare(&mut self, _sample_rate: f32, _max_block: usize) {}
 
     fn process(&mut self, events: &[NoteEvent], out: &mut AudioBuffer, frames: usize) {
@@ -205,7 +313,9 @@ impl Instrument for SharedExternalInstrument {
     }
 
     fn set_param(&mut self, id: &str, value: f32) {
-        self.processor().set_param(id, value)
+        self.processor().set_param(id, value);
+        let capabilities = self.processor().runtime_capabilities();
+        self.capabilities.store(capabilities)
     }
 
     fn set_tempo(&mut self, bpm: f64) {
@@ -226,19 +336,23 @@ impl Instrument for SharedExternalInstrument {
         unsafe { self.processor.get_ref().active_voice_count() }
     }
 
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        self.capabilities.load()
+    }
+
     fn plugin_control(&self) -> Option<Arc<dyn PluginControl>> {
         self.control.clone()
     }
 }
 
 struct EffectEntry {
-    identity: PluginIdentity,
-    effect: SharedExternalEffect,
+    identity: ProcessorIdentity,
+    effect: SharedEffect,
 }
 
 struct InstrumentEntry {
-    identity: PluginIdentity,
-    instrument: SharedExternalInstrument,
+    identity: ProcessorIdentity,
+    instrument: SharedInstrument,
 }
 
 /// Control-thread registry of stable plug-in instances. It deliberately owns
@@ -246,30 +360,31 @@ struct InstrumentEntry {
 /// graph build; the retired graph's `Arc` keeps removed instances alive until
 /// the callback has completed its swap.
 #[derive(Default)]
-pub struct ExternalPluginRegistry {
+pub struct StableProcessorRegistry {
     effects: HashMap<String, EffectEntry>,
     instruments: HashMap<String, InstrumentEntry>,
 }
 
-impl ExternalPluginRegistry {
+impl StableProcessorRegistry {
     pub fn effect(
         &mut self,
         target_id: &str,
         spec: &EffectSpec,
         sample_rate: f32,
     ) -> Result<Box<dyn DspEffect>, String> {
-        let identity = PluginIdentity::effect(spec, sample_rate)?;
+        let identity = ProcessorIdentity::effect(spec, sample_rate);
         let needs_instance = self
             .effects
             .get(target_id)
             .is_none_or(|entry| entry.identity != identity);
         if needs_instance {
-            let effect = try_create_external_effect(spec, sample_rate)?;
+            let effect = create_effect(spec, sample_rate)
+                .ok_or_else(|| format!("unsupported effect kind: {}", spec.kind))?;
             self.effects.insert(
                 target_id.to_owned(),
                 EffectEntry {
                     identity,
-                    effect: SharedExternalEffect::new(effect),
+                    effect: SharedEffect::new(effect),
                 },
             );
         }
@@ -291,18 +406,19 @@ impl ExternalPluginRegistry {
         if spec.bypassed {
             return Ok(None);
         }
-        let identity = PluginIdentity::instrument(spec, sample_rate)?;
+        let identity = ProcessorIdentity::instrument(spec, sample_rate);
         let needs_instance = self
             .instruments
             .get(target_id)
             .is_none_or(|entry| entry.identity != identity);
         if needs_instance {
-            let instrument = try_create_external_instrument(spec, sample_rate)?;
+            let instrument = create_instrument(spec, sample_rate)
+                .ok_or_else(|| format!("unsupported instrument kind: {}", spec.kind))?;
             self.instruments.insert(
                 target_id.to_owned(),
                 InstrumentEntry {
                     identity,
-                    instrument: SharedExternalInstrument::new(instrument),
+                    instrument: SharedInstrument::new(instrument),
                 },
             );
         }

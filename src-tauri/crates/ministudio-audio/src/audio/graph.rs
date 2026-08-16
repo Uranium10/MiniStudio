@@ -3,11 +3,14 @@ use super::{
     asset::AudioAsset,
     command::{ChainKind, EffectRef},
     dsp::{
-        clipper_curve, create_effect, AudioBuffer, DspEffect, PluginControl, Smoother,
-        DISTORTION_SPECTRUM_BINS, LIMITER_METER_VALUES,
+        clipper_curve, AudioBuffer, DspEffect, PluginControl, Smoother, DISTORTION_SPECTRUM_BINS,
+        LIMITER_METER_VALUES,
     },
-    instrument::{create_instrument, Instrument, NoteEvent, NoteEventKind, TempoMap},
-    plugin::ExternalPluginRegistry,
+    instrument::{Instrument, NoteEvent, NoteEventKind, TempoMap},
+    plugin::StableProcessorRegistry,
+    runtime::{
+        BlockActivity, NodeRuntime, ProcessDecision, SchedulerSnapshot, SleepPolicy, WakeReason,
+    },
     types::{db_to_gain, sec_to_samples, GraphSnapshot, Level},
     MAX_BLOCK_SIZE, MAX_CHANNELS, MAX_EFFECT_METERS, MAX_TRACKS,
 };
@@ -108,6 +111,108 @@ struct SendRoute {
     gain: Smoother,
     pre: bool,
 }
+
+struct ScheduledEffect {
+    processor: Box<dyn DspEffect>,
+    runtime: NodeRuntime,
+}
+
+impl ScheduledEffect {
+    fn new(processor: Box<dyn DspEffect>) -> Self {
+        let runtime = NodeRuntime::new(processor.runtime_capabilities());
+        Self { processor, runtime }
+    }
+
+    #[inline]
+    fn process(
+        &mut self,
+        buffer: &mut AudioBuffer,
+        sidechain: Option<&AudioBuffer>,
+        activity: BlockActivity,
+        frames: usize,
+        scheduler_enabled: bool,
+        metrics: &mut SchedulerSnapshot,
+    ) -> bool {
+        let decision = self
+            .runtime
+            .begin_block(activity, scheduler_enabled, frames);
+        if decision == ProcessDecision::SkipAndClear {
+            buffer.clear(frames);
+        } else {
+            self.processor
+                .process_with_sidechain(&[], buffer, sidechain, frames);
+        }
+        metrics.observe(&self.runtime, decision);
+        decision == ProcessDecision::Process
+    }
+
+    fn set_param(&mut self, id: &str, value: f32) {
+        self.processor.set_param(id, value);
+        self.runtime
+            .update_capabilities(self.processor.runtime_capabilities());
+        self.runtime.wake(WakeReason::Parameter);
+    }
+
+    fn set_bypassed(&mut self, bypassed: bool) {
+        self.processor.set_bypassed(bypassed);
+        self.runtime.wake(WakeReason::Bypass);
+    }
+
+    fn reset(&mut self) {
+        self.processor.reset();
+        self.runtime.reset();
+    }
+}
+
+struct ScheduledInstrument {
+    processor: Box<dyn Instrument>,
+    runtime: NodeRuntime,
+}
+
+impl ScheduledInstrument {
+    fn new(processor: Box<dyn Instrument>) -> Self {
+        let runtime = NodeRuntime::new(processor.runtime_capabilities());
+        Self { processor, runtime }
+    }
+
+    #[inline]
+    fn process(
+        &mut self,
+        events: &[NoteEvent],
+        out: &mut AudioBuffer,
+        frames: usize,
+        scheduler_enabled: bool,
+        metrics: &mut SchedulerSnapshot,
+    ) -> bool {
+        let activity = BlockActivity {
+            main_input: self.processor.active_voice_count() > 0,
+            midi: !events.is_empty(),
+            ..BlockActivity::default()
+        };
+        let decision = self
+            .runtime
+            .begin_block(activity, scheduler_enabled, frames);
+        if decision == ProcessDecision::SkipAndClear {
+            out.clear(frames);
+        } else {
+            self.processor.process(events, out, frames);
+        }
+        metrics.observe(&self.runtime, decision);
+        decision == ProcessDecision::Process
+    }
+
+    fn set_param(&mut self, id: &str, value: f32) {
+        self.processor.set_param(id, value);
+        self.runtime
+            .update_capabilities(self.processor.runtime_capabilities());
+        self.runtime.wake(WakeReason::Parameter);
+    }
+
+    fn reset(&mut self) {
+        self.processor.reset();
+        self.runtime.reset();
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidechainSource {
     Track(usize),
@@ -117,6 +222,7 @@ struct DelayComp {
     data: [Vec<f32>; MAX_CHANNELS],
     index: usize,
     delay: usize,
+    activity_remaining: usize,
 }
 impl DelayComp {
     fn new(delay: usize) -> Self {
@@ -125,11 +231,12 @@ impl DelayComp {
             data: [vec![0.0; len], vec![0.0; len]],
             index: 0,
             delay,
+            activity_remaining: 0,
         }
     }
-    fn process(&mut self, b: &mut AudioBuffer, n: usize) {
+    fn process(&mut self, b: &mut AudioBuffer, n: usize, input_active: bool) -> bool {
         if self.delay == 0 {
-            return;
+            return input_active;
         }
         let len = self.data[0].len();
         for i in 0..n {
@@ -141,6 +248,19 @@ impl DelayComp {
             }
             self.index = (self.index + 1) % len
         }
+        if input_active {
+            self.activity_remaining = self.delay.saturating_add(n);
+        } else {
+            self.activity_remaining = self.activity_remaining.saturating_sub(n);
+        }
+        input_active || self.activity_remaining > 0
+    }
+    fn reset(&mut self) {
+        for channel in &mut self.data {
+            channel.fill(0.0);
+        }
+        self.index = 0;
+        self.activity_remaining = 0;
     }
 }
 struct TrackNode {
@@ -150,8 +270,8 @@ struct TrackNode {
     midi_cursor: usize,
     live_events: Vec<NoteEvent>,
     event_buffer: Vec<NoteEvent>,
-    instrument: Option<Box<dyn Instrument>>,
-    effects: Vec<Box<dyn DspEffect>>,
+    instrument: Option<ScheduledInstrument>,
+    effects: Vec<ScheduledEffect>,
     effect_sidechains: Vec<Option<SidechainSource>>,
     buffer: AudioBuffer,
     gain: Smoother,
@@ -163,7 +283,7 @@ struct TrackNode {
     pdc: DelayComp,
 }
 struct BusNode {
-    effects: Vec<Box<dyn DspEffect>>,
+    effects: Vec<ScheduledEffect>,
     effect_sidechains: Vec<Option<SidechainSource>>,
     buffer: AudioBuffer,
     gain: Smoother,
@@ -173,7 +293,7 @@ pub struct AudioGraph {
     tempo: TempoMap,
     tracks: Vec<TrackNode>,
     buses: Vec<BusNode>,
-    master_effects: Vec<Box<dyn DspEffect>>,
+    master_effects: Vec<ScheduledEffect>,
     master_effect_sidechains: Vec<Option<SidechainSource>>,
     master_buffer: AudioBuffer,
     master_gain: Smoother,
@@ -185,6 +305,13 @@ pub struct AudioGraph {
     next_sidechain_taps: Vec<AudioBuffer>,
     bus_sidechain_taps: Vec<AudioBuffer>,
     next_bus_sidechain_taps: Vec<AudioBuffer>,
+    sidechain_activity: Vec<bool>,
+    next_sidechain_activity: Vec<bool>,
+    bus_sidechain_activity: Vec<bool>,
+    next_bus_sidechain_activity: Vec<bool>,
+    bus_input_activity: Vec<bool>,
+    scheduler_enabled: bool,
+    scheduler_snapshot: SchedulerSnapshot,
 }
 
 impl AudioGraph {
@@ -193,7 +320,7 @@ impl AudioGraph {
         assets: &HashMap<String, Arc<AudioAsset>>,
         sample_rate: u32,
     ) -> Result<(Box<Self>, Bindings), String> {
-        let mut plugins = ExternalPluginRegistry::default();
+        let mut plugins = StableProcessorRegistry::default();
         Self::build_with_plugins(spec, assets, sample_rate, &mut plugins)
     }
 
@@ -201,7 +328,7 @@ impl AudioGraph {
         spec: &GraphSnapshot,
         assets: &HashMap<String, Arc<AudioAsset>>,
         sample_rate: u32,
-        plugins: &mut ExternalPluginRegistry,
+        plugins: &mut StableProcessorRegistry,
     ) -> Result<(Box<Self>, Bindings), String> {
         let sr = sample_rate as f32;
         let mut effects = HashMap::new();
@@ -233,14 +360,10 @@ impl AudioGraph {
             let mut chain = Vec::new();
             let mut effect_sidechains = Vec::new();
             for (es_idx, es) in ts.effects.iter().enumerate() {
-                let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
-                    live_effect_ids.insert(es.id.clone());
-                    Some(plugins.effect(&es.id, es, sr).map_err(|error| {
-                        format!("failed to load effect '{}' ({}): {error}", es.id, es.kind)
-                    })?)
-                } else {
-                    create_effect(es, sr)
-                };
+                live_effect_ids.insert(es.id.clone());
+                let fx = Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                    format!("failed to load effect '{}' ({}): {error}", es.id, es.kind)
+                })?);
                 if let Some(fx) = fx {
                     if let Some(control) = fx.plugin_control() {
                         plugin_controls.insert(es.id.clone(), control);
@@ -277,10 +400,13 @@ impl AudioGraph {
                         },
                     );
                     let _ = es_idx;
-                    chain.push(fx)
+                    chain.push(ScheduledEffect::new(fx))
                 }
             }
-            let latency = chain.iter().map(|v| v.latency_samples()).sum();
+            let latency = chain
+                .iter()
+                .map(|effect| effect.processor.latency_samples())
+                .sum();
             latencies.push(latency);
             let mut clips = Vec::new();
             for c in &ts.clips {
@@ -448,10 +574,7 @@ impl AudioGraph {
             }
             midi_events.sort_by_key(|event| event.sample);
             let instrument = match ts.instrument.as_ref() {
-                Some(instrument)
-                    if instrument.kind.starts_with("vst3:")
-                        || instrument.kind.starts_with("clap:") =>
-                {
+                Some(instrument) => {
                     live_instrument_ids.insert(ts.id.clone());
                     plugins
                         .instrument(&ts.id, instrument, sr)
@@ -461,13 +584,13 @@ impl AudioGraph {
                                 ts.id, instrument.kind
                             )
                         })?
+                        .map(ScheduledInstrument::new)
                 }
-                Some(instrument) => create_instrument(instrument, sr),
                 None => None,
             };
             if let Some(control) = instrument
                 .as_ref()
-                .and_then(|instrument| instrument.plugin_control())
+                .and_then(|instrument| instrument.processor.plugin_control())
             {
                 plugin_controls.insert(ts.id.clone(), control);
             }
@@ -519,17 +642,13 @@ impl AudioGraph {
             let mut chain = Vec::new();
             let mut effect_sidechains = Vec::new();
             for es in &bs.effects {
-                let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
-                    live_effect_ids.insert(es.id.clone());
-                    Some(plugins.effect(&es.id, es, sr).map_err(|error| {
-                        format!(
-                            "failed to load bus effect '{}' ({}): {error}",
-                            es.id, es.kind
-                        )
-                    })?)
-                } else {
-                    create_effect(es, sr)
-                };
+                live_effect_ids.insert(es.id.clone());
+                let fx = Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                    format!(
+                        "failed to load bus effect '{}' ({}): {error}",
+                        es.id, es.kind
+                    )
+                })?);
                 if let Some(fx) = fx {
                     if let Some(control) = fx.plugin_control() {
                         plugin_controls.insert(es.id.clone(), control);
@@ -565,7 +684,7 @@ impl AudioGraph {
                             effect: chain.len(),
                         },
                     );
-                    chain.push(fx)
+                    chain.push(ScheduledEffect::new(fx))
                 }
             }
             buses.push(BusNode {
@@ -578,17 +697,13 @@ impl AudioGraph {
         let mut master_effects = Vec::new();
         let mut master_effect_sidechains = Vec::new();
         for es in &spec.master.effects {
-            let fx = if es.kind.starts_with("vst3:") || es.kind.starts_with("clap:") {
-                live_effect_ids.insert(es.id.clone());
-                Some(plugins.effect(&es.id, es, sr).map_err(|error| {
-                    format!(
-                        "failed to load master effect '{}' ({}): {error}",
-                        es.id, es.kind
-                    )
-                })?)
-            } else {
-                create_effect(es, sr)
-            };
+            live_effect_ids.insert(es.id.clone());
+            let fx = Some(plugins.effect(&es.id, es, sr).map_err(|error| {
+                format!(
+                    "failed to load master effect '{}' ({}): {error}",
+                    es.id, es.kind
+                )
+            })?);
             if let Some(fx) = fx {
                 if let Some(control) = fx.plugin_control() {
                     plugin_controls.insert(es.id.clone(), control);
@@ -620,7 +735,7 @@ impl AudioGraph {
                         effect: master_effects.len(),
                     },
                 );
-                master_effects.push(fx)
+                master_effects.push(ScheduledEffect::new(fx))
             }
         }
         let track_count = tracks.len();
@@ -644,6 +759,13 @@ impl AudioGraph {
                 next_sidechain_taps: (0..track_count).map(|_| AudioBuffer::new()).collect(),
                 bus_sidechain_taps: (0..bus_count).map(|_| AudioBuffer::new()).collect(),
                 next_bus_sidechain_taps: (0..bus_count).map(|_| AudioBuffer::new()).collect(),
+                sidechain_activity: vec![false; track_count],
+                next_sidechain_activity: vec![false; track_count],
+                bus_sidechain_activity: vec![false; bus_count],
+                next_bus_sidechain_activity: vec![false; bus_count],
+                bus_input_activity: vec![false; bus_count],
+                scheduler_enabled: true,
+                scheduler_snapshot: SchedulerSnapshot::default(),
             }),
             Bindings {
                 tracks: tracks_map,
@@ -692,24 +814,30 @@ impl AudioGraph {
         master: &mut Level,
         timeline: bool,
     ) {
+        let mut scheduler = SchedulerSnapshot {
+            skipped_process_calls: self.scheduler_snapshot.skipped_process_calls,
+            wake_count: self.scheduler_snapshot.wake_count,
+            sleep_count: self.scheduler_snapshot.sleep_count,
+            ..SchedulerSnapshot::default()
+        };
         let tempo_bpm = self
             .tempo
             .bpm_at_tick(self.tempo.samples_to_ticks(position));
         for track in &mut self.tracks {
             if let Some(instrument) = &mut track.instrument {
-                instrument.set_tempo(tempo_bpm);
+                instrument.processor.set_tempo(tempo_bpm);
             }
             for effect in &mut track.effects {
-                effect.set_tempo(tempo_bpm);
+                effect.processor.set_tempo(tempo_bpm);
             }
         }
         for bus in &mut self.buses {
             for effect in &mut bus.effects {
-                effect.set_tempo(tempo_bpm);
+                effect.processor.set_tempo(tempo_bpm);
             }
         }
         for effect in &mut self.master_effects {
-            effect.set_tempo(tempo_bpm);
+            effect.processor.set_tempo(tempo_bpm);
         }
         self.master_buffer.clear(frames);
         for b in &mut self.buses {
@@ -722,10 +850,17 @@ impl AudioGraph {
         for tap in &mut self.next_bus_sidechain_taps {
             tap.clear(frames)
         }
+        self.next_sidechain_activity.fill(false);
+        self.next_bus_sidechain_activity.fill(false);
+        self.bus_input_activity.fill(false);
+        let mut master_activity = false;
         let sidechain_taps = &self.sidechain_taps;
         let bus_sidechain_taps = &self.bus_sidechain_taps;
+        let sidechain_activity = &self.sidechain_activity;
+        let bus_sidechain_activity = &self.bus_sidechain_activity;
         for (index, track) in self.tracks.iter_mut().enumerate() {
             track.buffer.clear(frames);
+            let mut track_activity = false;
             if timeline {
                 while track.cursor < track.clips.len() && track.clips[track.cursor].end <= position
                 {
@@ -735,7 +870,8 @@ impl AudioGraph {
                     if clip.start >= position + frames as u64 {
                         break;
                     }
-                    render_clip(clip, position, frames, &mut track.buffer)
+                    render_clip(clip, position, frames, &mut track.buffer);
+                    track_activity = true;
                 }
             }
             if let Some(instrument) = &mut track.instrument {
@@ -762,30 +898,60 @@ impl AudioGraph {
                     }
                     track.midi_cursor = cursor;
                 }
+                let live_capacity = track
+                    .event_buffer
+                    .capacity()
+                    .saturating_sub(track.event_buffer.len())
+                    .min(128);
                 track
                     .event_buffer
-                    .extend(track.live_events.drain(..).take(128));
-                track.event_buffer.sort_by_key(|event| event.sample_offset);
-                instrument.process(&track.event_buffer, &mut track.buffer, frames);
+                    .extend(track.live_events.drain(..).take(live_capacity));
+                // The timeline prefix is sorted and live packets are bounded. An
+                // unstable in-place sort cannot allocate, unlike slice::sort.
+                track
+                    .event_buffer
+                    .sort_unstable_by_key(|event| event.sample_offset);
+                track_activity |= instrument.process(
+                    &track.event_buffer,
+                    &mut track.buffer,
+                    frames,
+                    self.scheduler_enabled,
+                    &mut scheduler,
+                );
             } else {
                 track.live_events.clear();
             }
             for (effect_index, fx) in track.effects.iter_mut().enumerate() {
-                let sidechain = track
-                    .effect_sidechains
-                    .get(effect_index)
-                    .copied()
-                    .flatten()
-                    .and_then(|source| {
-                        sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
-                    });
+                let source = track.effect_sidechains.get(effect_index).copied().flatten();
+                let sidechain = source.and_then(|source| {
+                    sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
+                });
+                let sidechain_active = source.is_some_and(|source| match source {
+                    SidechainSource::Track(index) => {
+                        sidechain_activity.get(index).copied().unwrap_or(false)
+                    }
+                    SidechainSource::Bus(index) => {
+                        bus_sidechain_activity.get(index).copied().unwrap_or(false)
+                    }
+                });
                 // Effect-note routing is intentionally not connected yet. The
                 // event-aware DSP contract is live, but inserts receive an
                 // allocation-free empty slice until a routing source exists.
                 // Querying the capability keeps graph construction ready for
                 // a routed source without implicitly borrowing instrument MIDI.
-                let _awaiting_midi_route = fx.wants_midi();
-                fx.process_with_sidechain(&[], &mut track.buffer, sidechain, frames)
+                let _awaiting_midi_route = fx.processor.wants_midi();
+                track_activity = fx.process(
+                    &mut track.buffer,
+                    sidechain,
+                    BlockActivity {
+                        main_input: track_activity,
+                        sidechain: sidechain_active,
+                        ..BlockActivity::default()
+                    },
+                    frames,
+                    self.scheduler_enabled,
+                    &mut scheduler,
+                );
             }
             let silent = track.muted || (has_solo && !track.solo);
             let mut peak = 0.0_f32;
@@ -810,16 +976,31 @@ impl AudioGraph {
                     }
                 }
             }
-            track.pdc.process(&mut track.buffer, frames);
+            for send in &track.sends {
+                if let Some(active) = self.bus_input_activity.get_mut(send.bus) {
+                    *active |= track_activity && (send.pre || !silent);
+                }
+            }
+            let track_output_activity =
+                track
+                    .pdc
+                    .process(&mut track.buffer, frames, track_activity && !silent);
             for channel in 0..MAX_CHANNELS {
                 self.next_sidechain_taps[index].channels[channel][..frames]
                     .copy_from_slice(&track.buffer.channels[channel][..frames])
             }
+            self.next_sidechain_activity[index] = track_output_activity;
             if let Some(bus) = track.output_bus.and_then(|index| self.buses.get_mut(index)) {
                 for ch in 0..2 {
                     for i in 0..frames {
                         bus.buffer.channels[ch][i] += track.buffer.channels[ch][i]
                     }
+                }
+                if let Some(active) = track
+                    .output_bus
+                    .and_then(|index| self.bus_input_activity.get_mut(index))
+                {
+                    *active |= track_output_activity;
                 }
             } else {
                 for ch in 0..2 {
@@ -827,6 +1008,7 @@ impl AudioGraph {
                         self.master_buffer.channels[ch][i] += track.buffer.channels[ch][i]
                     }
                 }
+                master_activity |= track_output_activity;
             }
             if let Some(m) = levels.get_mut(index) {
                 m.peak = peak;
@@ -834,16 +1016,32 @@ impl AudioGraph {
             }
         }
         for (bus_index, bus) in self.buses.iter_mut().enumerate() {
+            let mut bus_activity = self.bus_input_activity[bus_index];
             for (effect_index, fx) in bus.effects.iter_mut().enumerate() {
-                let sidechain = bus
-                    .effect_sidechains
-                    .get(effect_index)
-                    .copied()
-                    .flatten()
-                    .and_then(|source| {
-                        sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
-                    });
-                fx.process_with_sidechain(&[], &mut bus.buffer, sidechain, frames)
+                let source = bus.effect_sidechains.get(effect_index).copied().flatten();
+                let sidechain = source.and_then(|source| {
+                    sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps)
+                });
+                let sidechain_active = source.is_some_and(|source| match source {
+                    SidechainSource::Track(index) => {
+                        sidechain_activity.get(index).copied().unwrap_or(false)
+                    }
+                    SidechainSource::Bus(index) => {
+                        bus_sidechain_activity.get(index).copied().unwrap_or(false)
+                    }
+                });
+                bus_activity = fx.process(
+                    &mut bus.buffer,
+                    sidechain,
+                    BlockActivity {
+                        main_input: bus_activity,
+                        sidechain: sidechain_active,
+                        ..BlockActivity::default()
+                    },
+                    frames,
+                    self.scheduler_enabled,
+                    &mut scheduler,
+                );
             }
             for i in 0..frames {
                 let g = bus.gain.next();
@@ -854,15 +1052,37 @@ impl AudioGraph {
                 self.master_buffer.channels[0][i] += left;
                 self.master_buffer.channels[1][i] += right
             }
+            self.next_bus_sidechain_activity[bus_index] = bus_activity;
+            master_activity |= bus_activity;
         }
         for (effect_index, fx) in self.master_effects.iter_mut().enumerate() {
-            let sidechain = self
+            let source = self
                 .master_effect_sidechains
                 .get(effect_index)
                 .copied()
-                .flatten()
+                .flatten();
+            let sidechain = source
                 .and_then(|source| sidechain_from_taps(source, sidechain_taps, bus_sidechain_taps));
-            fx.process_with_sidechain(&[], &mut self.master_buffer, sidechain, frames)
+            let sidechain_active = source.is_some_and(|source| match source {
+                SidechainSource::Track(index) => {
+                    sidechain_activity.get(index).copied().unwrap_or(false)
+                }
+                SidechainSource::Bus(index) => {
+                    bus_sidechain_activity.get(index).copied().unwrap_or(false)
+                }
+            });
+            master_activity = fx.process(
+                &mut self.master_buffer,
+                sidechain,
+                BlockActivity {
+                    main_input: master_activity,
+                    sidechain: sidechain_active,
+                    ..BlockActivity::default()
+                },
+                frames,
+                self.scheduler_enabled,
+                &mut scheduler,
+            );
         }
         let (mut peak, mut sum) = (0.0_f32, 0.0_f32);
         for (i, frame) in out.chunks_exact_mut(2).take(frames).enumerate() {
@@ -880,9 +1100,32 @@ impl AudioGraph {
         std::mem::swap(
             &mut self.bus_sidechain_taps,
             &mut self.next_bus_sidechain_taps,
-        )
+        );
+        std::mem::swap(
+            &mut self.sidechain_activity,
+            &mut self.next_sidechain_activity,
+        );
+        std::mem::swap(
+            &mut self.bus_sidechain_activity,
+            &mut self.next_bus_sidechain_activity,
+        );
+        self.scheduler_snapshot = scheduler;
     }
+    /// Positions a newly built graph at the current transport sample without
+    /// resetting stable processors shared with the retiring graph. Structural
+    /// edits use this path so held MIDI voices and effect tails survive the
+    /// callback-boundary swap.
+    pub fn activate(&mut self, position: u64) {
+        self.reposition(position, false)
+    }
+
+    /// Destructive transport reset used by seek/stop/loop. Unlike `activate`,
+    /// this intentionally releases voices and clears processor history.
     pub fn reset(&mut self, position: u64) {
+        self.reposition(position, true)
+    }
+
+    fn reposition(&mut self, position: u64, reset_processors: bool) {
         for tap in self
             .sidechain_taps
             .iter_mut()
@@ -890,6 +1133,11 @@ impl AudioGraph {
         {
             tap.clear(MAX_BLOCK_SIZE)
         }
+        self.sidechain_activity.fill(false);
+        self.next_sidechain_activity.fill(false);
+        self.bus_sidechain_activity.fill(false);
+        self.next_bus_sidechain_activity.fill(false);
+        self.bus_input_activity.fill(false);
         for tap in self
             .bus_sidechain_taps
             .iter_mut()
@@ -903,24 +1151,29 @@ impl AudioGraph {
                 .midi_events
                 .partition_point(|event| event.sample < position);
             t.live_events.clear();
-            if let Some(instrument) = &mut t.instrument {
-                instrument.reset();
+            if reset_processors {
+                if let Some(instrument) = &mut t.instrument {
+                    instrument.reset();
+                }
+                for fx in &mut t.effects {
+                    fx.reset()
+                }
             }
-            for fx in &mut t.effects {
+            t.pdc.reset();
+        }
+        if reset_processors {
+            for b in &mut self.buses {
+                for fx in &mut b.effects {
+                    fx.reset()
+                }
+            }
+            for fx in &mut self.master_effects {
                 fx.reset()
             }
-        }
-        for b in &mut self.buses {
-            for fx in &mut b.effects {
-                fx.reset()
-            }
-        }
-        for fx in &mut self.master_effects {
-            fx.reset()
         }
     }
     pub fn set_effect(&mut self, target: EffectRef, param: &str, value: f32) {
-        let fx: Option<&mut Box<dyn DspEffect>> = match target.chain {
+        let fx: Option<&mut ScheduledEffect> = match target.chain {
             ChainKind::Track => self
                 .tracks
                 .get_mut(target.owner)
@@ -936,7 +1189,7 @@ impl AudioGraph {
         }
     }
     pub fn set_effect_bypassed(&mut self, target: EffectRef, bypassed: bool) {
-        let effect: Option<&mut Box<dyn DspEffect>> = match target.chain {
+        let effect: Option<&mut ScheduledEffect> = match target.chain {
             ChainKind::Track => self
                 .tracks
                 .get_mut(target.owner)
@@ -968,6 +1221,48 @@ impl AudioGraph {
             }
         }
     }
+    pub fn wake_all(&mut self, reason: WakeReason) {
+        for track in &mut self.tracks {
+            if let Some(instrument) = &mut track.instrument {
+                instrument.runtime.wake(reason);
+            }
+            for effect in &mut track.effects {
+                effect.runtime.wake(reason);
+            }
+        }
+        for bus in &mut self.buses {
+            for effect in &mut bus.effects {
+                effect.runtime.wake(reason);
+            }
+        }
+        for effect in &mut self.master_effects {
+            effect.runtime.wake(reason);
+        }
+    }
+
+    pub fn set_scheduler_enabled(&mut self, enabled: bool) {
+        self.scheduler_enabled = enabled;
+        if !enabled {
+            self.wake_all(WakeReason::Routing);
+        }
+    }
+
+    pub fn set_effect_sleep_policy(&mut self, target: EffectRef, policy: SleepPolicy) {
+        let effect = match target.chain {
+            ChainKind::Track => self
+                .tracks
+                .get_mut(target.owner)
+                .and_then(|track| track.effects.get_mut(target.effect)),
+            ChainKind::Bus => self
+                .buses
+                .get_mut(target.owner)
+                .and_then(|bus| bus.effects.get_mut(target.effect)),
+            ChainKind::Master => self.master_effects.get_mut(target.effect),
+        };
+        if let Some(effect) = effect {
+            effect.runtime.set_policy(policy);
+        }
+    }
     pub fn write_multiband_levels(
         &self,
         output: &mut [[[f32; MAX_CHANNELS]; 3]; MAX_EFFECT_METERS],
@@ -981,7 +1276,7 @@ impl AudioGraph {
             .chain(self.master_effects.iter());
         let mut index = 0;
         for effect in effects {
-            if let Some(levels) = effect.multiband_levels() {
+            if let Some(levels) = effect.processor.multiband_levels() {
                 if index >= MAX_EFFECT_METERS {
                     break;
                 }
@@ -1003,7 +1298,7 @@ impl AudioGraph {
             .chain(self.master_effects.iter());
         let mut index = 0;
         for effect in effects {
-            if let Some(spectrum) = effect.effect_spectrum() {
+            if let Some(spectrum) = effect.processor.effect_spectrum() {
                 if index >= MAX_EFFECT_METERS {
                     break;
                 }
@@ -1025,7 +1320,7 @@ impl AudioGraph {
             .chain(self.master_effects.iter());
         let mut index = 0;
         for effect in effects {
-            if let Some(metrics) = effect.limiter_metrics() {
+            if let Some(metrics) = effect.processor.limiter_metrics() {
                 if index >= MAX_EFFECT_METERS {
                     break;
                 }
@@ -1043,16 +1338,13 @@ impl AudioGraph {
             instrument.set_param(param, value);
         }
     }
-    pub fn active_voice_counts(&self) -> Vec<u32> {
-        self.tracks
-            .iter()
-            .map(|track| {
-                track
-                    .instrument
-                    .as_ref()
-                    .map_or(0, |instrument| instrument.active_voice_count() as u32)
-            })
-            .collect()
+    pub fn write_active_voice_counts(&self, output: &mut [u32; MAX_TRACKS]) {
+        output.fill(0);
+        for (index, track) in self.tracks.iter().enumerate() {
+            output[index] = track.instrument.as_ref().map_or(0, |instrument| {
+                instrument.processor.active_voice_count() as u32
+            });
+        }
     }
     pub fn track_mut(
         &mut self,
@@ -1091,12 +1383,12 @@ impl AudioGraph {
             .flat_map(|track| track.effects.iter())
             .chain(self.buses.iter().flat_map(|bus| bus.effects.iter()))
             .chain(self.master_effects.iter())
-            .map(|effect| effect.tail_samples())
+            .map(|effect| effect.processor.tail_samples())
             .chain(self.tracks.iter().filter_map(|track| {
                 track
                     .instrument
                     .as_ref()
-                    .map(|instrument| instrument.tail_samples())
+                    .map(|instrument| instrument.processor.tail_samples())
             }))
             .max()
             .unwrap_or(0)
@@ -1107,6 +1399,10 @@ impl AudioGraph {
 
     pub fn tempo_map(&self) -> &TempoMap {
         &self.tempo
+    }
+
+    pub fn scheduler_snapshot(&self) -> SchedulerSnapshot {
+        self.scheduler_snapshot
     }
 }
 fn render_clip(c: &ClipEvent, pos: u64, n: usize, b: &mut AudioBuffer) {
@@ -1333,6 +1629,64 @@ mod tests {
         rendered
     }
 
+    fn active_voice_count(graph: &AudioGraph, track: usize) -> u32 {
+        let mut counts = [0; MAX_TRACKS];
+        graph.write_active_voice_counts(&mut counts);
+        counts[track]
+    }
+
+    #[test]
+    fn inserting_an_effect_preserves_a_held_live_midi_voice() {
+        let first = midi_snapshot();
+        let mut registry = StableProcessorRegistry::default();
+        let (mut old_graph, _) =
+            AudioGraph::build_with_plugins(&first, &HashMap::new(), 48_000, &mut registry).unwrap();
+        old_graph.push_live_event(
+            0,
+            NoteEvent {
+                sample_offset: 0,
+                kind: NoteEventKind::NoteOn {
+                    note_id: 77,
+                    pitch: 60,
+                    velocity: 1.0,
+                    tuning_cents: 0.0,
+                },
+            },
+        );
+        let mut first_output = vec![0.0; 256 * 2];
+        let mut levels = [Level::default(); MAX_TRACKS];
+        let mut master = Level::default();
+        old_graph.process(0, 256, &mut first_output, &mut levels, &mut master, false);
+        assert_eq!(active_voice_count(&old_graph, 0), 1);
+
+        let mut second = first;
+        second.tracks[0]
+            .effects
+            .push(effect("inserted-compressor", "builtin:compressor", &[]));
+        let (mut new_graph, _) =
+            AudioGraph::build_with_plugins(&second, &HashMap::new(), 48_000, &mut registry)
+                .unwrap();
+        // Mirrors AudioCommand::SwapGraph: position the replacement, but do
+        // not issue the destructive transport reset used by seek/stop.
+        new_graph.activate(256);
+        drop(old_graph);
+
+        let mut second_output = vec![0.0; 256 * 2];
+        new_graph.process(
+            256,
+            256,
+            &mut second_output,
+            &mut levels,
+            &mut master,
+            false,
+        );
+        assert_eq!(active_voice_count(&new_graph, 0), 1);
+        assert!(
+            second_output.iter().any(|sample| sample.abs() > 0.001),
+            "the held note became silent during the structural graph swap"
+        );
+    }
+
     /// Manual regression for the commercial-instrument failure that motivated
     /// the stable registry: keep editor A open, add instrument B through a new
     /// graph, then open B. The A control pointer must survive the rebuild.
@@ -1373,7 +1727,7 @@ mod tests {
             "MINISTUDIO_VST3_SMOKE_PATH_A",
             "MINISTUDIO_VST3_SMOKE_UID_A",
         ));
-        let mut registry = ExternalPluginRegistry::default();
+        let mut registry = StableProcessorRegistry::default();
         let (first_graph, first_bindings) =
             AudioGraph::build_with_plugins(&first, &HashMap::new(), 48_000, &mut registry)
                 .expect("first VST3 graph should build");
@@ -1509,14 +1863,14 @@ mod tests {
             &mut master,
             true,
         );
-        assert_eq!(graph.active_voice_counts()[0], 1);
+        assert_eq!(active_voice_count(&graph, 0), 1);
         graph.all_notes_off();
         // The synth release parameter is an exponential time constant, so
         // allow enough blocks to fall below its -86 dB idle threshold.
         for _ in 0..600 {
             graph.process(0, 256, &mut output[..512], &mut levels, &mut master, false)
         }
-        assert_eq!(graph.active_voice_counts()[0], 0)
+        assert_eq!(active_voice_count(&graph, 0), 0)
     }
 
     #[test]
@@ -1730,5 +2084,163 @@ mod tests {
             .iter()
             .any(|sample| sample.abs() > 0.0001));
         assert!(output.iter().all(|sample| sample.abs() < 0.0001));
+    }
+
+    #[test]
+    fn mass_native_no_tail_nodes_sleep_without_leaving_garbage() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].instrument = None;
+        snapshot.tracks[0].midi_clips.clear();
+        snapshot.tracks[0].effects = (0..500)
+            .map(|index| effect(&format!("utility-{index}"), "builtin:utility", &[]))
+            .collect();
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let mut levels = [Level::default(); MAX_TRACKS];
+        let mut master = Level::default();
+        let mut output = vec![1.0; 512];
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        let metrics = graph.scheduler_snapshot();
+        assert_eq!(metrics.total_nodes, 500);
+        assert_eq!(metrics.sleeping_nodes, 500);
+        assert!(metrics.skipped_process_calls >= 500);
+        assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn scheduler_on_and_off_render_identically_for_safe_native_chain() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].midi_clips[0].notes[0].start_ticks = 0;
+        snapshot.tracks[0].effects = vec![
+            effect("utility", "builtin:utility", &[]),
+            effect("clipper", "builtin:clipper", &[("inputDb", 0.0)]),
+        ];
+        let (mut enabled, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let (mut disabled, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        disabled.set_scheduler_enabled(false);
+        let mut enabled_out = vec![0.0_f32; 8_192];
+        let mut disabled_out = vec![0.0_f32; 8_192];
+        let mut enabled_levels = [Level::default(); MAX_TRACKS];
+        let mut disabled_levels = [Level::default(); MAX_TRACKS];
+        let mut enabled_master = Level::default();
+        let mut disabled_master = Level::default();
+        for position in (0_usize..4_096).step_by(256) {
+            enabled.process(
+                position as u64,
+                256,
+                &mut enabled_out[position * 2..position * 2 + 512],
+                &mut enabled_levels,
+                &mut enabled_master,
+                true,
+            );
+            disabled.process(
+                position as u64,
+                256,
+                &mut disabled_out[position * 2..position * 2 + 512],
+                &mut disabled_levels,
+                &mut disabled_master,
+                true,
+            );
+        }
+        assert!(enabled_out
+            .iter()
+            .zip(&disabled_out)
+            .all(|(left, right)| left.to_bits() == right.to_bits()));
+    }
+
+    #[test]
+    fn sleeping_never_changes_pdc_and_seek_wakes_nodes() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].instrument = None;
+        snapshot.tracks[0].midi_clips.clear();
+        snapshot.tracks[0].effects = vec![effect("clipper", "builtin:clipper", &[])];
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let latency = graph.max_latency();
+        let mut levels = [Level::default(); MAX_TRACKS];
+        let mut master = Level::default();
+        let mut output = vec![0.0; 512];
+        for _ in 0..4 {
+            graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        }
+        assert_eq!(graph.scheduler_snapshot().sleeping_nodes, 1);
+        assert_eq!(graph.max_latency(), latency);
+        graph.reset(0);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        assert_eq!(graph.scheduler_snapshot().running_nodes, 1);
+        assert_eq!(graph.max_latency(), latency);
+    }
+
+    #[test]
+    fn parameter_automation_and_modulation_wake_a_sleeping_node() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].instrument = None;
+        snapshot.tracks[0].midi_clips.clear();
+        snapshot.tracks[0].effects = vec![effect("utility", "builtin:utility", &[])];
+        let (mut graph, bindings) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let target = bindings.effects["utility"];
+        let mut levels = [Level::default(); MAX_TRACKS];
+        let mut master = Level::default();
+        let mut output = vec![0.0; 512];
+        for _ in 0..3 {
+            graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        }
+        assert_eq!(graph.scheduler_snapshot().sleeping_nodes, 1);
+        graph.set_effect(target, "gainDb", -3.0);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        assert_eq!(graph.scheduler_snapshot().running_nodes, 1);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        graph.wake_all(WakeReason::Automation);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        assert_eq!(graph.scheduler_snapshot().running_nodes, 1);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        graph.wake_all(WakeReason::Modulation);
+        graph.process(0, 256, &mut output, &mut levels, &mut master, false);
+        assert_eq!(graph.scheduler_snapshot().running_nodes, 1);
+    }
+
+    #[test]
+    fn return_reverb_tail_survives_after_the_source_becomes_quiet() {
+        let mut snapshot = midi_snapshot();
+        snapshot.tracks[0].midi_clips[0].notes[0].start_ticks = 0;
+        snapshot.tracks[0].midi_clips[0].notes[0].length_ticks = 120;
+        snapshot.tracks[0].sends = vec![SendSpec {
+            id: "tail-send".into(),
+            target_bus_id: "tail-return".into(),
+            gain_db: 0.0,
+            pre_fader: false,
+        }];
+        snapshot.buses = vec![BusSpec {
+            id: "tail-return".into(),
+            name: "Tail Return".into(),
+            effects: vec![effect(
+                "tail-reverb",
+                "builtin:reverb",
+                &[("decaySec", 2.5), ("mix", 1.0)],
+            )],
+            volume_db: 0.0,
+        }];
+        let (mut graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
+        let mut levels = [Level::default(); MAX_TRACKS];
+        let mut master = Level::default();
+        let mut output = vec![0.0; 512];
+        let mut late_energy = 0.0_f32;
+        for position in (0..72_000).step_by(256) {
+            graph.process(
+                position as u64,
+                256,
+                &mut output,
+                &mut levels,
+                &mut master,
+                true,
+            );
+            if position >= 48_000 {
+                late_energy += output.iter().map(|sample| sample.abs()).sum::<f32>();
+            }
+        }
+        assert!(
+            late_energy > 0.01,
+            "return tail was truncated: {late_energy}"
+        );
     }
 }

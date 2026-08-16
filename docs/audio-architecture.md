@@ -8,6 +8,32 @@ audio stream. The CPAL callback owns `AudioCore` and renders only the currently 
 Graph replacement is transactional: a complete graph is built off the callback, submitted through
 a bounded SPSC queue, and the retired graph is returned to the control side for destruction.
 
+`StableProcessorRegistry` owns one processor cell per stable track/effect ID for both built-in and
+external devices. A structural edit clones lightweight graph proxies instead of reconstructing the
+unchanged instrument and insert chain. At the callback boundary, `AudioGraph::activate` positions
+clip/MIDI cursors and routing buffers without resetting those processors. Destructive
+`AudioGraph::reset` is reserved for seek, stop and loop transport boundaries, where releasing
+voices and histories is intentional. This separation preserves held live-MIDI voices and effect
+tails while inserting, deleting or reordering devices without adding callback locks or allocation.
+
+## P1 runtime scheduler
+
+`audio/runtime.rs` owns the format-neutral `Running -> Tail -> Sleeping` state machine. Native DSP
+and external adapters expose `RuntimeCapabilities`; the graph wraps each processor in a small
+scheduled node without moving or destroying the processor. The scheduler sees main input,
+sidechain, MIDI and control wake activity before deciding the current block.
+
+Only explicitly safe native configurations are initially eligible: stateless Utility and the
+Clipper with its declared 15-sample finite tail. Stateful/unknown native DSP, VST3 and CLAP remain
+`AlwaysProcess`. Skipping clears the node buffer explicitly, while sleeping nodes remain in routing
+and PDC calculations. Activity flags have the same double-buffered lifetime as their sidechain
+audio taps and bus/master propagation uses preallocated boolean arrays.
+
+The diagnostic global switch reverts to all-process behavior, and each effect has an internal
+`Auto`/`AlwaysProcess` policy seam. Scheduler gauges and cumulative skip/wake/sleep counters travel
+through the existing triple-buffered meter frame to `StreamStatus`; no React-rate publication is
+added to the callback.
+
 External plug-in control and realtime processing are separate owners. In particular, the Windows
 VST3 audio adapter owns a detached `RealtimeClient`; editor, state and lifecycle operations retain
 only the control handle. A stalled native editor can therefore not acquire anything needed by the
@@ -26,8 +52,10 @@ audio callback.
 - Every callback buffer, event list and graph scratch area is allocated before streaming begins.
 
 The callback must not use mutexes, blocking channels, synchronous control IPC, file I/O, logging,
-or heap allocation. `tests/realtime_architecture.rs` rejects direct regressions in the callback and
-`AudioCore::render` surfaces; this is a guardrail rather than a substitute for profiling.
+or heap allocation. `tests/realtime_architecture.rs` scans the explicit callback, render and graph
+process surfaces, while the full-render allocation test instruments the executed call graph and
+requires zero allocation/deallocation. These remain guardrails rather than substitutes for
+profiling vendor DSP code.
 
 ## Bounded failure behavior
 

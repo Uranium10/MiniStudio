@@ -6,4 +6,5 @@ description = "Allocation-free native DSP for MiniStudio"
 
 [dependencies]
 rustfft = "6.4"
+realfft = "3.5"
 ministudio-contracts = { path = "../ministudio-contracts" }

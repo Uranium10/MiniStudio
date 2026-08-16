@@ -13,7 +13,7 @@ import { commands } from './bindings'
 import type { DecodeProgress, EngineError, ExportProgress, GraphSnapshot as NativeGraphSnapshot, MidiNoteInput, PluginDescriptor as NativePluginDescriptor } from './bindings'
 import { getAssetPeaks } from './binary'
 
-const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0, cpuLoadPercent: 0, cpuPeakPercent: 0, countInBeatsRemaining: 0, callbackP50Ms: 0, callbackP95Ms: 0, callbackP99Ms: 0, callbackMaxMs: 0, commandQueueHighWater: 0, commandQueueOverflow: 0, pluginDeadlineMisses: 0 }
+const idleStatus: StreamStatus = { latencyMs: 0, xruns: 0, running: false, pdcSamples: 0, cpuLoadPercent: 0, cpuPeakPercent: 0, countInBeatsRemaining: 0, callbackP50Ms: 0, callbackP95Ms: 0, callbackP99Ms: 0, callbackMaxMs: 0, commandQueueHighWater: 0, commandQueueOverflow: 0, pluginDeadlineMisses: 0, schedulerRunningNodes: 0, schedulerTailNodes: 0, schedulerSleepingNodes: 0, schedulerTotalNodes: 0, schedulerSkippedProcessCalls: 0, schedulerWakeCount: 0, schedulerSleepCount: 0 }
 
 export class RustEngine implements IAudioEngine {
   private initialized = false
@@ -379,6 +379,13 @@ export class RustEngine implements IAudioEngine {
       this.streamStatus.commandQueueHighWater = state.stream.commandQueueHighWater
       this.streamStatus.commandQueueOverflow = state.stream.commandQueueOverflow
       this.streamStatus.pluginDeadlineMisses = state.stream.pluginDeadlineMisses
+      this.streamStatus.schedulerRunningNodes = state.stream.schedulerRunningNodes
+      this.streamStatus.schedulerTailNodes = state.stream.schedulerTailNodes
+      this.streamStatus.schedulerSleepingNodes = state.stream.schedulerSleepingNodes
+      this.streamStatus.schedulerTotalNodes = state.stream.schedulerTotalNodes
+      this.streamStatus.schedulerSkippedProcessCalls = state.stream.schedulerSkippedProcessCalls
+      this.streamStatus.schedulerWakeCount = state.stream.schedulerWakeCount
+      this.streamStatus.schedulerSleepCount = state.stream.schedulerSleepCount
       for (const listener of this.listeners) listener(this.playheadSec)
     } catch (error) {
       this.streamStatus = { ...this.streamStatus, running: false, error: describeEngineError(error) }

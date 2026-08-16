@@ -98,6 +98,9 @@ impl DspEffect for Clipper {
     fn latency_samples(&self) -> usize {
         2
     }
+    fn runtime_capabilities(&self) -> RuntimeCapabilities {
+        RuntimeCapabilities::finite_tail(15)
+    }
     fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
         Some(self.flow)
     }

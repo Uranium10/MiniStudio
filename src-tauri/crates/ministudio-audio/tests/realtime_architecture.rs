@@ -50,6 +50,36 @@ fn audio_core_render_has_no_direct_io_or_lock() {
     }
 }
 
+#[test]
+fn audio_graph_process_has_no_obvious_allocator_or_blocking_primitive() {
+    let source = include_str!("../src/audio/graph.rs");
+    let process = between(
+        source,
+        "pub fn process(\n        &mut self,",
+        "/// Positions a newly built graph",
+    );
+    for forbidden in [
+        ".lock(",
+        "Mutex",
+        "RwLock",
+        ".recv(",
+        "File::",
+        "fs::",
+        "println!",
+        "eprintln!",
+        ".collect(",
+        "Vec::",
+        "vec![",
+        ".sort_by_key(",
+        ".sort_by(",
+    ] {
+        assert!(
+            !process.contains(forbidden),
+            "forbidden realtime primitive `{forbidden}` entered AudioGraph::process"
+        );
+    }
+}
+
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).expect("callback start marker") + start.len();
     let end = source[start..].find(end).expect("callback end marker") + start;
