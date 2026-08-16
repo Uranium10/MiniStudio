@@ -904,5 +904,5 @@ body.param-dragging * { cursor: ns-resize !important; user-select: none; }
 .device-picker-group .device-picker-group-label b,.device-picker-group .device-picker-submenu > strong { color: var(--category-color); }
 .device-picker-group:hover > .device-picker-group-label,.device-picker-group:focus-within > .device-picker-group-label { border-color: color-mix(in srgb,var(--category-color) 55%,#33434d); background: color-mix(in srgb,var(--category-color) 14%,#202c34); box-shadow: inset 2px 0 var(--category-color); }
 
-/* Colorizer 2.0 adds an engine selector without growing the fixed rack card. */
+/* Colorizer quality/key controls stay compact without growing the fixed rack card. */
 .colorizer-selects { grid-template-columns: 58px 54px minmax(88px,1fr) 44px; }

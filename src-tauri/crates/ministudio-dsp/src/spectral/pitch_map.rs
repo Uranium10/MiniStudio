@@ -10,57 +10,76 @@ use crate::MAX_CHANNELS;
 #[cfg(test)]
 use super::analysis::SpectralPeak;
 
-const MAX_FUNDAMENTALS: usize = 8;
+const MAX_GROUPS: usize = 4;
+const MAX_SHIFT_CENTS: f32 = 150.0;
+const MIN_MAPPABLE_HZ: f32 = 40.0;
+const RATIO_SMOOTH_SECONDS: f32 = 0.025;
+const PEAK_TRACK_CENTS: f32 = 60.0;
+const GROUP_TRACK_CENTS: f32 = 80.0;
+const SILENCE_ENERGY: f32 = 1e-9;
 
-/// Pitch judgment is unstable below this frequency (too few cycles per
-/// analysis window, and the ear localizes bass pitch poorly anyway). Peaks
-/// down here are left at their source frequency instead of chasing a target
-/// pitch class.
-const MIN_MAPPABLE_HZ: f32 = 60.0;
-
-/// A peak that would have to move further than this to reach an enabled
-/// pitch class is more likely a different note entirely than an out-of-tune
-/// one. Forcing it onto the grid anyway produces an audible, un-musical
-/// jump, so it is left unshifted instead.
-const MAX_SHIFT_CENTS: f32 = 400.0;
-
-/// The phase-locked mapped component (never the residual pass-through, which
-/// already exactly tracks the dry signal) is gated toward silence once the
-/// dry source's own broadband envelope has dropped well below its recent
-/// level. This is what actually shortens ringing: the mapped signal can be
-/// frequency-shifted well away from wherever the dry signal still has
-/// energy, so gating bin-for-bin against dry would just erase the shift
-/// itself instead of the tail left behind after the source releases.
-/// Fraction of the remaining gap to `target` covered per hop: attack (gate
-/// opening) is fast so ringing does not linger, release (gate closing) is
-/// slow so a genuine decaying tone does not chatter through the gate.
-const GATE_ATTACK_STEP: f32 = 0.35;
-const GATE_RELEASE_STEP: f32 = 0.05;
-/// Decay rate of the slow reference envelope that the current dry level is
-/// compared against, applied once per hop.
-const GATE_REFERENCE_DECAY: f32 = 0.995;
-
-#[derive(Clone, Copy)]
-struct Fundamental {
-    frequency_hz: f32,
-    score: f32,
+#[derive(Clone, Copy, Debug)]
+struct PeakPlan {
+    source_bin: usize,
+    region_start: usize,
+    region_end: usize,
+    source_frequency: f32,
     ratio: f32,
+    target_frequency: f32,
+    delta_bins: isize,
+    synthesis_phase: [f32; MAX_CHANNELS],
 }
 
-impl Fundamental {
+impl PeakPlan {
     const EMPTY: Self = Self {
-        frequency_hz: 0.0,
-        score: 0.0,
+        source_bin: 0,
+        region_start: 0,
+        region_end: 0,
+        source_frequency: 0.0,
         ratio: 1.0,
+        target_frequency: 0.0,
+        delta_bins: 0,
+        synthesis_phase: [0.0; MAX_CHANNELS],
     };
 }
 
-/// Bounded, stereo-coherent tonal pitch mapper.
+#[derive(Clone, Copy, Debug)]
+struct PeakTrack {
+    frequency: f32,
+    ratio: f32,
+    synthesis_phase: [f32; MAX_CHANNELS],
+    active: bool,
+}
+
+impl PeakTrack {
+    const EMPTY: Self = Self {
+        frequency: 0.0,
+        ratio: 1.0,
+        synthesis_phase: [0.0; MAX_CHANNELS],
+        active: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GroupTrack {
+    fundamental: f32,
+    ratio: f32,
+    active: bool,
+}
+
+impl GroupTrack {
+    const EMPTY: Self = Self {
+        fundamental: 0.0,
+        ratio: 1.0,
+        active: false,
+    };
+}
+
+/// Linked-stereo, fixed-capacity harmonic-family pitch mapper.
 ///
-/// The analyzer and all synthesis workspaces are prepared up-front. One linked
-/// map is applied to the original L/R spectra; the channel complex values are
-/// never collapsed to mono. Stable peak regions use identity-style relative
-/// phase locking, while transient and residual energy stays at its source bin.
+/// Detection and target decisions are shared between channels. Resynthesis is
+/// channel-specific and moves each complete source peak region with one bin
+/// offset while retaining every bin's phase relative to its source peak.
 pub(crate) struct PitchMapProcessor {
     analyzer: SpectralAnalyzer,
     fft_size: usize,
@@ -68,31 +87,22 @@ pub(crate) struct PitchMapProcessor {
     sample_rate: f32,
     original: [Vec<Complex32>; MAX_CHANNELS],
     output: [Vec<Complex32>; MAX_CHANNELS],
-    mapped_magnitude: [Vec<f32>; MAX_CHANNELS],
-    mapped_linked: Vec<f32>,
-    mapped_omega: Vec<f32>,
-    mapped_source: Vec<u16>,
-    mapped_weight: Vec<f32>,
-    mapped_region_peak: Vec<u16>,
-    synthesis_phase: [Vec<f32>; MAX_CHANNELS],
-    previous_source: Vec<u16>,
-    next_active: Vec<bool>,
-    previous_phase_anchor: Vec<bool>,
-    next_phase_anchor: Vec<bool>,
-    peak_bins: [usize; MAX_SPECTRAL_PEAKS],
-    peak_frequencies: [f32; MAX_SPECTRAL_PEAKS],
-    peak_ratios: [f32; MAX_SPECTRAL_PEAKS],
-    peak_strengths: [f32; MAX_SPECTRAL_PEAKS],
-    sorted_frequencies: [f32; MAX_SPECTRAL_PEAKS],
-    sorted_ratios: [f32; MAX_SPECTRAL_PEAKS],
-    sorted_strengths: [f32; MAX_SPECTRAL_PEAKS],
-    mapped_peaks: [usize; MAX_SPECTRAL_PEAKS],
-    fundamentals: [Fundamental; MAX_FUNDAMENTALS],
-    fundamental_count: usize,
-    /// Current smoothed gain applied to the mapped component only.
+    shifted: [Vec<Complex32>; MAX_CHANNELS],
+    resonance_hold: [Vec<Complex32>; MAX_CHANNELS],
+    region_owner: Vec<i16>,
+    plans: [PeakPlan; MAX_SPECTRAL_PEAKS],
+    peak_groups: [i8; MAX_SPECTRAL_PEAKS],
+    group_ratios: [f32; MAX_GROUPS],
+    previous_peaks: [PeakTrack; MAX_SPECTRAL_PEAKS],
+    next_peaks: [PeakTrack; MAX_SPECTRAL_PEAKS],
+    previous_peak_count: usize,
+    previous_groups: [GroupTrack; MAX_GROUPS],
+    next_groups: [GroupTrack; MAX_GROUPS],
+    group_count: usize,
     gate_gain: f32,
-    /// Slow envelope of recent dry broadband energy; the gate's threshold.
     gate_reference: f32,
+    energy_gain: f32,
+    resonance_enabled: bool,
 }
 
 impl PitchMapProcessor {
@@ -105,29 +115,22 @@ impl PitchMapProcessor {
             sample_rate,
             original: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); bins]),
             output: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); bins]),
-            mapped_magnitude: std::array::from_fn(|_| vec![0.0; bins]),
-            mapped_linked: vec![0.0; bins],
-            mapped_omega: vec![0.0; bins],
-            mapped_source: vec![0; bins],
-            mapped_weight: vec![0.0; bins],
-            mapped_region_peak: vec![0; bins],
-            synthesis_phase: std::array::from_fn(|_| vec![0.0; bins]),
-            previous_source: vec![u16::MAX; bins],
-            next_active: vec![false; bins],
-            previous_phase_anchor: vec![false; bins],
-            next_phase_anchor: vec![false; bins],
-            peak_bins: [0; MAX_SPECTRAL_PEAKS],
-            peak_frequencies: [0.0; MAX_SPECTRAL_PEAKS],
-            peak_ratios: [1.0; MAX_SPECTRAL_PEAKS],
-            peak_strengths: [0.0; MAX_SPECTRAL_PEAKS],
-            sorted_frequencies: [0.0; MAX_SPECTRAL_PEAKS],
-            sorted_ratios: [1.0; MAX_SPECTRAL_PEAKS],
-            sorted_strengths: [0.0; MAX_SPECTRAL_PEAKS],
-            mapped_peaks: [0; MAX_SPECTRAL_PEAKS],
-            fundamentals: [Fundamental::EMPTY; MAX_FUNDAMENTALS],
-            fundamental_count: 0,
+            shifted: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); bins]),
+            resonance_hold: std::array::from_fn(|_| vec![Complex32::new(0.0, 0.0); bins]),
+            region_owner: vec![-1; bins],
+            plans: [PeakPlan::EMPTY; MAX_SPECTRAL_PEAKS],
+            peak_groups: [-1; MAX_SPECTRAL_PEAKS],
+            group_ratios: [1.0; MAX_GROUPS],
+            previous_peaks: [PeakTrack::EMPTY; MAX_SPECTRAL_PEAKS],
+            next_peaks: [PeakTrack::EMPTY; MAX_SPECTRAL_PEAKS],
+            previous_peak_count: 0,
+            previous_groups: [GroupTrack::EMPTY; MAX_GROUPS],
+            next_groups: [GroupTrack::EMPTY; MAX_GROUPS],
+            group_count: 0,
             gate_gain: 1.0,
             gate_reference: 0.0,
+            energy_gain: 1.0,
+            resonance_enabled: false,
         }
     }
 
@@ -136,26 +139,36 @@ impl PitchMapProcessor {
         for channel in 0..MAX_CHANNELS {
             self.original[channel].fill(Complex32::new(0.0, 0.0));
             self.output[channel].fill(Complex32::new(0.0, 0.0));
-            self.mapped_magnitude[channel].fill(0.0);
-            self.synthesis_phase[channel].fill(0.0);
+            self.shifted[channel].fill(Complex32::new(0.0, 0.0));
+            self.resonance_hold[channel].fill(Complex32::new(0.0, 0.0));
         }
-        self.mapped_linked.fill(0.0);
-        self.mapped_omega.fill(0.0);
-        self.mapped_source.fill(0);
-        self.mapped_weight.fill(0.0);
-        self.mapped_region_peak.fill(0);
-        self.previous_source.fill(u16::MAX);
-        self.next_active.fill(false);
-        self.previous_phase_anchor.fill(false);
-        self.next_phase_anchor.fill(false);
-        self.fundamentals.fill(Fundamental::EMPTY);
-        self.fundamental_count = 0;
+        self.region_owner.fill(-1);
+        self.plans.fill(PeakPlan::EMPTY);
+        self.peak_groups.fill(-1);
+        self.previous_peaks.fill(PeakTrack::EMPTY);
+        self.next_peaks.fill(PeakTrack::EMPTY);
+        self.previous_peak_count = 0;
+        self.previous_groups.fill(GroupTrack::EMPTY);
+        self.next_groups.fill(GroupTrack::EMPTY);
+        self.group_count = 0;
         self.gate_gain = 1.0;
         self.gate_reference = 0.0;
+        self.energy_gain = 1.0;
+        self.resonance_enabled = false;
     }
 
     pub(crate) fn analyzer(&self) -> &SpectralAnalyzer {
         &self.analyzer
+    }
+
+    pub(crate) fn clear_resonance(&mut self) {
+        if !self.resonance_enabled {
+            return;
+        }
+        for channel in &mut self.resonance_hold {
+            channel.fill(Complex32::new(0.0, 0.0));
+        }
+        self.resonance_enabled = false;
     }
 
     #[cfg(test)]
@@ -188,139 +201,73 @@ impl PitchMapProcessor {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn process(
         &mut self,
         frame: &mut SpectralFrame<'_>,
         target_mask: u16,
-        map_amount: f32,
-        transient_preserve: f32,
-        color: f32,
+        morph: f32,
         gate: f32,
+        resonance: f32,
     ) {
         self.analyzer.analyze(frame);
         let bins = frame.positive_bins();
+        let frame_energy = self.analyzer.magnitudes()[..bins]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>();
         for channel in 0..MAX_CHANNELS {
             self.original[channel].copy_from_slice(frame.channel(channel));
             self.output[channel].fill(Complex32::new(0.0, 0.0));
-            self.mapped_magnitude[channel].fill(0.0);
+            self.shifted[channel].fill(Complex32::new(0.0, 0.0));
         }
-        self.mapped_linked.fill(0.0);
-        self.mapped_omega.fill(0.0);
-        self.mapped_source.fill(0);
-        self.mapped_weight.fill(0.0);
-        self.next_active.fill(false);
-        self.next_phase_anchor.fill(false);
 
-        if target_mask == 0 || map_amount <= 1e-5 {
-            for channel in 0..MAX_CHANNELS {
-                frame
-                    .channel_mut(channel)
-                    .copy_from_slice(&self.original[channel]);
+        if frame_energy <= SILENCE_ENERGY {
+            self.clear_tracking();
+            if resonance > 1e-5 {
+                self.render_resonance_only(frame, resonance);
+            } else {
+                for channel in 0..MAX_CHANNELS {
+                    frame.channel_mut(channel).fill(Complex32::new(0.0, 0.0));
+                }
             }
             return;
         }
 
-        self.build_peak_map(target_mask, color);
+        let mask = target_mask & 0x0fff;
+        if mask == 0 || mask == 0x0fff {
+            self.copy_identity(frame);
+            self.clear_tracking();
+            if resonance <= 1e-5 && self.resonance_enabled {
+                self.clear_resonance();
+            }
+            return;
+        }
+
         let peak_count = self.analyzer.peaks().len().min(MAX_SPECTRAL_PEAKS);
         if peak_count == 0 {
-            for channel in 0..MAX_CHANNELS {
-                frame
-                    .channel_mut(channel)
-                    .copy_from_slice(&self.original[channel]);
-            }
+            self.copy_identity(frame);
+            self.clear_tracking();
             return;
         }
 
-        let sorted_count = peak_count;
-        for index in 0..peak_count {
-            let peak = self.analyzer.peaks()[index];
-            let insertion = (0..index)
-                .find(|sorted| peak.bin < self.peak_bins[*sorted])
-                .unwrap_or(index);
-            for slot in (insertion + 1..=index).rev() {
-                self.peak_bins[slot] = self.peak_bins[slot - 1];
-                self.sorted_frequencies[slot] = self.sorted_frequencies[slot - 1];
-                self.sorted_ratios[slot] = self.sorted_ratios[slot - 1];
-                self.sorted_strengths[slot] = self.sorted_strengths[slot - 1];
-            }
-            self.peak_bins[insertion] = peak.bin;
-            self.sorted_frequencies[insertion] = self.peak_frequencies[index];
-            self.sorted_ratios[insertion] = self.peak_ratios[index];
-            self.sorted_strengths[insertion] = self.peak_strengths[index];
-        }
+        self.build_regions(peak_count, bins);
+        self.build_harmonic_groups(peak_count, mask);
+        self.build_peak_plans(peak_count, mask);
+        self.render_regions(peak_count, bins);
 
-        let width = 2.2 + color.clamp(0.0, 1.0) * 4.8;
-        let amount = map_amount.clamp(0.0, 1.0);
-        let transient = transient_preserve.clamp(0.0, 1.0);
-        let mut sorted_peak_index = 0;
-
-        for bin in 0..bins {
-            while sorted_peak_index + 1 < sorted_count
-                && self.peak_bins[sorted_peak_index + 1].abs_diff(bin)
-                    <= self.peak_bins[sorted_peak_index].abs_diff(bin)
-            {
-                sorted_peak_index += 1;
-            }
-            let peak_bin = self.peak_bins[sorted_peak_index];
-            let ratio = self.sorted_ratios[sorted_peak_index];
-            let peak_frequency = self.sorted_frequencies[sorted_peak_index];
-            let peak_strength = self.sorted_strengths[sorted_peak_index];
-            let distance = peak_bin.abs_diff(bin) as f32;
-            let region_weight = (-0.5 * (distance / width).powi(2)).exp();
-            let local_energy = if self.analyzer.magnitudes()[peak_bin] > 1e-12 {
-                (self.analyzer.magnitudes()[bin] / self.analyzer.magnitudes()[peak_bin])
-                    .sqrt()
-                    .min(1.0)
-            } else {
-                0.0
-            };
-            let tonal =
-                (peak_strength * region_weight * (0.55 + 0.45 * local_energy)).clamp(0.0, 1.0);
-            let mapped = (amount * tonal * (1.0 - transient * self.analyzer.transient_mask()[bin]))
-                .clamp(0.0, 1.0);
-            let residual = 1.0 - mapped;
-            for channel in 0..MAX_CHANNELS {
-                self.output[channel][bin] += self.original[channel][bin] * residual;
-            }
-            if mapped <= 1e-5 {
-                continue;
-            }
-
-            let bin_hz = self.sample_rate / self.fft_size as f32;
-            let source_frequency =
-                (peak_frequency + (bin as f32 - peak_bin as f32) * bin_hz).max(0.0);
-            let mapped_frequency = source_frequency * ratio;
-            let destination = mapped_frequency / bin_hz;
-            let lower = destination.floor() as usize;
-            if lower >= bins {
-                continue;
-            }
-            let fraction = destination - lower as f32;
-            self.scatter_mapped_bin(bin, lower, 1.0 - fraction, mapped_frequency, mapped);
-            if fraction > 1e-5 && lower + 1 < bins {
-                self.scatter_mapped_bin(bin, lower + 1, fraction, mapped_frequency, mapped);
+        let gate_gain = self.update_gate(frame_energy.sqrt(), gate);
+        for channel in 0..MAX_CHANNELS {
+            for bin in 0..bins {
+                self.output[channel][bin] += self.shifted[channel][bin] * gate_gain;
             }
         }
 
-        let gate = gate.clamp(0.0, 1.0);
-        if gate > 1e-5 {
-            self.apply_spectral_gate(bins, gate);
-        } else {
-            // Gate fully open when the control is at zero: skip the
-            // envelope/threshold work entirely and let it re-settle to unity
-            // so a later re-enable does not resume from a stale gain.
-            self.gate_gain = 1.0;
-        }
-
-        for bin in 0..bins {
-            self.mapped_linked[bin] = (0.5
-                * (self.mapped_magnitude[0][bin].powi(2) + self.mapped_magnitude[1][bin].powi(2)))
-            .sqrt();
-        }
-        let mapped_peak_count = self.assign_mapped_phase_regions();
-        if mapped_peak_count > 0 {
-            self.render_phase_locked_component(mapped_peak_count);
+        self.apply_energy_compensation(bins);
+        self.apply_transient_morph(bins, morph);
+        if resonance > 1e-5 {
+            self.apply_resonance(bins, resonance);
+        } else if self.resonance_enabled {
+            self.clear_resonance();
         }
 
         for channel in 0..MAX_CHANNELS {
@@ -328,232 +275,467 @@ impl PitchMapProcessor {
                 .channel_mut(channel)
                 .copy_from_slice(&self.output[channel]);
         }
-        std::mem::swap(&mut self.previous_phase_anchor, &mut self.next_phase_anchor);
-        self.previous_source.copy_from_slice(&self.mapped_source);
+        self.commit_tracking(peak_count);
     }
 
-    fn build_peak_map(&mut self, target_mask: u16, color: f32) {
-        let peaks = self.analyzer.peaks();
-        self.fundamentals.fill(Fundamental::EMPTY);
-        self.fundamental_count = 0;
+    fn copy_identity(&mut self, frame: &mut SpectralFrame<'_>) {
+        for channel in 0..MAX_CHANNELS {
+            frame
+                .channel_mut(channel)
+                .copy_from_slice(&self.original[channel]);
+        }
+    }
 
-        for candidate in peaks
-            .iter()
-            .filter(|peak| (40.0..=2_000.0).contains(&peak.frequency_hz) && peak.prominence > 0.08)
-        {
-            let mut score = candidate.magnitude * (0.35 + 0.65 * candidate.prominence);
-            for partial in peaks {
-                let harmonic = (partial.frequency_hz / candidate.frequency_hz).round();
-                if !(2.0..=16.0).contains(&harmonic) {
-                    continue;
+    fn clear_tracking(&mut self) {
+        self.previous_peaks.fill(PeakTrack::EMPTY);
+        self.previous_peak_count = 0;
+        self.previous_groups.fill(GroupTrack::EMPTY);
+        self.group_count = 0;
+    }
+
+    fn build_regions(&mut self, peak_count: usize, bins: usize) {
+        self.region_owner.fill(-1);
+        let peaks = self.analyzer.peaks();
+        let magnitudes = self.analyzer.magnitudes();
+        let mut first_start = peaks[0].bin;
+        while first_start > 0 && magnitudes[first_start - 1] <= magnitudes[first_start] {
+            first_start -= 1;
+        }
+        let mut left_boundary = first_start;
+        for peak_index in 0..peak_count {
+            let peak_bin = peaks[peak_index].bin;
+            let right_boundary = if peak_index + 1 < peak_count {
+                let next = peaks[peak_index + 1].bin;
+                let mut valley = peak_bin;
+                let mut valley_magnitude = magnitudes[peak_bin];
+                for bin in peak_bin..=next.min(bins - 1) {
+                    if magnitudes[bin] < valley_magnitude {
+                        valley = bin;
+                        valley_magnitude = magnitudes[bin];
+                    }
                 }
-                let expected = candidate.frequency_hz * harmonic;
-                let cents = 1200.0 * (partial.frequency_hz / expected).log2().abs();
-                if cents < 38.0 {
-                    score += partial.magnitude * partial.prominence / harmonic.sqrt();
+                valley
+            } else {
+                let mut valley = peak_bin;
+                while valley + 1 < bins && magnitudes[valley + 1] <= magnitudes[valley] {
+                    valley += 1;
                 }
+                valley
+            };
+            let start = left_boundary.min(peak_bin);
+            let end = right_boundary.max(peak_bin).min(bins - 1);
+            self.plans[peak_index] = PeakPlan {
+                source_bin: peak_bin,
+                region_start: start,
+                region_end: end,
+                source_frequency: peaks[peak_index].frequency_hz,
+                ..PeakPlan::EMPTY
+            };
+            for owner in &mut self.region_owner[start..=end] {
+                *owner = peak_index as i16;
             }
-            if self.fundamentals[..self.fundamental_count]
-                .iter()
-                .any(|existing| {
-                    let ratio = candidate.frequency_hz / existing.frequency_hz;
-                    let harmonic = ratio.round().max(1.0);
-                    let harmonic_cents = 1200.0 * (ratio / harmonic).log2().abs();
-                    (1200.0 * ratio.log2()).abs() < 70.0
-                        || (harmonic <= 16.0 && harmonic_cents < 38.0)
-                })
-            {
+            left_boundary = end.saturating_add(1).min(bins - 1);
+        }
+    }
+
+    fn build_harmonic_groups(&mut self, peak_count: usize, target_mask: u16) {
+        self.peak_groups.fill(-1);
+        self.next_groups.fill(GroupTrack::EMPTY);
+        self.group_ratios.fill(1.0);
+        self.group_count = 0;
+
+        // Seed from prior fundamentals first so a sustained family does not
+        // change identity just because two partial magnitudes cross.
+        for previous in self.previous_groups {
+            if !previous.active || self.group_count == MAX_GROUPS {
                 continue;
             }
-            let fundamental = Fundamental {
-                frequency_hz: candidate.frequency_hz,
-                score,
-                ratio: constrained_ratio(
-                    candidate.frequency_hz,
-                    nearest_allowed_ratio(candidate.frequency_hz, target_mask),
-                ),
-            };
-            let insertion = (0..self.fundamental_count)
-                .find(|index| score > self.fundamentals[*index].score)
-                .unwrap_or(self.fundamental_count);
-            if insertion < MAX_FUNDAMENTALS {
-                let end = self.fundamental_count.min(MAX_FUNDAMENTALS - 1);
-                for index in (insertion + 1..=end).rev() {
-                    self.fundamentals[index] = self.fundamentals[index - 1];
-                }
-                self.fundamentals[insertion] = fundamental;
-                self.fundamental_count = (self.fundamental_count + 1).min(MAX_FUNDAMENTALS);
+            if let Some(fundamental) =
+                self.refine_supported_fundamental(previous.fundamental, peak_count, true)
+            {
+                self.install_group(fundamental, peak_count, target_mask, Some(previous));
             }
         }
 
-        for (index, peak) in peaks.iter().enumerate() {
-            let mut ratio = nearest_allowed_ratio(peak.frequency_hz, target_mask);
-            let mut best_cents = 39.0_f32;
-            for fundamental in &self.fundamentals[..self.fundamental_count] {
-                let harmonic = (peak.frequency_hz / fundamental.frequency_hz).round();
-                if !(1.0..=16.0).contains(&harmonic) {
-                    continue;
-                }
-                let expected = fundamental.frequency_hz * harmonic;
-                let cents = 1200.0 * (peak.frequency_hz / expected).log2().abs();
-                if cents < best_cents {
-                    best_cents = cents;
-                    ratio = fundamental.ratio;
+        while self.group_count < MAX_GROUPS {
+            let Some(strongest) = self.strongest_unassigned_peak(peak_count) else {
+                break;
+            };
+            let peak = self.analyzer.peaks()[strongest];
+            let mut best_fundamental = 0.0;
+            let mut best_score = 0.0;
+            let mut best_members = 0;
+            for harmonic in 1..=4 {
+                let candidate = peak.frequency_hz / harmonic as f32;
+                let (score, members, refined) = self.score_fundamental(candidate, peak_count, true);
+                if members > best_members || (members == best_members && score > best_score) {
+                    best_fundamental = refined;
+                    best_score = score;
+                    best_members = members;
                 }
             }
-            self.peak_ratios[index] = constrained_ratio(peak.frequency_hz, ratio);
-            self.peak_frequencies[index] = peak.frequency_hz;
-            let exponent = 1.75 - color.clamp(0.0, 1.0) * 1.25;
-            // Prominence distinguishes a tonal peak from its floor, but must
-            // not cap the requested correction amount: a Hann-windowed sine
-            // deliberately has energetic shoulders and modest prominence.
-            let prominence = peak.prominence.powf(exponent);
-            self.peak_strengths[index] = if best_cents < 39.0 {
-                0.84 + 0.16 * prominence
-            } else {
-                0.45 + 0.35 * prominence
+            if best_members < 2 || best_score < peak.magnitude * 1.1 {
+                // Leave it for the individual-peak path and prevent this peak
+                // from repeatedly becoming the next group seed.
+                self.peak_groups[strongest] = -2;
+                continue;
             }
-            .clamp(0.0, 1.0);
+            self.install_group(best_fundamental, peak_count, target_mask, None);
+        }
+
+        for assignment in &mut self.peak_groups[..peak_count] {
+            if *assignment == -2 {
+                *assignment = -1;
+            }
         }
     }
 
-    fn scatter_mapped_bin(
+    fn strongest_unassigned_peak(&self, peak_count: usize) -> Option<usize> {
+        let mut strongest = None;
+        let mut strength = 0.0;
+        for index in 0..peak_count {
+            let peak = self.analyzer.peaks()[index];
+            if self.peak_groups[index] == -1 && peak.magnitude > strength {
+                strongest = Some(index);
+                strength = peak.magnitude;
+            }
+        }
+        strongest
+    }
+
+    fn refine_supported_fundamental(
+        &self,
+        fundamental: f32,
+        peak_count: usize,
+        only_unassigned: bool,
+    ) -> Option<f32> {
+        let (_, members, refined) =
+            self.score_fundamental(fundamental, peak_count, only_unassigned);
+        (members >= 2).then_some(refined)
+    }
+
+    fn score_fundamental(
+        &self,
+        fundamental: f32,
+        peak_count: usize,
+        only_unassigned: bool,
+    ) -> (f32, usize, f32) {
+        if fundamental < MIN_MAPPABLE_HZ || fundamental > 4_000.0 {
+            return (0.0, 0, fundamental);
+        }
+        let mut score = 0.0;
+        let mut members = 0;
+        let mut weighted_fundamental = 0.0;
+        let mut total_weight = 0.0;
+        for index in 0..peak_count {
+            if only_unassigned && self.peak_groups[index] != -1 {
+                continue;
+            }
+            let peak = self.analyzer.peaks()[index];
+            let harmonic = (peak.frequency_hz / fundamental).round().max(1.0);
+            if harmonic > 32.0 {
+                continue;
+            }
+            let expected = fundamental * harmonic;
+            let cents = cents_distance(peak.frequency_hz, expected);
+            let tolerance = (40.0 + harmonic * 1.25).min(65.0);
+            if cents <= tolerance {
+                let weight = peak.magnitude / harmonic.sqrt();
+                score += weight;
+                total_weight += weight;
+                weighted_fundamental += peak.frequency_hz / harmonic * weight;
+                members += 1;
+            }
+        }
+        let refined = if total_weight > 1e-12 {
+            weighted_fundamental / total_weight
+        } else {
+            fundamental
+        };
+        (score, members, refined)
+    }
+
+    fn install_group(
         &mut self,
-        source: usize,
-        destination: usize,
-        interpolation: f32,
-        mapped_frequency: f32,
-        amount: f32,
+        fundamental: f32,
+        peak_count: usize,
+        target_mask: u16,
+        seeded: Option<GroupTrack>,
     ) {
-        let gain = amount * interpolation.max(0.0);
-        if gain <= 1e-7 {
+        if self.group_count == MAX_GROUPS {
+            return;
+        }
+        let group = self.group_count;
+        let desired =
+            constrained_ratio(fundamental, nearest_allowed_ratio(fundamental, target_mask));
+        let previous = seeded.or_else(|| {
+            self.previous_groups
+                .iter()
+                .copied()
+                .filter(|item| item.active)
+                .min_by(|left, right| {
+                    cents_distance(fundamental, left.fundamental)
+                        .total_cmp(&cents_distance(fundamental, right.fundamental))
+                })
+                .filter(|item| cents_distance(fundamental, item.fundamental) <= GROUP_TRACK_CENTS)
+        });
+        let alpha = ratio_smoothing_alpha(self.hop_size, self.sample_rate);
+        let ratio = previous
+            .map(|item| item.ratio + (desired - item.ratio) * alpha)
+            .unwrap_or(desired);
+        self.group_ratios[group] = ratio;
+        self.next_groups[group] = GroupTrack {
+            fundamental,
+            ratio: self.group_ratios[group],
+            active: true,
+        };
+
+        for index in 0..peak_count {
+            if self.peak_groups[index] != -1 {
+                continue;
+            }
+            let peak = self.analyzer.peaks()[index];
+            let harmonic = (peak.frequency_hz / fundamental).round().max(1.0);
+            if harmonic > 32.0 {
+                continue;
+            }
+            let tolerance = (40.0 + harmonic * 1.25).min(65.0);
+            if cents_distance(peak.frequency_hz, fundamental * harmonic) <= tolerance {
+                self.peak_groups[index] = group as i8;
+            }
+        }
+        self.group_count += 1;
+    }
+
+    fn build_peak_plans(&mut self, peak_count: usize, target_mask: u16) {
+        self.next_peaks.fill(PeakTrack::EMPTY);
+        let mut previous_used = [false; MAX_SPECTRAL_PEAKS];
+        let bin_hz = self.sample_rate / self.fft_size as f32;
+        let alpha = ratio_smoothing_alpha(self.hop_size, self.sample_rate);
+
+        for index in 0..peak_count {
+            let source_frequency = self.analyzer.peaks()[index].frequency_hz;
+            let group = self.peak_groups[index];
+            let desired = if group >= 0 {
+                self.group_ratios[group as usize]
+            } else {
+                constrained_ratio(
+                    source_frequency,
+                    nearest_allowed_ratio(source_frequency, target_mask),
+                )
+            };
+            let previous = self.match_previous_peak(source_frequency, &mut previous_used);
+            let ratio = if group >= 0 {
+                desired
+            } else if let Some(track) = previous {
+                track.ratio + (desired - track.ratio) * alpha
+            } else {
+                desired
+            };
+            let target_frequency = source_frequency * ratio;
+            let delta_bins = ((target_frequency - source_frequency) / bin_hz).round() as isize;
+            let source_bin = self.plans[index].source_bin;
+            let mut phase = [0.0; MAX_CHANNELS];
+            for channel in 0..MAX_CHANNELS {
+                phase[channel] = if let Some(track) = previous {
+                    wrap_phase(
+                        track.synthesis_phase[channel]
+                            + 2.0 * std::f32::consts::PI * target_frequency * self.hop_size as f32
+                                / self.sample_rate,
+                    )
+                } else {
+                    self.original[channel][source_bin].arg()
+                };
+            }
+            self.plans[index].source_frequency = source_frequency;
+            self.plans[index].ratio = ratio;
+            self.plans[index].target_frequency = target_frequency;
+            self.plans[index].delta_bins = delta_bins;
+            self.plans[index].synthesis_phase = phase;
+            self.next_peaks[index] = PeakTrack {
+                frequency: source_frequency,
+                ratio,
+                synthesis_phase: phase,
+                active: true,
+            };
+        }
+    }
+
+    fn match_previous_peak(
+        &self,
+        frequency: f32,
+        used: &mut [bool; MAX_SPECTRAL_PEAKS],
+    ) -> Option<PeakTrack> {
+        let mut best = None;
+        let mut best_cents = PEAK_TRACK_CENTS;
+        for index in 0..self.previous_peak_count {
+            let track = self.previous_peaks[index];
+            if used[index] || !track.active {
+                continue;
+            }
+            let cents = cents_distance(frequency, track.frequency);
+            if cents <= best_cents {
+                best = Some(index);
+                best_cents = cents;
+            }
+        }
+        best.map(|index| {
+            used[index] = true;
+            self.previous_peaks[index]
+        })
+    }
+
+    fn render_regions(&mut self, peak_count: usize, bins: usize) {
+        for bin in 0..bins {
+            let owner = self.region_owner[bin];
+            if owner < 0 || owner as usize >= peak_count {
+                for channel in 0..MAX_CHANNELS {
+                    self.output[channel][bin] += self.original[channel][bin];
+                }
+                continue;
+            }
+            let plan = self.plans[owner as usize];
+            if (plan.ratio - 1.0).abs() <= 1e-6 {
+                for channel in 0..MAX_CHANNELS {
+                    self.output[channel][bin] += self.original[channel][bin];
+                }
+                continue;
+            }
+            let destination = bin as isize + plan.delta_bins;
+            if destination < 0 || destination >= bins as isize {
+                for channel in 0..MAX_CHANNELS {
+                    self.output[channel][bin] += self.original[channel][bin];
+                }
+                continue;
+            }
+            let destination = destination as usize;
+            for channel in 0..MAX_CHANNELS {
+                let relative = wrap_phase(
+                    self.original[channel][bin].arg()
+                        - self.original[channel][plan.source_bin].arg(),
+                );
+                let phase = wrap_phase(plan.synthesis_phase[channel] + relative);
+                self.shifted[channel][destination] +=
+                    Complex32::from_polar(self.original[channel][bin].norm(), phase);
+            }
+        }
+    }
+
+    fn update_gate(&mut self, dry_envelope: f32, amount: f32) -> f32 {
+        let amount = amount.clamp(0.0, 1.0);
+        if amount <= 1e-5 {
+            self.gate_gain = 1.0;
+            self.gate_reference = dry_envelope;
+            return 1.0;
+        }
+        let release = (-(self.hop_size as f32) / (self.sample_rate * 0.12)).exp();
+        self.gate_reference =
+            self.gate_reference.max(dry_envelope) * release + dry_envelope * (1.0 - release);
+        let threshold = self.gate_reference * (0.003 + amount * 0.35) + 1e-12;
+        let ratio = (dry_envelope / threshold).clamp(0.0, 1.0);
+        let target = ratio * ratio * (3.0 - 2.0 * ratio);
+        let time = if target > self.gate_gain {
+            0.003
+        } else {
+            0.085
+        };
+        let coefficient = 1.0 - (-(self.hop_size as f32) / (self.sample_rate * time)).exp();
+        self.gate_gain += (target - self.gate_gain) * coefficient;
+        self.gate_gain
+    }
+
+    fn apply_energy_compensation(&mut self, bins: usize) {
+        let mut input_energy = 0.0_f32;
+        let mut output_energy = 0.0_f32;
+        for channel in 0..MAX_CHANNELS {
+            for bin in 0..bins {
+                input_energy += self.original[channel][bin].norm_sqr();
+                output_energy += self.output[channel][bin].norm_sqr();
+            }
+        }
+        if input_energy <= 1e-12 || output_energy <= 1e-12 {
+            return;
+        }
+        let target = (input_energy / output_energy)
+            .sqrt()
+            .clamp(0.707_945_76, 1.412_537_6);
+        self.energy_gain += (target - self.energy_gain) * 0.2;
+        for channel in 0..MAX_CHANNELS {
+            for bin in 0..bins {
+                self.output[channel][bin] *= self.energy_gain;
+            }
+        }
+    }
+
+    fn apply_transient_morph(&mut self, bins: usize, amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        if amount <= 1e-5 {
+            return;
+        }
+        let flux = self.analyzer.transient().spectral_flux;
+        let transient = smoothstep(0.10, 0.25, flux);
+        let blend = 1.0 - transient * amount;
+        if blend >= 0.999_99 {
             return;
         }
         for channel in 0..MAX_CHANNELS {
-            self.mapped_magnitude[channel][destination] +=
-                self.original[channel][source].norm() * gain;
+            for bin in 0..bins {
+                self.output[channel][bin] = self.original[channel][bin]
+                    + (self.output[channel][bin] - self.original[channel][bin]) * blend;
+            }
         }
-        let weight = self.analyzer.magnitudes()[source] * gain;
-        if weight > self.mapped_weight[destination] {
-            self.mapped_weight[destination] = weight;
-            self.mapped_source[destination] = source.min(u16::MAX as usize) as u16;
-            self.mapped_omega[destination] =
-                2.0 * std::f32::consts::PI * mapped_frequency / self.sample_rate;
-        }
-        self.next_active[destination] = true;
     }
 
-    /// Shortens ringing left over after the dry source releases, by gating
-    /// the phase-locked mapped component against the dry signal's own
-    /// broadband envelope. Deliberately not a per-bin dry-vs-wet comparison:
-    /// the mapped content is frequency-*shifted*, so it legitimately lands
-    /// where dry has nothing, and gating that bin-for-bin would erase the
-    /// pitch correction itself instead of just its tail.
-    fn apply_spectral_gate(&mut self, bins: usize, gate: f32) {
-        let dry = self.analyzer.magnitudes();
-        let frame_energy: f32 = dry[..bins].iter().sum();
-        self.gate_reference = if frame_energy > self.gate_reference {
-            frame_energy
-        } else {
-            self.gate_reference * GATE_REFERENCE_DECAY + frame_energy * (1.0 - GATE_REFERENCE_DECAY)
-        };
-        // `gate` sweeps the relative threshold from barely-there (only once
-        // the source has nearly fully released) to aggressive (closes as
-        // soon as the source dips modestly below its recent level).
-        let threshold = self.gate_reference * (0.02 + gate * 0.6) + 1e-12;
-        let headroom = (frame_energy / threshold).min(1.0);
-        // Cubic soft knee: unity once the source is present, an inaudible
-        // taper rather than a hard chop as it falls toward silence.
-        let target = headroom * headroom * headroom;
-        let step = if target > self.gate_gain {
-            GATE_ATTACK_STEP
-        } else {
-            GATE_RELEASE_STEP
-        };
-        self.gate_gain += (target - self.gate_gain) * step;
-        let applied = self.gate_gain;
+    fn apply_resonance(&mut self, bins: usize, amount: f32) {
+        self.resonance_enabled = true;
+        let amount = amount.clamp(0.0, 1.0);
+        let decay = (0.96 + amount * 0.0385).min(0.9985);
+        let boost = amount * 0.35;
         for channel in 0..MAX_CHANNELS {
             for bin in 0..bins {
-                self.mapped_magnitude[channel][bin] *= applied;
-            }
-        }
-    }
-
-    fn assign_mapped_phase_regions(&mut self) -> usize {
-        let bins = self.mapped_linked.len();
-        let maximum = self.mapped_linked.iter().copied().fold(0.0_f32, f32::max);
-        let threshold = maximum * 1e-4;
-        let mut count = 0;
-        for bin in 1..bins.saturating_sub(1) {
-            if self.mapped_linked[bin] >= threshold
-                && self.mapped_linked[bin] > self.mapped_linked[bin - 1]
-                && self.mapped_linked[bin] >= self.mapped_linked[bin + 1]
-            {
-                if count < MAX_SPECTRAL_PEAKS {
-                    self.mapped_peaks[count] = bin;
-                    count += 1;
-                }
-            }
-        }
-        if count == 0 && maximum > 1e-12 {
-            self.mapped_peaks[0] = self
-                .mapped_linked
-                .iter()
-                .position(|value| *value == maximum)
-                .unwrap_or(0);
-            count = 1;
-        }
-        if count == 0 {
-            return 0;
-        }
-        let mut peak_index = 0;
-        for bin in 0..bins {
-            while peak_index + 1 < count
-                && self.mapped_peaks[peak_index + 1].abs_diff(bin)
-                    <= self.mapped_peaks[peak_index].abs_diff(bin)
-            {
-                peak_index += 1;
-            }
-            self.mapped_region_peak[bin] = self.mapped_peaks[peak_index] as u16;
-        }
-        count
-    }
-
-    fn render_phase_locked_component(&mut self, peak_count: usize) {
-        for &peak in &self.mapped_peaks[..peak_count] {
-            let source = self.mapped_source[peak] as usize;
-            self.next_phase_anchor[peak] = true;
-            for channel in 0..MAX_CHANNELS {
-                let restart = !self.previous_phase_anchor[peak]
-                    || self.previous_source[peak] != self.mapped_source[peak];
-                self.synthesis_phase[channel][peak] = if restart {
-                    self.original[channel][source].arg()
+                let current = self.shifted[channel][bin];
+                let decayed = self.resonance_hold[channel][bin] * decay;
+                self.resonance_hold[channel][bin] = if current.norm_sqr() >= decayed.norm_sqr() {
+                    current
                 } else {
-                    wrap_phase(
-                        self.synthesis_phase[channel][peak]
-                            + self.mapped_omega[peak] * self.hop_size as f32,
-                    )
+                    decayed
                 };
+                self.output[channel][bin] += self.resonance_hold[channel][bin] * boost;
             }
         }
+    }
 
-        for bin in 0..self.mapped_linked.len() {
-            if !self.next_active[bin] || self.mapped_linked[bin] <= 1e-12 {
-                continue;
-            }
-            let peak = self.mapped_region_peak[bin] as usize;
-            let source = self.mapped_source[bin] as usize;
-            let peak_source = self.mapped_source[peak] as usize;
-            for channel in 0..MAX_CHANNELS {
-                let relative = wrap_phase(
-                    self.original[channel][source].arg()
-                        - self.original[channel][peak_source].arg(),
-                );
-                let phase = wrap_phase(self.synthesis_phase[channel][peak] + relative);
-                self.output[channel][bin] +=
-                    Complex32::from_polar(self.mapped_magnitude[channel][bin], phase);
-            }
+    fn render_resonance_only(&mut self, frame: &mut SpectralFrame<'_>, amount: f32) {
+        let bins = frame.positive_bins();
+        self.output
+            .iter_mut()
+            .for_each(|channel| channel.fill(Complex32::new(0.0, 0.0)));
+        self.shifted
+            .iter_mut()
+            .for_each(|channel| channel.fill(Complex32::new(0.0, 0.0)));
+        self.apply_resonance(bins, amount);
+        for channel in 0..MAX_CHANNELS {
+            frame
+                .channel_mut(channel)
+                .copy_from_slice(&self.output[channel]);
         }
+    }
+
+    fn commit_tracking(&mut self, peak_count: usize) {
+        self.previous_peaks[..peak_count].copy_from_slice(&self.next_peaks[..peak_count]);
+        self.previous_peaks[peak_count..].fill(PeakTrack::EMPTY);
+        self.previous_peak_count = peak_count;
+        self.previous_groups = self.next_groups;
+    }
+
+    #[cfg(test)]
+    fn build_peak_map_for_test(&mut self, target_mask: u16) {
+        let count = self.analyzer.peaks().len();
+        for (index, peak) in self.analyzer.peaks().iter().enumerate() {
+            self.plans[index].source_bin = peak.bin;
+            self.plans[index].source_frequency = peak.frequency_hz;
+        }
+        self.build_harmonic_groups(count, target_mask);
     }
 }
 
@@ -563,33 +745,53 @@ fn nearest_allowed_ratio(frequency_hz: f32, target_mask: u16) -> f32 {
     }
     let pitch = 69.0 + 12.0 * (frequency_hz / 440.0).log2();
     let center = pitch.round() as i32;
-    let mut best = center;
     let mut best_distance = f32::MAX;
+    let mut best_pitch = pitch;
     for candidate in center - 12..=center + 12 {
         if target_mask & (1 << candidate.rem_euclid(12)) == 0 {
             continue;
         }
         let distance = (candidate as f32 - pitch).abs();
         if distance < best_distance {
-            best = candidate;
             best_distance = distance;
+            best_pitch = candidate as f32;
         }
     }
-    2.0_f32.powf((best as f32 - pitch) / 12.0)
+    2.0_f32.powf((best_pitch - pitch) / 12.0)
 }
 
-/// Refuses a shift that isn't musically defensible: unstable low-frequency
-/// pitch judgment, or a target so far away it reads as a different note
-/// rather than a correction. See `MIN_MAPPABLE_HZ`/`MAX_SHIFT_CENTS`.
 fn constrained_ratio(frequency_hz: f32, ratio: f32) -> f32 {
-    if frequency_hz < MIN_MAPPABLE_HZ {
-        return 1.0;
+    let cents = cents_from_ratio(ratio).abs();
+    if frequency_hz < MIN_MAPPABLE_HZ || cents < 5.0 || cents > MAX_SHIFT_CENTS {
+        1.0
+    } else {
+        ratio
     }
-    let cents = 1200.0 * ratio.log2().abs();
-    if cents > MAX_SHIFT_CENTS {
-        return 1.0;
+}
+
+#[inline]
+fn cents_from_ratio(ratio: f32) -> f32 {
+    1200.0 * ratio.max(1e-12).log2()
+}
+
+#[inline]
+fn cents_distance(left: f32, right: f32) -> f32 {
+    if left <= 0.0 || right <= 0.0 {
+        f32::MAX
+    } else {
+        cents_from_ratio(left / right).abs()
     }
-    ratio
+}
+
+#[inline]
+fn ratio_smoothing_alpha(hop_size: usize, sample_rate: f32) -> f32 {
+    1.0 - (-(hop_size as f32) / (sample_rate * RATIO_SMOOTH_SECONDS)).exp()
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[cfg(test)]
@@ -597,15 +799,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_ratio_snaps_to_enabled_pitch_class() {
+    fn target_ratio_obeys_deadband_and_shift_limit() {
         let c_only = 1 << 0;
-        let ratio = nearest_allowed_ratio(277.182_65, c_only); // C#4 -> C4
-        let mapped = 277.182_65 * ratio;
-        assert!((mapped - 261.625_55).abs() < 0.01, "mapped={mapped}");
+        assert_eq!(
+            constrained_ratio(261.625_55, nearest_allowed_ratio(261.625_55, c_only)),
+            1.0
+        );
+        let near_c = constrained_ratio(264.0, nearest_allowed_ratio(264.0, c_only));
+        assert!((264.0 * near_c - 261.625_55).abs() < 0.05);
+        assert_eq!(
+            constrained_ratio(440.0, nearest_allowed_ratio(440.0, c_only)),
+            1.0
+        );
+        let a_ratio = constrained_ratio(445.0, nearest_allowed_ratio(445.0, 1 << 9));
+        assert!((445.0 * a_ratio - 440.0).abs() < 0.05, "ratio={a_ratio}");
     }
 
     #[test]
-    fn harmonic_family_uses_the_fundamental_ratio() {
+    fn harmonic_family_receives_one_shared_ratio() {
         let mut processor = PitchMapProcessor::new(48_000.0, 1024, 256);
         processor.analyzer.replace_peaks_for_test(&[
             SpectralPeak {
@@ -617,12 +828,21 @@ mod tests {
             SpectralPeak {
                 bin: 12,
                 frequency_hz: 554.365_3,
-                magnitude: 0.6,
+                magnitude: 0.7,
                 prominence: 0.9,
             },
+            SpectralPeak {
+                bin: 18,
+                frequency_hz: 831.547_9,
+                magnitude: 0.45,
+                prominence: 0.85,
+            },
         ]);
-        processor.build_peak_map(1 << 0, 0.7);
-        assert_eq!(processor.fundamental_count, 1);
-        assert!((processor.peak_ratios[0] - processor.peak_ratios[1]).abs() < 1e-6);
+        processor.build_peak_map_for_test(1 << 0);
+        assert_eq!(processor.group_count, 1);
+        assert_eq!(processor.peak_groups[0], processor.peak_groups[1]);
+        assert_eq!(processor.peak_groups[1], processor.peak_groups[2]);
+        let ratio = processor.group_ratios[0];
+        assert!((277.182_65 * ratio - 261.625_55).abs() < 0.1);
     }
 }

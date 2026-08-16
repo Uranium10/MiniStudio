@@ -587,8 +587,10 @@ const COLORIZER_SCALES = [
 const COLORIZER_CUSTOM_SCALE = COLORIZER_SCALES.length
 
 function ColorizerPanel({ params, setParam }: { params: Record<string, number>; setParam(param: string, value: number): void }) {
-  const quality = Math.round(params.quality ?? 0); const mapMode = quality >= 1
+  const quality = Math.round(params.quality ?? params.mapQuality ?? 1)
   const midi = (params.midi ?? 0) >= .5; const key = Math.max(0, Math.min(11, Math.round(params.key ?? 0))); const scale = Math.max(0, Math.min(COLORIZER_CUSTOM_SCALE, Math.round(params.scale ?? 0)))
+  const color = Math.max(0, Math.min(2, params.color ?? params.mix ?? .72))
+  const morph = Math.max(0, Math.min(1, params.morph ?? params.transient ?? .72))
   const applyPreset = (nextKey: number, nextScale: number) => {
     setParam('key', nextKey); setParam('scale', nextScale)
     const preset = COLORIZER_SCALES[nextScale]
@@ -598,11 +600,11 @@ function ColorizerPanel({ params, setParam }: { params: Record<string, number>; 
   }
   return <div className="colorizer-panel">
     <div className="colorizer-source">
-      <div className="colorizer-selects"><label>ENGINE<select value={quality} onChange={(event) => setParam('quality', Number(event.target.value))}><option value="0">Live</option><option value="1">Map</option></select></label>{mapMode && <label>QUALITY<select value={Math.round(params.mapQuality ?? 1)} onChange={(event) => setParam('mapQuality', Number(event.target.value))}><option value="0">Fast (512, ~11 ms)</option><option value="1">Clean (1024, ~21 ms)</option></select></label>}<label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
+      <div className="colorizer-selects"><label>QUALITY<select value={quality} onChange={(event) => setParam('quality', Number(event.target.value))}><option value="0">Fast · 512</option><option value="1">Clean · 1024</option></select></label><label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
       <PitchClassKeyboard disabled={midi} active={COLORIZER_NOTES.map((_, pitch) => (params[`pitch${pitch}`] ?? 0) >= .5)} onToggle={(pitch) => { setParam(`pitch${pitch}`, (params[`pitch${pitch}`] ?? 0) >= .5 ? 0 : 1); setParam('scale', COLORIZER_CUSTOM_SCALE) }} />
-      {midi && <div className="colorizer-midi-note">MIDI ROUTING NOT AVAILABLE YET · WAITING FOR NOTES</div>}
+      {midi && <div className="colorizer-midi-note">MIDI PITCH CLASS FOLLOW · WAITING FOR NOTES</div>}
     </div>
-    <div className="colorizer-controls parameter-row"><Knob value={params.resonance ?? .62} min={0} max={1} step={.01} defaultValue={.62} label={mapMode ? 'COLOR' : 'RESONANCE'} format={percentFormat} onChange={(value) => setParam('resonance', value)} />{mapMode ? <Knob value={params.transient ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MORPH" format={percentFormat} onChange={(value) => setParam('transient', value)} /> : <Knob value={params.decay ?? .45} min={0} max={1} step={.01} defaultValue={.45} label="DECAY" format={percentFormat} onChange={(value) => setParam('decay', value)} />}<Knob value={params.depth ?? .82} min={0} max={1} step={.01} defaultValue={.82} label={mapMode ? 'MAP' : 'DEPTH'} format={percentFormat} onChange={(value) => setParam('depth', value)} />{mapMode && <Knob value={params.gate ?? 0} min={0} max={1} step={.01} defaultValue={0} label="GATE" format={percentFormat} onChange={(value) => setParam('gate', value)} />}<Knob value={params.mix ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div>
+    <div className="colorizer-controls parameter-row"><Knob value={color} min={0} max={2} step={.01} defaultValue={.72} label="COLOR" format={(value) => `${Math.round(value * 100)}%`} onChange={(value) => setParam('color', value)} /><Knob value={morph} min={0} max={1} step={.01} defaultValue={.72} label="MORPH" format={percentFormat} onChange={(value) => setParam('morph', value)} /><Knob value={params.gate ?? 0} min={0} max={1} step={.01} defaultValue={0} label="GATE" format={percentFormat} onChange={(value) => setParam('gate', value)} /></div>
   </div>
 }
 
@@ -1459,7 +1461,7 @@ const EFFECT_CATALOG: EffectCatalogEntry[] = [
   { type: 'builtin:distortion', description: '3-band Tube · Tape · Saturation · Exciter', category: 'Color & Drive' }, { type: 'builtin:waveshaper', description: '3-mode · 4× oversampled shaper', category: 'Color & Drive' }, { type: 'builtin:disperser', description: 'Cascaded all-pass phase dispersion', category: 'Color & Drive' },
   { type: 'builtin:lfo-tremolo', description: 'Volume · pan LFO modulation', category: 'Modulation' }, { type: 'builtin:vocoder', description: '24-band carrier / modulator vocoder', category: 'Modulation' },
   { type: 'builtin:roboter', description: 'Auto-key pitch correction · 5-voice harmonizer', category: 'Pitch & Vocal' },
-  { type: 'builtin:resonator', description: 'Live modal colour · polyphonic spectral pitch map', category: 'Pitch & Vocal' },
+  { type: 'builtin:resonator', description: 'Harmonic-family spectral pitch mapper', category: 'Pitch & Vocal' },
   { type: 'builtin:formant-shifter', description: 'PSOLA mono / phase-vocoder poly, auto-selected', category: 'Pitch & Vocal' },
   { type: 'builtin:delay', description: 'Stereo echo', category: 'Time & Space' }, { type: 'builtin:reverb', description: 'FDN room reverb', category: 'Time & Space' },
   { type: 'builtin:utility', description: 'Stereo utility · bass mono', category: 'Utility & Other' },

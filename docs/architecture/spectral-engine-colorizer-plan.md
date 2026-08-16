@@ -1,5 +1,8 @@
 # Spectral engine preservation and Colorizer 2.0 research
 
+> Historical design note. The dual Live/Map proposal was superseded by the
+> harmonic-family mapper in `docs/colorizer-algorithm.md`.
+
 Status: Map/Fast implementation baseline, 2026-08-16
 
 ## Decision

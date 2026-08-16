@@ -13,12 +13,20 @@ pub(crate) fn detect_spectral_peaks(
 ) -> usize {
     output.fill(SpectralPeak::EMPTY);
     let maximum = magnitudes.iter().copied().fold(0.0_f32, f32::max);
-    let threshold = (maximum * 1e-4).max(1e-10);
+    let mean = magnitudes.iter().copied().sum::<f32>() / magnitudes.len().max(1) as f32;
+    // -60 dB relative to the frame maximum, with a linked-spectrum dynamic
+    // floor that keeps broadband material from filling all 96 peak slots.
+    let threshold = (maximum * 1e-3).max(mean * 0.25).max(1e-10);
     let mut count = 0;
 
     for bin in 2..magnitudes.len().saturating_sub(2) {
         let center = magnitudes[bin];
-        if center < threshold || center <= magnitudes[bin - 1] || center < magnitudes[bin + 1] {
+        if center < threshold
+            || center <= magnitudes[bin - 1]
+            || center <= magnitudes[bin + 1]
+            || center <= magnitudes[bin - 2]
+            || center <= magnitudes[bin + 2]
+        {
             continue;
         }
 
@@ -63,18 +71,25 @@ pub(crate) fn detect_spectral_peaks(
             prominence,
         };
 
-        // Fixed-capacity descending insertion. This keeps the strongest peaks
-        // without allocating or sorting a frame-sized candidate vector.
-        let insertion = (0..count)
-            .find(|index| candidate.magnitude > output[*index].magnitude)
-            .unwrap_or(count);
-        if insertion < output.len() {
-            let end = count.min(output.len() - 1);
-            for index in (insertion + 1..=end).rev() {
-                output[index] = output[index - 1];
+        // Detection scans bins in ascending order, so the retained array stays
+        // frequency-sorted without a post-pass sort. Once full, discard only
+        // the weakest retained peak and append this later-bin candidate.
+        if count < output.len() {
+            output[count] = candidate;
+            count += 1;
+        } else {
+            let mut weakest = 0;
+            for index in 1..count {
+                if output[index].magnitude < output[weakest].magnitude {
+                    weakest = index;
+                }
             }
-            output[insertion] = candidate;
-            count = (count + 1).min(output.len());
+            if candidate.magnitude > output[weakest].magnitude {
+                for index in weakest..count - 1 {
+                    output[index] = output[index + 1];
+                }
+                output[count - 1] = candidate;
+            }
         }
     }
     count

@@ -275,6 +275,16 @@ pub fn create_builtin_effect(
     for (id, value) in params {
         effect.set_param(id, *value);
     }
+    // Legacy Colorizer sessions stored the removed Live/Map selector in
+    // `quality` and the actual FFT size in `mapQuality`. HashMap iteration is
+    // intentionally unordered, so apply the old FFT selector once more after
+    // the generic loop. New sessions own a `color` parameter and use
+    // `quality` directly as Fast/Clean.
+    if kind == "builtin:resonator" && !params.contains_key("color") {
+        if let Some(quality) = params.get("mapQuality") {
+            effect.set_param("quality", *quality);
+        }
+    }
     effect.set_bypassed(bypassed);
     Some(effect)
 }

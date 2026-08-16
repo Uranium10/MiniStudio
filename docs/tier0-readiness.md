@@ -25,8 +25,8 @@ without returning every DSP or audio edit through the Tauri app crate.
 3. Distortion exposes 1x/2x/4x oversampling plus explicit low/mid/high enable
    switches. Its latency report follows the selected oversampling factor.
 4. All 17 native effect kinds are covered by an explicit latency contract test.
-   Colorizer now uses a zero-latency fixed modal bank; the graph PDC regression
-   uses the mastering limiter's explicit 240-sample lookahead path.
+   Colorizer reports 512/1024 samples for Fast/Clean harmonic mapping; the
+   graph PDC regression also covers the mastering limiter's 240-sample path.
 5. Out-of-process plug-in discovery is covered for missing executables and
    hung probes; the latter is killed at its deadline.
 

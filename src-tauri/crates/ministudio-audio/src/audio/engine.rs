@@ -1780,6 +1780,32 @@ mod realtime_tests {
                         sidechain: None,
                         params: HashMap::new(),
                     },
+                    EffectSpec {
+                        id: "rt-colorizer".into(),
+                        kind: "builtin:resonator".into(),
+                        bypassed: false,
+                        plugin: None,
+                        sidechain: None,
+                        params: HashMap::from([
+                            ("quality".into(), 1.0),
+                            ("color".into(), 1.0),
+                            ("morph".into(), 0.72),
+                            ("gate".into(), 0.2),
+                            ("midi".into(), 1.0),
+                            ("pitch0".into(), 1.0),
+                            ("pitch1".into(), 0.0),
+                            ("pitch2".into(), 0.0),
+                            ("pitch3".into(), 0.0),
+                            ("pitch4".into(), 0.0),
+                            ("pitch5".into(), 0.0),
+                            ("pitch6".into(), 0.0),
+                            ("pitch7".into(), 0.0),
+                            ("pitch8".into(), 0.0),
+                            ("pitch9".into(), 0.0),
+                            ("pitch10".into(), 0.0),
+                            ("pitch11".into(), 0.0),
+                        ]),
+                    },
                 ],
                 sends: Vec::new(),
                 output_bus_id: None,
@@ -1822,9 +1848,18 @@ mod realtime_tests {
                         track: 0,
                         event: NoteEvent {
                             sample_offset: (index % 16) as u32,
-                            kind: NoteEventKind::Controller {
-                                cc: 1,
-                                value: index as f32 / 31.0,
+                            kind: if index == 0 {
+                                NoteEventKind::NoteOn {
+                                    note_id: 91,
+                                    pitch: 60,
+                                    velocity: 0.8,
+                                    tuning_cents: 0.0,
+                                }
+                            } else {
+                                NoteEventKind::Controller {
+                                    cc: 1,
+                                    value: index as f32 / 31.0,
+                                }
                             },
                         },
                     })

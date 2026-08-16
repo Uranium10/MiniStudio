@@ -56,15 +56,12 @@ impl StftPlan {
         let forward_scratch_len = forward.get_scratch_len();
         let inverse_scratch_len = inverse.get_scratch_len();
 
-        // A periodic sqrt-Hann analysis/synthesis pair gives a Hann product.
-        // Derive the phase-dependent overlap sum instead of relying on a magic
-        // 1.5/2.0 constant, allowing future 1/2, 1/4, or 1/8 hop plans safely.
+        // Use the same periodic Hann window for analysis and synthesis. At the
+        // Colorizer's N/4 hop the effective Hann^2 COLA sum is exactly 1.5.
+        // We still derive it per phase instead of baking in that constant so
+        // the reusable STFT remains correct for every accepted hop divisor.
         let analysis_window: Vec<f32> = (0..size)
-            .map(|index| {
-                (0.5 - 0.5 * (2.0 * PI * index as f32 / size as f32).cos())
-                    .max(0.0)
-                    .sqrt()
-            })
+            .map(|index| 0.5 - 0.5 * (2.0 * PI * index as f32 / size as f32).cos())
             .collect();
         let mut overlap_sum = vec![0.0_f32; hop];
         for index in 0..size {
@@ -316,6 +313,65 @@ mod tests {
             .map(|sample| (output[sample] - input[sample - latency]).abs())
             .fold(0.0_f32, f32::max);
         assert!(maximum_error < 2e-5, "maximum error={maximum_error}");
+    }
+
+    #[test]
+    fn colorizer_hann_squared_cola_has_unity_gain_at_both_qualities() {
+        for size in [512_usize, 1024] {
+            let hop = size / 4;
+            let plan = StftPlan::new(StftConfig::new(size, hop)).unwrap();
+            let latency = plan.latency_samples();
+            let mut engine = StftEngine::new(plan);
+            let length = latency * 8;
+            let mut input_energy = 0.0_f64;
+            let mut output_energy = 0.0_f64;
+            let mut error_energy = 0.0_f64;
+            for sample in 0..length {
+                let input = (2.0 * PI * 997.0 * sample as f32 / 48_000.0).sin() * 0.37
+                    + (2.0 * PI * 3_113.0 * sample as f32 / 48_000.0).sin() * 0.11;
+                let output = engine.process_sample([input, -input], |_| {})[0];
+                if sample >= latency * 2 {
+                    let reference_sample = sample - latency;
+                    let reference = (2.0 * PI * 997.0 * reference_sample as f32 / 48_000.0).sin()
+                        * 0.37
+                        + (2.0 * PI * 3_113.0 * reference_sample as f32 / 48_000.0).sin() * 0.11;
+                    input_energy += f64::from(reference * reference);
+                    output_energy += f64::from(output * output);
+                    error_energy += f64::from((output - reference) * (output - reference));
+                }
+            }
+            let rms_db = 10.0 * (output_energy / input_energy).log10();
+            let error_db = 10.0 * (error_energy / input_energy).max(1e-30).log10();
+            assert!(rms_db.abs() <= 0.5, "size={size}, RMS delta={rms_db} dB");
+            assert!(error_db <= -60.0, "size={size}, error={error_db} dB");
+        }
+    }
+
+    #[test]
+    fn identity_wola_clears_consumed_overlap_and_has_no_recursive_tail() {
+        for size in [512_usize, 1024] {
+            let hop = size / 4;
+            let plan = StftPlan::new(StftConfig::new(size, hop)).unwrap();
+            let mut engine = StftEngine::new(plan);
+            let burst = size / 2;
+            let limit = burst + size + hop;
+            let mut maximum_after_limit = 0.0_f32;
+            for sample in 0..limit + size {
+                let input = if sample < burst {
+                    (2.0 * PI * 440.0 * sample as f32 / 48_000.0).sin() * 0.5
+                } else {
+                    0.0
+                };
+                let output = engine.process_sample([input, input], |_| {})[0];
+                if sample >= limit {
+                    maximum_after_limit = maximum_after_limit.max(output.abs());
+                }
+            }
+            assert!(
+                maximum_after_limit <= 1e-4,
+                "size={size}, tail={maximum_after_limit}"
+            );
+        }
     }
 
     #[test]

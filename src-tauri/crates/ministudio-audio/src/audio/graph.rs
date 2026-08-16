@@ -126,6 +126,7 @@ impl ScheduledEffect {
     #[inline]
     fn process(
         &mut self,
+        events: &[NoteEvent],
         buffer: &mut AudioBuffer,
         sidechain: Option<&AudioBuffer>,
         activity: BlockActivity,
@@ -140,10 +141,14 @@ impl ScheduledEffect {
             buffer.clear(frames);
         } else {
             self.processor
-                .process_with_sidechain(&[], buffer, sidechain, frames);
+                .process_with_sidechain(events, buffer, sidechain, frames);
         }
         metrics.observe(&self.runtime, decision);
         decision == ProcessDecision::Process
+    }
+
+    fn wants_midi(&self) -> bool {
+        self.processor.wants_midi()
     }
 
     fn set_param(&mut self, id: &str, value: f32) {
@@ -934,17 +939,21 @@ impl AudioGraph {
                         bus_sidechain_activity.get(index).copied().unwrap_or(false)
                     }
                 });
-                // Effect-note routing is intentionally not connected yet. The
-                // event-aware DSP contract is live, but inserts receive an
-                // allocation-free empty slice until a routing source exists.
-                // Querying the capability keeps graph construction ready for
-                // a routed source without implicitly borrowing instrument MIDI.
-                let _awaiting_midi_route = fx.processor.wants_midi();
+                // MIDI-aware native inserts follow their own instrument
+                // track's already sorted timeline/live packet stream. Borrow
+                // the immutable slice directly to preserve sample offsets.
+                let effect_events = if fx.wants_midi() {
+                    track.event_buffer.as_slice()
+                } else {
+                    &[]
+                };
                 track_activity = fx.process(
+                    effect_events,
                     &mut track.buffer,
                     sidechain,
                     BlockActivity {
                         main_input: track_activity,
+                        midi: !effect_events.is_empty(),
                         sidechain: sidechain_active,
                         ..BlockActivity::default()
                     },
@@ -1031,6 +1040,7 @@ impl AudioGraph {
                     }
                 });
                 bus_activity = fx.process(
+                    &[],
                     &mut bus.buffer,
                     sidechain,
                     BlockActivity {
@@ -1072,6 +1082,7 @@ impl AudioGraph {
                 }
             });
             master_activity = fx.process(
+                &[],
                 &mut self.master_buffer,
                 sidechain,
                 BlockActivity {

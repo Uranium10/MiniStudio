@@ -52,9 +52,12 @@ fn audio_core_render_has_no_direct_io_or_lock() {
 
 #[test]
 fn audio_graph_process_has_no_obvious_allocator_or_blocking_primitive() {
-    let source = include_str!("../src/audio/graph.rs");
+    // rustfmt follows the checkout's line-ending policy on Windows. Normalize
+    // the source so this architecture gate cannot fail merely because Git
+    // materialized CRLF instead of LF.
+    let source = include_str!("../src/audio/graph.rs").replace("\r\n", "\n");
     let process = between(
-        source,
+        &source,
         "pub fn process(\n        &mut self,",
         "/// Positions a newly built graph",
     );

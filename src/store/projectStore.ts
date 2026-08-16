@@ -1581,7 +1581,7 @@ export function effectDefaults(type: EffectInstance['type']): Record<string, num
   if (type === 'builtin:transient-shaper') return { attack: 0, sustain: 0, thresholdDb: -36, speed: .5, clip: 0 }
   if (type === 'builtin:roboter') return { amount: .72, number: 0 }
   if (type === 'builtin:formant-shifter') return { mode: 0, pitchSemitones: 0, formantSemitones: 0, formantLink: 1, mix: 1, outputDb: 0 }
-  if (type === 'builtin:resonator') return { quality: 1, midi: 0, key: 0, scale: 0, pitch0: 1, pitch1: 0, pitch2: 1, pitch3: 0, pitch4: 1, pitch5: 1, pitch6: 0, pitch7: 1, pitch8: 0, pitch9: 1, pitch10: 0, pitch11: 1, resonance: .62, decay: .45, transient: .72, depth: .82, mix: .72 }
+  if (type === 'builtin:resonator') return { quality: 1, midi: 0, key: 0, scale: 0, pitch0: 1, pitch1: 0, pitch2: 1, pitch3: 0, pitch4: 1, pitch5: 1, pitch6: 0, pitch7: 1, pitch8: 0, pitch9: 1, pitch10: 0, pitch11: 1, color: .72, morph: .72, gate: 0 }
   if (type === 'builtin:utility') return { inputMode: 0, invertLeft: 0, invertRight: 0, width: 1, gainDb: 0, balance: 0, mono: 0, bassMono: 0, bassFreq: 120, mute: 0, dcBlock: 0 }
   if (type === 'builtin:delay') return { time: 0.25, feedback: 0.3, mix: 0.25, damping: 0.35, pingPong: 0 }
   if (type === 'builtin:reverb') return { decaySec: 2.4, damping: 0.4, width: 0.8, diffusion: 0.7, mix: 0.25 }

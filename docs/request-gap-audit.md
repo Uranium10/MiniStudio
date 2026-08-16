@@ -10,7 +10,7 @@ implementation documents.
 |---|---|---|
 | Realtime plug-in crash containment | Scanning is isolated, but an external plug-in still runs in the realtime host process. | Design processing isolation without putting IPC or allocation on the audio callback. |
 | External plug-in editor/state | Plug-in parameter metadata has a generic host UI, but plug-in-specific editor windows and opaque preset/state persistence remain explicitly deferred. | Add VST3/CLAP editor lifecycle and state save/restore. |
-| Colorizer MIDI control | The device UI explicitly reports `MIDI ROUTING NOT AVAILABLE YET`. | Route track/clip MIDI into the effect and expose the source/mode controls described by the readiness patch. |
+| Colorizer MIDI control | Own-track timeline/live MIDI is connected sample-accurately. | Add explicit cross-track effect-MIDI routing when the project schema gains source edges. |
 | Automation completion | Playback is UI control-rate. Write/Touch/Latch and sample-offset parameter queues are documented as future work. | Move playback scheduling native-side, implement write modes, and verify offline export parity. |
 | Audio recording | REC currently records virtual-piano MIDI only; there is no input-stream/audio-file recording path. | Add input device negotiation, direct-to-file capture, monitoring, and crash-safe take recovery after autosave exists. |
 | External single-effect offline API | `RustEngine.renderOffline()` is still an explicit phase-three stub. | Implement it when isolated external plug-in rendering is introduced. |
