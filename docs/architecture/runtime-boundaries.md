@@ -57,9 +57,10 @@ control recovery. Neither path may infer the other without direct evidence.
 
 Dedicated helper placement is the stabilization default. Module grouping is eligible only after a
 multiplexed helper protocol passes parity tests, admits at most four instances, and uses a binary
-fingerprint failure domain. Any crash, hang or realtime deadline miss promotes that fingerprint to
-dedicated placement in a relative user-data cache. A changed fingerprint receives a fresh probation
-period; no manufacturer-specific branch belongs in the engine.
+fingerprint failure domain. Any crash, hang or sustained realtime deadline stall promotes that
+fingerprint to dedicated placement in a relative user-data cache. An isolated deadline miss remains
+diagnostic data. A changed fingerprint receives a fresh probation period; no manufacturer-specific
+branch belongs in the engine.
 
 ## ARA/source-layer compatibility
 

@@ -1,7 +1,8 @@
 # MiniStudio core runtime audit
 
-Status: gates 1-4 partially landed on `stabilize/core-runtime-realignment-20260816`; gates 5-6
-remain intentionally blocked on cross-platform helper parity and legacy removal tests.
+Status: the Windows VST3 stability gate required before Performance Tier P1 is satisfied on
+`stabilize/core-runtime-realignment-20260816`. Gates 1-4 remain a staged migration overall;
+cross-platform helper parity and legacy removal still block gates 5-6 and release readiness.
 
 ## Confirmed failure chain
 
@@ -59,8 +60,14 @@ the helper did not consistently apply the platform topmost transition.
 
 - Added format-neutral `ministudio-plugin-api`, supervisor state machine and helper placement
   policy crates. Project schema, target IDs, state blobs and `TempoMap` remain unchanged.
-- Detached the Windows VST3 `RealtimeClient` from plug-in control ownership. Native editor/state
-  calls and audio processing no longer share the outer plug-in mutex.
+- Detached the Windows VST3 `RealtimeClient` from main-process control ownership and split the
+  helper's native editor into a cloneable GUI-only capability. `createView`, `attached`, DPI,
+  resize and `removed` no longer acquire the mutex used by the helper realtime worker.
+- Replaced editor-to-processor parameter feedback mutexes with bounded lock-free queues. The
+  audio worker drains the latest values without waiting on the GUI thread.
+- Classified an isolated realtime timeout as a transient deadline miss until a sustained stall
+  crosses the terminal threshold. Late responses are retired safely, terminal transport faults
+  remain latched, and the recovery actor coalesces a fault burst into one helper respawn.
 - Replaced editor-action and realtime-fault timer polls with bounded shared memory plus independent
   Windows events. The owner actor sleeps on channel/event work while idle.
 - Added generation-fenced editor open/close/pin state. Old generations cannot resurrect a closed or
@@ -75,7 +82,24 @@ the helper did not consistently apply the platform topmost transition.
   compatibility records. Actual group multiplexing remains disabled until its helper protocol is
   implemented and qualified.
 - Added architecture guard tests plus physical Serum/BBC tests for rendering, editor close actions,
-  helper recovery and a 500 ms control-lock stall.
+  helper recovery, a 500 ms control-lock stall, and native editor creation concurrent with 96
+  realtime blocks. Both installed plug-ins completed the overlap with zero deadline misses.
+
+## Performance Tier P1 entry decision
+
+P1 may now build its scheduler/silence model on the existing `RealtimeEndpoint` and plug-in
+adapter boundary without inheriting the former editor/control restart loop. The entry gate is:
+
+- Serum and BBC Symphony Orchestra open their native editor while realtime blocks continue;
+- a GUI delay is not promoted directly to an audio fault;
+- one terminal endpoint fault queues one recovery intent;
+- the helper prints one start and one explicit shutdown for the tested lifetime, not a respawn
+  loop;
+- workspace Rust tests, frontend tests/build and the `dev-dsp` application build pass.
+
+This decision does not claim that the cross-platform migration is complete. P1 must keep unknown
+or non-qualified plug-ins in `AlwaysProcess`, and must not use working-set trimming as a substitute
+for a scheduler-owned Sleeping state.
 
 ## Gates not yet satisfied
 

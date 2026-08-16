@@ -57,7 +57,9 @@ export function hydratePlugin(engine: IAudioEngine, plugin: PluginDescriptor): P
  * This closes the pointer-down race where a fast drag can finish before the
  * lazy metadata request and would otherwise create a parameter-less device. */
 export async function hydratePluginRef(engine: IAudioEngine, reference: ExternalPluginRef, isInstrument: boolean): Promise<ExternalPluginRef> {
-  if (reference.parameters?.length || !reference.paramCount) return reference
+  // Old/portable projects may not carry paramCount. An explicit zero paired
+  // with an inspected empty parameter array is authoritative; missing metadata is not.
+  if (reference.parameters?.length || (reference.parameters !== undefined && reference.paramCount === 0)) return reference
   const detailed = await hydratePlugin(engine, {
     format: reference.format,
     uid: reference.uid,

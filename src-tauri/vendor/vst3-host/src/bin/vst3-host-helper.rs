@@ -759,13 +759,20 @@ mod windows {
 
         let mut sample_rate = 44_100.0;
         let mut editor: Option<vst3_host::PluginWindow> = None;
+        let mut editor_host_state = vst3_host::process_isolation::EditorHostState::default();
         let mut pending_editor_actions = Vec::new();
         let mut realtime: Option<vst3_host::realtime_ipc::RealtimeServer> = None;
         loop {
             match command_rx.recv_timeout(std::time::Duration::from_millis(4)) {
                 Ok(request) => {
                     let response = match request.command {
-                        HostCommand::CreateGui => open_editor(&plugin, &mut editor),
+                        HostCommand::CreateGui => {
+                            let response = open_editor(&plugin, &mut editor);
+                            if let Some(window) = editor.as_ref() {
+                                window.set_host_state(editor_host_state);
+                            }
+                            response
+                        }
                         HostCommand::CloseGui => {
                             if let Some(mut window) = editor.take() {
                                 window.close();
@@ -787,6 +794,7 @@ mod windows {
                             }
                         }
                         HostCommand::SetEditorHostState { state } => {
+                            editor_host_state = state;
                             if let Some(window) = editor.as_ref() {
                                 window.set_host_state(state);
                             }
@@ -875,11 +883,9 @@ mod windows {
             .as_ref()
             .is_some_and(vst3_host::PluginWindow::is_open)
         {
-            let (width, height) = plugin
-                .lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().cloned())
-                .and_then(|instance| instance.lock().ok()?.get_editor_size().ok())
+            let (width, height) = editor
+                .as_ref()
+                .and_then(|window| window.preferred_size().ok())
                 .unwrap_or((800, 600));
             return HostResponse::GuiCreated { width, height };
         }
@@ -892,14 +898,10 @@ mod windows {
                 }
             }
         };
-        let (width, height) = instance
-            .lock()
-            .ok()
-            .and_then(|plugin| plugin.get_editor_size().ok())
-            .unwrap_or((800, 600));
         let mut window = vst3_host::PluginWindow::new(instance);
         match window.open() {
             Ok(()) => {
+                let (width, height) = window.preferred_size().unwrap_or((800, 600));
                 *editor = Some(window);
                 HostResponse::GuiCreated { width, height }
             }

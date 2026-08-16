@@ -18,6 +18,10 @@ ministudio-contracts (serializable domain/IPC structures)
   plug-in, DSP, or Tauri implementations.
 - `ministudio-dsp` may depend on math/FFT and contracts, but not CPAL,
   Symphonia, VST3/CLAP, or Tauri.
+- Reusable transform mechanics belong to `ministudio-dsp/src/spectral`.
+  Effect files own musical policy and may not duplicate FFT planning, WOLA ring
+  scheduling, reconstruction normalization, phase utility, linked peak/HPCP,
+  transient-mask, or harmonic-family mapping code.
 - `ministudio-plugin` owns VST3/CLAP dependencies and implements the DSP and
   instrument contracts. It must not depend on the audio engine or Tauri.
 - `ministudio-audio` owns realtime control, CPAL streams, graph scheduling,

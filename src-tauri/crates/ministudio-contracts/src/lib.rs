@@ -139,6 +139,16 @@ pub struct EngineSnapshot {
     pub multiband_levels: Vec<MultibandLevels>,
     pub distortion_spectra: Vec<Vec<f32>>,
     pub limiter_metrics: Vec<LimiterMetrics>,
+    /// Bounded native editor gestures drained from plug-in realtime endpoints.
+    pub plugin_parameter_changes: Vec<PluginParameterChange>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginParameterChange {
+    pub target_id: String,
+    pub parameter_id: String,
+    pub value: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]

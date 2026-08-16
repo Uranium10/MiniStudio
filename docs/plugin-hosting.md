@@ -143,7 +143,8 @@ realtime playback uses:
   5-50 ms block deadlines, with no JSON, pipe I/O or allocation in the host
   callback;
 - an explicit realtime `Idle -> Requested -> Processing -> Done` state machine,
-  sequence IDs, timeout latching and safe mapping reattachment after recovery;
+  sequence IDs, safe late-response retirement, sustained-stall fault promotion and mapping
+  reattachment after recovery;
 - a higher-level heartbeat plus `Loading`, `Ready`, `EditorOpening`, `Running`,
   `Closing`, `Crashed` and `Recovering` states (still pending);
 - selectable Together / By manufacturer / By plug-in / Individually isolation,
@@ -211,3 +212,31 @@ new PID, reattached the same mapping and rendered audio again. This verifies
 the Windows VST3 process boundary end to end, including timestamped MIDI and
 audio return. A separate regression holds the plug-in control mutex for 500 ms while the detached
 realtime endpoint renders all 96 blocks, proving native editor/control stalls no longer gate audio.
+
+The helper itself now has the same ownership split. Its `PluginWindow` retains the plug-in lifetime
+but uses a GUI-only editor capability containing the controller/view/run-loop state; native editor
+creation, attachment, resize, movement and teardown never borrow the processor-facing `Plugin`.
+Editor parameter feedback crosses to the processor through bounded lock-free queues. A transient
+deadline miss remains diagnostic and a late response is retired; only a sustained stall or a real
+protocol error wakes recovery, and recovery intents are coalesced per instance.
+
+On the reference Windows installation, Serum and BBC Symphony Orchestra each opened their native
+editor concurrently with 96 live 256-frame realtime blocks at 48 kHz. Both runs completed with zero
+deadline misses, then closed the editor and helper cleanly. These are the mandatory VST3 entry tests
+for Performance Tier P1.
+
+### Editor ownership, modal dialogs and automation feedback
+
+- A helper editor is an OS-owned child of the MiniStudio main HWND. An ordinary editor therefore
+  stays above its DAW without covering unrelated applications; Pin alone promotes it to global
+  topmost. The owner state is queued before `CreateGui` and retained by the helper across close/open.
+- Preset save/load enters an acknowledged modal state before opening the DAW file picker. The helper
+  disables and lowers the editor until the picker completes, and routine toolbar snapshots cannot
+  overwrite that state. Cancellation and errors restore the editor in a `finally` path.
+- Explicit VST3 `performEdit` values are returned in the fixed realtime response block and moved to
+  a bounded control-side queue. Processor output parameters such as meters are excluded, so they do
+  not create automation. Write/Latch creates the moved parameter lane on first gesture and records
+  it at the transport playhead; Read/Off updates display state without writing points.
+- Cached and portable project references lazily hydrate their controller parameter descriptors.
+  Missing legacy `paramCount` metadata is treated as unknown, not as proof that the plug-in has no
+  automatable parameters.

@@ -2,6 +2,7 @@
 
 use crate::midi::{PluginEvent, PluginEventData, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_TEXT_UNITS};
 use crate::plugin::StateContext;
+use crossbeam_queue::ArrayQueue;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -1635,7 +1636,7 @@ impl IContextMenuTrait for HostContextMenu {
 // and is not implemented.
 pub struct ComponentHandler {
     // Track parameter changes from the plugin
-    pub parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>,
+    pub parameter_changes: Arc<ArrayQueue<(u32, f64)>>,
     // Ordered log of begin/change/end gestures the editor reports, preserving their order so
     // the host can reconstruct each gesture (drained via `take_parameter_edits`). This is the
     // richer superset of `parameter_changes` (which keeps only the value changes for the DSP).
@@ -1656,7 +1657,7 @@ pub struct ComponentHandler {
 }
 
 impl ComponentHandler {
-    pub fn new(parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>) -> Self {
+    pub fn new(parameter_changes: Arc<ArrayQueue<(u32, f64)>>) -> Self {
         ComponentHandler {
             parameter_changes,
             edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
@@ -1767,11 +1768,7 @@ impl IComponentHandlerTrait for ComponentHandler {
             value_normalized
         );
         // Store the parameter change for the DSP-feeding drain...
-        if let Ok(mut changes) = self.parameter_changes.lock() {
-            if changes.len() < MAX_EDITOR_FEEDBACK {
-                changes.push((id, value_normalized));
-            }
-        }
+        self.parameter_changes.force_push((id, value_normalized));
         // ...and as an ordered gesture event for the richer `take_parameter_edits` drain.
         self.push_edit(crate::plugin::ParameterEdit {
             id,
@@ -2786,7 +2783,7 @@ mod component_handler_tests {
 
     #[test]
     fn captures_begin_perform_end_in_order_and_drains() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
 
         // Drive a full gesture: mouse-down, two drag values, mouse-up.
         unsafe {
@@ -2825,10 +2822,11 @@ mod component_handler_tests {
 
         // The drain empties the buffer; the value-change sink still mirrors the performEdits.
         assert!(handler.take_parameter_edits().is_empty());
-        assert_eq!(
-            *handler.parameter_changes.lock().unwrap(),
-            vec![(5, 0.25), (5, 0.5)]
-        );
+        let mut values = Vec::new();
+        while let Some(value) = handler.parameter_changes.pop() {
+            values.push(value);
+        }
+        assert_eq!(values, vec![(5, 0.25), (5, 0.5)]);
     }
 
     /// Both editor-feedback buffers are drained only by an optional host poll, so a host that
@@ -2836,7 +2834,7 @@ mod component_handler_tests {
     /// `performEdit` (and one gesture event) per UI frame, for as long as the editor is open.
     #[test]
     fn editor_feedback_is_capped_when_the_host_never_polls() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
 
         // Simulate a very long drag: far more edits than the cap, never polled.
         unsafe {
@@ -2846,9 +2844,9 @@ mod component_handler_tests {
         }
 
         assert_eq!(
-            handler.parameter_changes.lock().unwrap().len(),
+            handler.parameter_changes.len(),
             MAX_EDITOR_FEEDBACK,
-            "the value-change sink must stop at the cap, not grow with the drag"
+            "the value-change sink must remain capped and keep the newest drag values"
         );
         let edits = handler.take_parameter_edits();
         assert_eq!(
@@ -2865,7 +2863,7 @@ mod component_handler_tests {
 
     #[test]
     fn handler2_requests_are_ordered_and_report_backpressure() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
         unsafe {
             assert_eq!(handler.setDirty(1), kResultOk);
             assert_eq!(handler.requestOpenEditor(c"editor".as_ptr()), kResultOk);
@@ -2899,7 +2897,7 @@ mod component_handler_tests {
 
     #[test]
     fn handler3_context_menu_preserves_items_and_executes_plugin_target() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
         let handler_wrapper = ComWrapper::new(handler);
         assert!(
             handler_wrapper.as_com_ref::<IComponentHandler3>().is_some(),
@@ -2986,7 +2984,7 @@ mod component_handler_tests {
 
     #[test]
     fn handler3_rejects_invalid_views_and_releases_dismissed_targets() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
         assert!(unsafe { handler.createContextMenu(ptr::null_mut(), ptr::null()) }.is_null());
 
         let menu = unsafe {
@@ -3011,7 +3009,7 @@ mod component_handler_tests {
 
     #[test]
     fn unit_handler_requests_are_ordered_and_preserve_whole_list_changes() {
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
         unsafe {
             assert_eq!(handler.notifyUnitSelection(7), kResultOk);
             assert_eq!(handler.notifyProgramListChange(11, 3), kResultOk);
@@ -3046,7 +3044,7 @@ mod component_handler_tests {
     #[test]
     fn restart_flags_accumulate_until_drained() {
         use vst3::Steinberg::Vst::RestartFlags_ as Flags;
-        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        let handler = ComponentHandler::new(Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)));
         assert!(handler.take_restart_flags().is_empty());
 
         // Two separate restarts, e.g. a preset load followed by a mode switch.

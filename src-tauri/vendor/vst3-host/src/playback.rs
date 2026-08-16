@@ -45,9 +45,8 @@ fn channel_peak(buf: &[f32]) -> f32 {
 /// The audio-thread half of the lock-free side channels. Moved into the device callback; it
 /// drains queued control before processing and publishes feedback (peaks, output MIDI, GUI
 /// parameter changes) after. The control/feedback rings and the level atomics are lock-free;
-/// the only lock the callback takes is the plugin mutex it already needs (plus, via
-/// `get_parameter_changes`, the plugin's tiny internal component-handler mutex that its editor
-/// briefly touches on `performEdit` — bounded, not the UI-thread audio mutex).
+/// the only lock the legacy in-process callback takes is the plugin mutex it already needs.
+/// Editor-to-processor parameter feedback itself uses a fixed-capacity lock-free queue.
 struct AudioSideChannels {
     control_rx: Consumer<HybridCommand>,
     out_midi_tx: Producer<MidiEvent>,

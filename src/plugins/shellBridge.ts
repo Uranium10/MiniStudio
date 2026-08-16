@@ -5,6 +5,7 @@ import type { EffectInstance, ExternalPluginRef, IAudioEngine, ProjectState } fr
 import { openDevicePreset, saveDevicePreset } from '../io/projectFiles'
 import { useProjectStore, type RackTarget } from '../store/projectStore'
 import { PLUGIN_EDITOR_FOREGROUND_PENDING, pluginEditorGraphSyncPolicy, type PluginEditorForegroundIntent } from './editor'
+import { withPluginEditorModal } from './editorModal'
 
 export const PLUGIN_SHELL_REQUEST = 'ministudio:plugin-shell-request'
 export const PLUGIN_SHELL_STATE = 'ministudio:plugin-shell-state'
@@ -48,6 +49,7 @@ type LocatedPlugin = {
   effect?: EffectInstance
   target?: RackTarget
   trackId?: string
+  automationMode?: PluginShellState['automationMode']
 }
 
 function locatePlugin(project: ProjectState, kind: PluginShellTarget['targetKind'], id: string): LocatedPlugin | null {
@@ -55,11 +57,11 @@ function locatePlugin(project: ProjectState, kind: PluginShellTarget['targetKind
     const track = project.tracks.find((candidate) => candidate.id === id)
     const instrument = track?.instrument
     if (!track || !instrument?.plugin) return null
-    return { plugin: instrument.plugin, deviceType: instrument.type, params: instrument.params, bypassed: instrument.bypassed, trackId: track.id }
+    return { plugin: instrument.plugin, deviceType: instrument.type, params: instrument.params, bypassed: instrument.bypassed, trackId: track.id, automationMode: instrument.automationMode }
   }
   for (const track of project.tracks) {
     const effect = track.effects.find((candidate) => candidate.id === id)
-    if (effect?.plugin) return { plugin: effect.plugin, deviceType: effect.type, params: effect.params, bypassed: effect.bypassed, effect, target: { kind: 'track', id: track.id }, trackId: track.id }
+    if (effect?.plugin) return { plugin: effect.plugin, deviceType: effect.type, params: effect.params, bypassed: effect.bypassed, effect, target: { kind: 'track', id: track.id }, trackId: track.id, automationMode: effect.automationMode }
   }
   for (const bus of project.buses) {
     const effect = bus.effects.find((candidate) => candidate.id === id)
@@ -82,7 +84,7 @@ function shellState(target: PluginShellTarget): PluginShellState | null {
     format: located.plugin.format.toUpperCase(),
     bypassed: located.bypassed,
     hasSidechain,
-    automationMode: lanes[0]?.mode ?? 'off',
+    automationMode: located.automationMode ?? lanes[0]?.mode ?? 'off',
     automationCount: lanes.length,
   }
 }
@@ -96,13 +98,11 @@ async function runAction(engine: IAudioEngine, payload: PluginShellAction): Prom
     if (payload.targetKind === 'instrument' && located.trackId) store.toggleInstrumentBypass(located.trackId)
     else if (located.target) {
       store.toggleTargetEffect(located.target, payload.targetId)
-      engine.setEffectBypass(payload.targetId, !located.bypassed)
     }
     return
   }
   if (payload.action === 'set-automation-mode' && payload.mode && located.trackId) {
-    const lanes = store.project.tracks.find((track) => track.id === located.trackId)?.automationLanes?.filter((lane) => lane.targetKind === payload.targetKind && lane.targetId === payload.targetId) ?? []
-    lanes.forEach((lane) => store.setAutomationLaneMode(located.trackId!, lane.id, payload.mode!))
+    store.setDeviceAutomationMode(located.trackId, payload.targetKind, payload.targetId, payload.mode)
     return
   }
   if (payload.action === 'show-automation' && located.trackId) {
@@ -119,13 +119,15 @@ async function runAction(engine: IAudioEngine, payload: PluginShellAction): Prom
     return
   }
   if (payload.action === 'save-preset') {
-    const state = await engine.savePluginState(payload.targetKind, payload.targetId)
-    const path = await saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: located.plugin.name, deviceType: located.deviceType, pluginUid: located.plugin.uid, params: { ...located.params }, state })
+    const path = await withPluginEditorModal(engine, payload.targetId, async () => {
+      const state = await engine.savePluginState(payload.targetKind, payload.targetId)
+      return saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: located.plugin.name, deviceType: located.deviceType, pluginUid: located.plugin.uid, params: { ...located.params }, state })
+    })
     if (path) store.showToast(`${located.plugin.name} 프리셋을 저장했습니다.`)
     return
   }
   if (payload.action === 'load-preset') {
-    const preset = await openDevicePreset()
+    const preset = await withPluginEditorModal(engine, payload.targetId, openDevicePreset)
     if (!preset) return
     if (preset.deviceType !== located.deviceType || preset.pluginUid !== located.plugin.uid) throw new Error('현재 플러그인과 다른 종류의 프리셋입니다.')
     if (preset.state) await engine.loadPluginState(payload.targetKind, payload.targetId, preset.state)

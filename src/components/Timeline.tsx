@@ -558,7 +558,7 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
     {lanes.map((lane, index) => { const laneHeight = lane.height ?? AUTOMATION_HEIGHT; return <div className="automation-row" data-automation-lane-id={lane.id} key={lane.id} style={{ height: laneHeight }}>
       <div className="automation-lane-header">
         <span className="automation-color" style={{ background: track.color }} />
-        <label className="automation-lane-title" title="클릭하여 자동화 파라미터 변경"><ChevronDown size={9} /><small>{lane.category}</small><select value={`${lane.targetKind}:${lane.targetId}:${lane.parameterId}`} onChange={(event) => { const option = allOptions.find((candidate) => `${candidate.targetKind}:${candidate.targetId}:${candidate.parameterId}` === event.target.value); if (option) replaceLane(track.id, lane.id, option) }}>{allOptions.map((option) => <option key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} value={`${option.targetKind}:${option.targetId}:${option.parameterId}`}>{option.category} · {option.label}</option>)}</select></label>
+        <AutomationLaneParameterSelect lane={lane} options={allOptions} onChange={(option) => replaceLane(track.id, lane.id, option)} />
         {index === 0 && <button ref={addButton} className="automation-add" title="오토메이션 파라미터 추가" onClick={() => setPickerOpen((open) => !open)}><Plus size={11} /></button>}
         <div className="automation-mode-grid" role="group" aria-label="오토메이션 모드">{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${(lane.mode ?? 'read') === mode ? 'active' : ''}`} title={{ off: '끄기', write: '쓰기', read: '읽기', latch: '래치' }[mode]} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => setLaneMode(track.id, lane.id, mode)} />)}</div>
         <button className="automation-remove" title="오토메이션 레인 제거" aria-label="오토메이션 레인 제거" onClick={() => removeLane(track.id, lane.id)}><X size={10} /></button>
@@ -572,6 +572,17 @@ function AutomationSection({ track, width, pixelsPerSecond }: { track: Track; wi
       <div>{[...categories].map(([category, items]) => <section key={category}><strong>{category}</strong>{items.map((option) => <button key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} onClick={() => { addLane(track.id, option); setPickerOpen(false); setQuery('') }}><span>{option.label}</span><small>{option.parameterId}</small></button>)}</section>)}{!options.length && <small className="automation-empty">추가할 파라미터가 없습니다.</small>}</div>
     </FloatingPanel>}
   </div>
+}
+
+function AutomationLaneParameterSelect({ lane, options, onChange }: { lane: AutomationLane; options: ReturnType<typeof automationOptionsForTrack>; onChange(option: ReturnType<typeof automationOptionsForTrack>[number]): void }) {
+  const selectRef = useRef<HTMLSelectElement>(null)
+  const open = () => {
+    const select = selectRef.current
+    if (!select) return
+    select.focus({ preventScroll: true })
+    try { select.showPicker() } catch { select.click() }
+  }
+  return <div className="automation-lane-title" title="클릭하여 오토메이션 파라미터 변경"><button type="button" aria-label="오토메이션 파라미터 목록 열기" onClick={open}><ChevronDown size={9} /></button><small>{lane.category}</small><select ref={selectRef} value={`${lane.targetKind}:${lane.targetId}:${lane.parameterId}`} onChange={(event) => { const option = options.find((candidate) => `${candidate.targetKind}:${candidate.targetId}:${candidate.parameterId}` === event.target.value); if (option) onChange(option) }}>{options.map((option) => <option key={`${option.targetKind}:${option.targetId}:${option.parameterId}`} value={`${option.targetKind}:${option.targetId}:${option.parameterId}`}>{option.category} · {option.label}</option>)}</select></div>
 }
 
 function AutomationResizeHandle({ trackId, laneId, height }: { trackId: string; laneId: string; height: number }) {

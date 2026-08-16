@@ -729,6 +729,14 @@ pub(crate) trait PluginInternal: Send {
     fn take_realtime_client(&mut self) -> Option<crate::realtime_ipc::RealtimeClient> {
         None
     }
+    /// Clone a GUI-only handle whose ownership is independent from audio processing.
+    ///
+    /// In-process format adapters use this to keep potentially blocking native editor calls
+    /// out of the mutex that serializes lifecycle/state operations. Process-isolated adapters
+    /// leave this as `None`: their editor is created inside the helper process instead.
+    fn editor_handle(&self) -> Option<PluginEditorHandle> {
+        None
+    }
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()>;
     /// Schedule a parameter change at a sample offset within the next process block.
     /// Defaults to a block-start change (ignores the offset) for implementations that don't
@@ -934,6 +942,11 @@ pub(crate) trait PluginInternal: Send {
     /// (non-Linux, or process isolation where the editor isn't bridged).
     fn service_run_loop(&mut self) {}
     fn get_parameter_changes(&self) -> Vec<(u32, f64)>;
+    /// Pop one processor/editor parameter value without allocating. Isolated realtime workers
+    /// use this to publish GUI edits through their fixed shared-memory response block.
+    fn pop_realtime_parameter_change(&self) -> Option<(u32, f64)> {
+        None
+    }
     /// Drain the ordered parameter-edit gesture log (begin/change/end) the plugin's editor
     /// reported since the last call. Defaults to empty for implementations that don't capture
     /// gestures.
@@ -1124,7 +1137,95 @@ pub(crate) trait PluginInternal: Send {
     }
 }
 
+/// Format-internal implementation of a native editor session.
+///
+/// This intentionally contains no audio, transport, state or parameter APIs. Keeping the
+/// surface this narrow is what makes it safe for [`PluginWindow`] to use it while the realtime
+/// worker is processing the same plug-in instance.
+pub(crate) trait PluginEditorInternal: Send + Sync {
+    fn has_editor(&self) -> bool;
+    fn open(&self, parent: *mut std::ffi::c_void) -> Result<()>;
+    fn close(&self) -> Result<()>;
+    fn size(&self) -> Result<(i32, i32)>;
+    fn can_resize(&self) -> bool;
+    fn resize(&self, width: i32, height: i32) -> Result<(i32, i32)>;
+    fn set_scale_factor(&self, factor: f32) -> Result<bool>;
+    fn service_run_loop(&self);
+    fn take_resize_request(&self) -> Option<(i32, i32)>;
+}
+
+/// Cloneable GUI-only capability for an in-process VST3 editor.
+///
+/// The handle owns references to the controller/view and editor run-loop state, but cannot
+/// reach the processor. Native window creation, attachment, movement and teardown therefore do
+/// not need to hold the plug-in control mutex used by the helper's audio-facing instance.
+#[derive(Clone)]
+pub struct PluginEditorHandle {
+    inner: Arc<dyn PluginEditorInternal>,
+}
+
+impl PluginEditorHandle {
+    pub(crate) fn new(inner: Arc<dyn PluginEditorInternal>) -> Self {
+        Self { inner }
+    }
+
+    /// Whether the controller advertises a native editor view.
+    pub fn has_editor(&self) -> bool {
+        self.inner.has_editor()
+    }
+
+    /// Create and attach the native editor to `parent`.
+    pub fn open(&self, parent: WindowHandle) -> Result<()> {
+        self.inner.open(parent.0)
+    }
+
+    /// Detach and release the current native editor view.
+    pub fn close(&self) -> Result<()> {
+        self.inner.close()
+    }
+
+    /// Return the editor's preferred content size.
+    pub fn size(&self) -> Result<(i32, i32)> {
+        self.inner.size()
+    }
+
+    /// Whether the editor accepts host-driven resizing.
+    pub fn can_resize(&self) -> bool {
+        self.inner.can_resize()
+    }
+
+    /// Resize the open editor, honoring its size constraints.
+    pub fn resize(&self, width: i32, height: i32) -> Result<(i32, i32)> {
+        self.inner.resize(width, height)
+    }
+
+    /// Apply a logical-to-physical content scale factor.
+    pub fn set_scale_factor(&self, factor: f32) -> Result<bool> {
+        self.inner.set_scale_factor(factor)
+    }
+
+    /// Service platform run-loop registrations owned by the editor.
+    pub fn service_run_loop(&self) {
+        self.inner.service_run_loop();
+    }
+
+    /// Drain the newest plug-in-requested editor size.
+    pub fn take_resize_request(&self) -> Option<(i32, i32)> {
+        self.inner.take_resize_request()
+    }
+}
+
 impl Plugin {
+    /// Return a GUI-only native editor capability when the in-process adapter supports one.
+    ///
+    /// Cloning this handle is cheap. Long-running editor operations performed through it never
+    /// borrow the processor-facing [`Plugin`] value.
+    pub fn editor_handle(&self) -> Option<PluginEditorHandle> {
+        self.internal
+            .as_ref()
+            .and_then(|internal| internal.editor_handle())
+    }
+
     /// Detach the process-isolated realtime endpoint from control ownership.
     ///
     /// A successful call transfers the only audio-side client to the caller while retaining a
@@ -2163,6 +2264,13 @@ impl Plugin {
             .as_ref()
             .map(|i| i.get_parameter_changes())
             .unwrap_or_default()
+    }
+
+    /// Pop one parameter feedback value without allocating.
+    pub(crate) fn pop_realtime_parameter_change(&self) -> Option<(u32, f64)> {
+        self.internal
+            .as_ref()
+            .and_then(|internal| internal.pop_realtime_parameter_change())
     }
 
     /// Drain the ordered log of parameter-edit gestures the plugin's editor has reported since

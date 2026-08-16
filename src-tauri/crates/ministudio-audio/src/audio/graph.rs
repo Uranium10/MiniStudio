@@ -32,7 +32,8 @@ fn effect_has_spectrum(kind: &str) -> bool {
             | "builtin:disperser"
             | "builtin:clipper"
             | "builtin:roboter"
-            | "builtin:resonator"
+            | "builtin:compressor"
+            | "builtin:upward-compressor"
     )
 }
 
@@ -1304,12 +1305,12 @@ mod tests {
         let mut dry = snapshot.tracks[0].clone();
         dry.id = "instrument-dry".into();
         dry.midi_clips.clear();
-        snapshot.tracks[0].effects = vec![effect("colorizer", "builtin:resonator", &[])];
+        snapshot.tracks[0].effects = vec![effect("limiter", "builtin:mastering-limiter", &[])];
         snapshot.tracks.push(dry);
         let (graph, _) = AudioGraph::build(&snapshot, &HashMap::new(), 48_000).unwrap();
-        assert_eq!(graph.max_latency(), 4_096);
+        assert_eq!(graph.max_latency(), 240);
         assert_eq!(graph.tracks[0].pdc.delay, 0);
-        assert_eq!(graph.tracks[1].pdc.delay, 4_096);
+        assert_eq!(graph.tracks[1].pdc.delay, 240);
     }
 
     fn render_midi(block_size: usize) -> Vec<f32> {

@@ -6,8 +6,8 @@ use crate::{
     midi::{MidiChannel, MidiEvent, PluginEvent},
     parameters::{Parameter, ParameterChange},
     plugin::{
-        decode_state_snapshot, encode_state_snapshot, PluginInfo, PluginInternal, StateContext,
-        StateSnapshot,
+        decode_state_snapshot, encode_state_snapshot, PluginEditorHandle, PluginEditorInternal,
+        PluginInfo, PluginInternal, StateContext, StateSnapshot,
     },
 };
 use crossbeam_queue::ArrayQueue;
@@ -135,6 +135,36 @@ struct BusActivationState {
     event_outputs: Vec<bool>,
 }
 
+struct NativeEditorState {
+    view: Option<ComPtr<IPlugView>>,
+    scale_factor: f32,
+}
+
+/// GUI-only ownership for an in-process VST3 editor.
+///
+/// The processor never reaches this object. Conversely, this object has no processor, process
+/// data, transport or lifecycle methods. A helper can therefore attach or move a native editor
+/// without taking the mutex used by its realtime worker.
+struct InProcessPluginEditor {
+    has_gui: bool,
+    controller: Option<ComPtr<IEditController>>,
+    state: Mutex<NativeEditorState>,
+    plug_frame: ComWrapper<HostPlugFrame>,
+    editor_resize: Arc<Mutex<Option<(i32, i32)>>>,
+    #[cfg(target_os = "linux")]
+    run_loop: Arc<Mutex<RunLoopRegistry>>,
+}
+
+impl InProcessPluginEditor {
+    fn with_view<R>(&self, f: impl FnOnce(Option<&ComPtr<IPlugView>>) -> R) -> R {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        f(state.view.as_ref())
+    }
+}
+
 /// Internal plugin implementation that handles all VST3 COM interactions
 pub struct PluginImpl {
     // Core VST3 interfaces
@@ -212,7 +242,7 @@ pub struct PluginImpl {
     // via `get_parameter_changes()` to update its UI. Separate from the raw performEdit sink
     // (`component_handler.parameter_changes`) so feeding the DSP and updating the display are
     // not two consumers racing to drain the same buffer.
-    gui_param_changes_for_host: Arc<Mutex<Vec<(u32, f64)>>>,
+    gui_param_changes_for_host: Arc<ArrayQueue<(u32, f64)>>,
     // Processor-originated output parameter points. Bounded and lock-free: process() pushes,
     // the host/UI drains through get_parameter_changes().
     output_param_feedback: Arc<ArrayQueue<(u32, f64)>>,
@@ -236,18 +266,9 @@ pub struct PluginImpl {
     // the oldest event is dropped (bounded memory if the host never polls).
     output_events_owned: Arc<ArrayQueue<PluginEvent>>,
 
-    // Plugin view
-    plugin_view: Option<ComPtr<IPlugView>>,
-    editor_scale_factor: f32,
-
-    // Editor resize plumbing: the IPlugFrame handed to the plugin's view, and the slot it
-    // writes requested sizes into (drained via take_editor_resize_request).
-    plug_frame: ComWrapper<HostPlugFrame>,
-    editor_resize: Arc<Mutex<Option<(i32, i32)>>>,
-    // Linux IRunLoop registrations from the plugin's editor (fd handlers +
-    // timers), serviced on the host UI thread via `service_run_loop`.
-    #[cfg(target_os = "linux")]
-    run_loop: Arc<Mutex<RunLoopRegistry>>,
+    // Native editor/controller ownership is intentionally outside the processor fields. The
+    // cloneable handle is used by PluginWindow without borrowing this PluginImpl.
+    editor: Arc<InProcessPluginEditor>,
 
     // VST3 module handle (kept alive). Declared after every plugin-side COM reference above so
     // those are released while the module's vtables still exist, and before `_host_app` below.
@@ -1013,20 +1034,17 @@ impl PluginImpl {
         while let Some(change) = self.output_param_feedback.pop() {
             changes.push(change);
         }
-        // Both drains take the elements in place rather than `mem::take`-ing the `Vec`: taking it
-        // would leave a zero-capacity buffer behind, so the next block's `append` would
-        // reallocate — on the audio thread, for the stash.
-        if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
-            if !stash.is_empty() {
-                changes.extend(stash.drain(..));
-            }
+        // Both fixed-capacity queues are drained in place. The editor and processor can keep
+        // producing feedback concurrently without a shared mutex or a callback-time allocation.
+        while let Some(change) = self.gui_param_changes_for_host.pop() {
+            changes.push(change);
         }
         // Not processing yet (process() hasn't run to move edits into the stash): drain the raw
         // performEdit sink directly so the host UI still reflects editor changes.
         if !self.is_processing {
             if let Some(ref handler) = self.component_handler {
-                if let Ok(mut raw_changes) = handler.parameter_changes.lock() {
-                    changes.extend(raw_changes.drain(..));
+                while let Some(change) = handler.parameter_changes.pop() {
+                    changes.push(change);
                 }
             }
         }
@@ -1335,7 +1353,7 @@ impl PluginImpl {
 
             // Create component handler for parameter change notifications
             log::debug!("Step 8: Creating component handler...");
-            let parameter_changes = Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK)));
+            let parameter_changes = Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK));
             let component_handler =
                 ComWrapper::new(ComponentHandler::new(parameter_changes.clone()));
             log::debug!("Component handler created");
@@ -1464,6 +1482,19 @@ impl PluginImpl {
             let mut updated_info = info;
             updated_info.has_gui = has_gui;
 
+            let editor = Arc::new(InProcessPluginEditor {
+                has_gui,
+                controller: controller.clone(),
+                state: Mutex::new(NativeEditorState {
+                    view: None,
+                    scale_factor: 1.0,
+                }),
+                plug_frame,
+                editor_resize,
+                #[cfg(target_os = "linux")]
+                run_loop,
+            });
+
             host_app.configure_data_exchange(
                 processor.as_ptr(),
                 controller
@@ -1510,21 +1541,14 @@ impl PluginImpl {
                 connection: initialized.take_connection(),
                 pending_param_changes: Vec::with_capacity(MAX_PENDING_PARAM_CHANGES),
                 dropped_param_changes: 0,
-                gui_param_changes_for_host: Arc::new(Mutex::new(Vec::with_capacity(
-                    MAX_EDITOR_FEEDBACK,
-                ))),
+                gui_param_changes_for_host: Arc::new(ArrayQueue::new(MAX_EDITOR_FEEDBACK)),
                 output_param_feedback: Arc::new(ArrayQueue::new(MAX_OUTPUT_PARAMETER_FEEDBACK)),
                 deferred_controller_sync: ArrayQueue::new(MAX_DEFERRED_CONTROLLER_SYNC),
                 input_events,
                 output_events,
                 chunk_events: Vec::with_capacity(MAX_QUEUED_EVENTS),
                 output_events_owned: Arc::new(ArrayQueue::new(MAX_OUTPUT_MIDI)),
-                plugin_view: None,
-                editor_scale_factor: 1.0,
-                plug_frame,
-                editor_resize,
-                #[cfg(target_os = "linux")]
-                run_loop,
+                editor,
                 _module: module,
                 _host_app: host_app,
                 control_thread: thread::current().id(),
@@ -2117,28 +2141,9 @@ impl PluginImpl {
                 // twice in the same block, which is idempotent.) Drained here at offset 0 and
                 // stashed for the host's display poll (get_parameter_changes).
                 if let Some(ref handler) = self.component_handler {
-                    if let Ok(mut gui_changes) = handler.parameter_changes.lock() {
-                        if !gui_changes.is_empty() {
-                            for &(id, value) in gui_changes.iter() {
-                                data.input_param_changes.enqueue(id, 0, value);
-                            }
-                            if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
-                                // Bounded: nothing drains the stash unless the host polls
-                                // `get_parameter_changes`, and the realtime runner never does, so
-                                // an unbounded append here would grow forever and reallocate on
-                                // the audio thread. Both buffers are pre-reserved to the cap, so
-                                // the steady-state append allocates nothing.
-                                let room = MAX_EDITOR_FEEDBACK.saturating_sub(stash.len());
-                                if room >= gui_changes.len() {
-                                    stash.append(&mut gui_changes);
-                                } else {
-                                    stash.extend(gui_changes.drain(..room));
-                                    gui_changes.clear();
-                                }
-                            } else {
-                                gui_changes.clear();
-                            }
-                        }
+                    while let Some((id, value)) = handler.parameter_changes.pop() {
+                        data.input_param_changes.enqueue(id, 0, value);
+                        self.gui_param_changes_for_host.force_push((id, value));
                     }
                 }
 
@@ -2382,7 +2387,352 @@ impl PluginImpl {
     }
 }
 
+impl PluginEditorInternal for InProcessPluginEditor {
+    fn has_editor(&self) -> bool {
+        if self.has_gui || self.with_view(|view| view.is_some()) {
+            return true;
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return false;
+        };
+        unsafe {
+            let view_ptr = controller.createView(c"editor".as_ptr());
+            if view_ptr.is_null() {
+                false
+            } else {
+                // A probe view was never attached, so `removed()` must not be called.
+                let _ = ComPtr::<IPlugView>::from_raw(view_ptr);
+                true
+            }
+        }
+    }
+
+    fn open(&self, parent: *mut std::ffi::c_void) -> Result<()> {
+        if parent.is_null() {
+            return Err(Error::Other(
+                "editor parent window handle is null".to_string(),
+            ));
+        }
+        let Some(controller) = self.controller.as_ref() else {
+            return Err(Error::Other("No controller available".to_string()));
+        };
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.view.is_some() {
+            return Err(Error::Other("Editor already open".to_string()));
+        }
+
+        unsafe {
+            let view_ptr = controller.createView(c"editor".as_ptr());
+            if view_ptr.is_null() {
+                return Err(Error::Other("Failed to create editor view".to_string()));
+            }
+            let view = ComPtr::<IPlugView>::from_raw(view_ptr)
+                .ok_or_else(|| Error::Other("Failed to wrap view".to_string()))?;
+            let mut view_rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 400,
+                bottom: 300,
+            };
+            if view.getSize(&mut view_rect) != kResultOk {
+                return Err(Error::Other("Failed to get view size".to_string()));
+            }
+            view_rect_size(&view_rect)?;
+
+            let frame = self.plug_frame.to_com_ptr::<IPlugFrame>().ok_or_else(|| {
+                Error::Other("Failed to create editor plug frame".to_string())
+            })?;
+            let frame_result = view.setFrame(frame.as_ptr());
+            if frame_result != kResultOk && frame_result != kResultTrue {
+                return Err(Error::Other(format!(
+                    "Plugin rejected editor plug frame: {frame_result:#x}"
+                )));
+            }
+            let _ = set_view_scale_factor(&view, state.scale_factor);
+
+            #[cfg(target_os = "macos")]
+            let platform_type = kPlatformTypeNSView;
+            #[cfg(target_os = "windows")]
+            let platform_type = kPlatformTypeHWND;
+            #[cfg(target_os = "linux")]
+            let platform_type = kPlatformTypeX11EmbedWindowID;
+            #[cfg(target_os = "android")]
+            {
+                view.setFrame(std::ptr::null_mut());
+                return Err(Error::Other(
+                    "embedded VST3 editors are not supported on Android".to_string(),
+                ));
+            }
+
+            #[cfg(not(target_os = "android"))]
+            if view.isPlatformTypeSupported(platform_type) != kResultOk {
+                view.setFrame(std::ptr::null_mut());
+                return Err(Error::Other("Platform type not supported".to_string()));
+            }
+            #[cfg(not(target_os = "android"))]
+            let attach_result = view.attached(parent, platform_type);
+            #[cfg(not(target_os = "android"))]
+            if attach_result != kResultOk {
+                view.setFrame(std::ptr::null_mut());
+                return Err(Error::Other(format!(
+                    "Failed to attach view: {attach_result:#x}"
+                )));
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                state.view = Some(view);
+                Ok(())
+            }
+        }
+    }
+
+    fn close(&self) -> Result<()> {
+        let view = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .view
+            .take();
+        let mut close_error = None;
+        if let Some(view) = view {
+            unsafe {
+                let removed_result = view.removed();
+                let frame_result = view.setFrame(std::ptr::null_mut());
+                if removed_result != kResultOk && removed_result != kResultTrue {
+                    close_error = Some(Error::Other(format!(
+                        "Failed to detach editor view: {removed_result:#x}"
+                    )));
+                } else if frame_result != kResultOk && frame_result != kResultTrue {
+                    close_error = Some(Error::Other(format!(
+                        "Failed to clear editor plug frame: {frame_result:#x}"
+                    )));
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(mut registry) = self.run_loop.lock() {
+            registry.handlers.clear();
+            registry.timers.clear();
+        }
+        close_error.map_or(Ok(()), Err)
+    }
+
+    fn size(&self) -> Result<(i32, i32)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(view) = state.view.as_ref() {
+            unsafe {
+                let mut rect = ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if view.getSize(&mut rect) != kResultOk {
+                    return Err(Error::Other("Failed to query open editor size".to_string()));
+                }
+                return view_rect_size(&rect);
+            }
+        }
+        drop(state);
+        let Some(controller) = self.controller.as_ref() else {
+            return Err(Error::Other("No controller available".to_string()));
+        };
+        unsafe {
+            let view_ptr = controller.createView(c"editor".as_ptr());
+            if view_ptr.is_null() {
+                return Err(Error::Other(
+                    "Failed to create view for size query".to_string(),
+                ));
+            }
+            let view = ComPtr::<IPlugView>::from_raw(view_ptr)
+                .ok_or_else(|| Error::Other("Failed to wrap plug view".to_string()))?;
+            let mut rect = ViewRect {
+                left: 0,
+                top: 0,
+                right: 400,
+                bottom: 300,
+            };
+            if view.getSize(&mut rect) == kResultOk {
+                view_rect_size(&rect)
+            } else {
+                Ok((800, 600))
+            }
+        }
+    }
+
+    fn can_resize(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            if let Some(view) = state.view.as_ref() {
+                return view.canResize() == kResultTrue;
+            }
+        }
+        drop(state);
+        let Some(controller) = self.controller.as_ref() else {
+            return false;
+        };
+        unsafe {
+            let Some(view) = ComPtr::<IPlugView>::from_raw(controller.createView(c"editor".as_ptr()))
+            else {
+                return false;
+            };
+            view.canResize() == kResultTrue
+        }
+    }
+
+    fn resize(&self, width: i32, height: i32) -> Result<(i32, i32)> {
+        if width <= 0 || height <= 0 {
+            return Err(Error::Other(
+                "editor dimensions must be greater than zero".to_string(),
+            ));
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let view = state
+            .view
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin editor is not open".to_string()))?;
+        unsafe {
+            if view.canResize() != kResultTrue {
+                let mut current = ViewRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if view.getSize(&mut current) != kResultOk {
+                    return Err(Error::Other(
+                        "Plugin editor is fixed-size and its size could not be queried"
+                            .to_string(),
+                    ));
+                }
+                return view_rect_size(&current);
+            }
+            let mut requested = ViewRect {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            let constraint = view.checkSizeConstraint(&mut requested);
+            if constraint != kResultOk
+                && constraint != kResultTrue
+                && constraint != kResultFalse
+                && constraint != kNotImplemented
+            {
+                return Err(Error::Other(format!(
+                    "Plugin failed to check the editor size constraint: {constraint:#x}"
+                )));
+            }
+            let accepted = view_rect_size(&requested)?;
+            let mut current = ViewRect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if view.getSize(&mut current) == kResultOk
+                && view_rect_size(&current).ok() == Some(accepted)
+            {
+                return Ok(accepted);
+            }
+            let result = view.onSize(&mut requested);
+            if result != kResultOk && result != kResultTrue {
+                return Err(Error::Other(format!(
+                    "Plugin rejected editor resize: {result:#x}"
+                )));
+            }
+            Ok(accepted)
+        }
+    }
+
+    fn set_scale_factor(&self, factor: f32) -> Result<bool> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Err(Error::Other(
+                "editor scale factor must be finite and greater than zero".to_string(),
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let supported = match state.view.as_ref() {
+            Some(view) => unsafe { set_view_scale_factor(view, factor)? },
+            None => false,
+        };
+        state.scale_factor = factor;
+        Ok(supported)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn service_run_loop(&self) {
+        use vst3::Steinberg::Linux::{IEventHandlerTrait, ITimerHandlerTrait};
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        if let Ok(mut registry) = self.run_loop.lock() {
+            for timer in registry.timers.iter_mut() {
+                if now >= timer.due {
+                    timer.due = now + std::time::Duration::from_millis(timer.interval_ms);
+                    due.push(timer.handler.clone());
+                }
+            }
+        }
+        for handler in due {
+            unsafe { handler.onTimer() };
+        }
+        let handlers = match self.run_loop.lock() {
+            Ok(registry) => registry.handlers.clone(),
+            Err(_) => return,
+        };
+        if handlers.is_empty() {
+            return;
+        }
+        let mut fds: Vec<libc::pollfd> = handlers
+            .iter()
+            .map(|&(_, fd)| libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 0) } > 0 {
+            for (poll, (handler, fd)) in fds.iter().zip(handlers.iter()) {
+                if poll.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                    unsafe { handler.onFDIsSet(*fd) };
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn service_run_loop(&self) {}
+
+    fn take_resize_request(&self) -> Option<(i32, i32)> {
+        self.editor_resize.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
 impl PluginInternal for PluginImpl {
+    fn editor_handle(&self) -> Option<PluginEditorHandle> {
+        Some(PluginEditorHandle::new(self.editor.clone()))
+    }
+
+    fn pop_realtime_parameter_change(&self) -> Option<(u32, f64)> {
+        // Automation write follows explicit editor gestures. Processor output parameters often
+        // contain meters/modulators and must not create automation lanes or project history.
+        self.gui_param_changes_for_host.pop()
+    }
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()> {
         self.set_parameter_at(id, value, 0)
     }
@@ -2956,370 +3306,39 @@ impl PluginInternal for PluginImpl {
     }
 
     fn has_editor(&self) -> bool {
-        // First check our cached value
-        if self.info.has_gui {
-            return true;
-        }
-
-        // An open editor is proof enough, and probing for a second view while one is attached
-        // upsets plugins that assume a single live view.
-        if self.plugin_view.is_some() {
-            return true;
-        }
-
-        // Otherwise do a runtime check
-        if let Some(ref controller) = self.controller {
-            unsafe {
-                // Check if controller can create an editor view
-                let view_type = c"editor".as_ptr();
-                let view_ptr = controller.createView(view_type);
-                if !view_ptr.is_null() {
-                    // Release the probe view; never call `removed()` on it — that pairs with
-                    // `attached()`, and an unmatched `removed()` crashes some plugins that
-                    // initialize their close state only on attach.
-                    let _ = ComPtr::<IPlugView>::from_raw(view_ptr);
-                    true
-                } else {
-                    false
-                }
-            }
-        } else {
-            false
-        }
+        self.editor.has_editor()
     }
 
     fn open_editor(&mut self, parent: *mut std::ffi::c_void) -> Result<()> {
-        if self.plugin_view.is_some() {
-            return Err(Error::Other("Editor already open".to_string()));
-        }
-        if parent.is_null() {
-            return Err(Error::Other(
-                "editor parent window handle is null".to_string(),
-            ));
-        }
-
-        if let Some(ref controller) = self.controller {
-            unsafe {
-                // Create editor view
-                let view_type = c"editor".as_ptr();
-                let view_ptr = controller.createView(view_type);
-                if view_ptr.is_null() {
-                    return Err(Error::Other("Failed to create editor view".to_string()));
-                }
-
-                let view = ComPtr::<IPlugView>::from_raw(view_ptr)
-                    .ok_or_else(|| Error::Other("Failed to wrap view".to_string()))?;
-
-                // Get view size
-                let mut view_rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 400,
-                    bottom: 300,
-                };
-
-                if view.getSize(&mut view_rect) != kResultOk {
-                    return Err(Error::Other("Failed to get view size".to_string()));
-                }
-                view_rect_size(&view_rect)?;
-
-                // Hand the plugin an IPlugFrame (before attach, per the SDK) so it can
-                // request host-side resizes; requests land in `editor_resize`.
-                let frame = self.plug_frame.to_com_ptr::<IPlugFrame>().ok_or_else(|| {
-                    Error::Other("Failed to create editor plug frame".to_string())
-                })?;
-                let frame_result = view.setFrame(frame.as_ptr());
-                if frame_result != kResultOk && frame_result != kResultTrue {
-                    return Err(Error::Other(format!(
-                        "Plugin rejected editor plug frame: {frame_result:#x}"
-                    )));
-                }
-
-                // Offer the current scale factor, but never let the answer decide whether the
-                // editor opens: a view that declines simply renders at its own scale.
-                let _ = set_view_scale_factor(&view, self.editor_scale_factor);
-
-                // Platform-specific attachment
-                #[cfg(target_os = "macos")]
-                let platform_type = kPlatformTypeNSView;
-                #[cfg(target_os = "windows")]
-                let platform_type = kPlatformTypeHWND;
-                #[cfg(target_os = "linux")]
-                let platform_type = kPlatformTypeX11EmbedWindowID;
-                #[cfg(target_os = "android")]
-                {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other(
-                        "embedded VST3 editors are not supported on Android".to_string(),
-                    ));
-                }
-
-                // Check platform support
-                #[cfg(not(target_os = "android"))]
-                if view.isPlatformTypeSupported(platform_type) != kResultOk {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other("Platform type not supported".to_string()));
-                }
-
-                // Attach to parent window
-                #[cfg(not(target_os = "android"))]
-                let attach_result = view.attached(parent, platform_type);
-                #[cfg(not(target_os = "android"))]
-                if attach_result != kResultOk {
-                    view.setFrame(std::ptr::null_mut());
-                    return Err(Error::Other(format!(
-                        "Failed to attach view: {:#x}",
-                        attach_result
-                    )));
-                }
-
-                #[cfg(not(target_os = "android"))]
-                {
-                    self.plugin_view = Some(view);
-                    Ok(())
-                }
-            }
-        } else {
-            Err(Error::Other("No controller available".to_string()))
-        }
+        self.editor.open(parent)
     }
 
     fn close_editor(&mut self) -> Result<()> {
-        let mut close_error = None;
-        if let Some(view) = self.plugin_view.take() {
-            unsafe {
-                let removed_result = view.removed();
-                // Break the view -> host-frame reference before releasing the view. The frame
-                // intentionally never retains the view, so this also avoids a COM retain cycle.
-                let frame_result = view.setFrame(std::ptr::null_mut());
-                if removed_result != kResultOk && removed_result != kResultTrue {
-                    close_error = Some(Error::Other(format!(
-                        "Failed to detach editor view: {removed_result:#x}"
-                    )));
-                } else if frame_result != kResultOk && frame_result != kResultTrue {
-                    close_error = Some(Error::Other(format!(
-                        "Failed to clear editor plug frame: {frame_result:#x}"
-                    )));
-                }
-            }
-        }
-        // Drop any run-loop registrations the editor left behind. A well-behaved plugin
-        // unregisters its own handlers and timers during `removed()`, but one that doesn't would
-        // otherwise leave live ComPtrs into a view that no longer exists — and since
-        // `Plugin::service_run_loop` is public with no editor-open guard, a host driving it from
-        // its frame loop would then dispatch straight into the removed view.
-        #[cfg(target_os = "linux")]
-        if let Ok(mut reg) = self.run_loop.lock() {
-            reg.handlers.clear();
-            reg.timers.clear();
-        }
-        close_error.map_or(Ok(()), Err)
+        self.editor.close()
     }
 
-    #[cfg(target_os = "linux")]
     fn service_run_loop(&mut self) {
-        use vst3::Steinberg::Linux::{IEventHandlerTrait, ITimerHandlerTrait};
-
-        // Fire due timers. Snapshot the handlers, then invoke with the lock
-        // RELEASED: a callback may re-enter registerTimer/unregisterTimer
-        // (VSTGUI does), which takes the same lock.
-        let now = std::time::Instant::now();
-        let mut due = Vec::new();
-        if let Ok(mut reg) = self.run_loop.lock() {
-            for timer in reg.timers.iter_mut() {
-                if now >= timer.due {
-                    timer.due = now + std::time::Duration::from_millis(timer.interval_ms);
-                    due.push(timer.handler.clone());
-                }
-            }
-        }
-        for handler in due {
-            unsafe { handler.onTimer() };
-        }
-
-        // Poll registered fds (zero timeout - never blocks the UI thread)
-        // and notify ready ones. Same snapshot-then-invoke pattern.
-        let handlers: Vec<_> = match self.run_loop.lock() {
-            Ok(reg) => reg.handlers.clone(),
-            Err(_) => return,
-        };
-        if handlers.is_empty() {
-            return;
-        }
-        let mut fds: Vec<libc::pollfd> = handlers
-            .iter()
-            .map(|&(_, fd)| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect();
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 0) };
-        if ready > 0 {
-            for (pfd, (handler, fd)) in fds.iter().zip(handlers.iter()) {
-                if pfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-                    unsafe { handler.onFDIsSet(*fd) };
-                }
-            }
-        }
+        self.editor.service_run_loop();
     }
 
     fn get_editor_size(&self) -> Result<(i32, i32)> {
-        if let Some(view) = self.plugin_view.as_ref() {
-            unsafe {
-                let mut view_rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                if view.getSize(&mut view_rect) != kResultOk {
-                    return Err(Error::Other("Failed to query open editor size".to_string()));
-                }
-                return view_rect_size(&view_rect);
-            }
-        }
-
-        if let Some(ref controller) = self.controller {
-            unsafe {
-                // Create a temporary view to get size
-                let view_type = c"editor".as_ptr();
-                let view_ptr = controller.createView(view_type);
-                if view_ptr.is_null() {
-                    return Err(Error::Other(
-                        "Failed to create view for size query".to_string(),
-                    ));
-                }
-
-                let view = ComPtr::<IPlugView>::from_raw(view_ptr)
-                    .ok_or_else(|| Error::Other("Failed to wrap plug view".to_string()))?;
-
-                // Get view size
-                let mut view_rect = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 400,
-                    bottom: 300,
-                };
-
-                let result = view.getSize(&mut view_rect);
-
-                // Released when `view` drops; do not call `removed()` — it pairs with
-                // `attached()`, which this probe never calls.
-
-                if result == kResultOk {
-                    view_rect_size(&view_rect)
-                } else {
-                    Ok((800, 600)) // Default size
-                }
-            }
-        } else {
-            Err(Error::Other("No controller available".to_string()))
-        }
+        self.editor.size()
     }
 
     fn editor_can_resize(&self) -> bool {
-        unsafe {
-            if let Some(view) = self.plugin_view.as_ref() {
-                return view.canResize() == kResultTrue;
-            }
-
-            let Some(controller) = self.controller.as_ref() else {
-                return false;
-            };
-            let view_ptr = controller.createView(c"editor".as_ptr());
-            let Some(view) = ComPtr::<IPlugView>::from_raw(view_ptr) else {
-                return false;
-            };
-            view.canResize() == kResultTrue
-        }
+        self.editor.can_resize()
     }
 
     fn resize_editor(&mut self, width: i32, height: i32) -> Result<(i32, i32)> {
-        if width <= 0 || height <= 0 {
-            return Err(Error::Other(
-                "editor dimensions must be greater than zero".to_string(),
-            ));
-        }
-        let view = self
-            .plugin_view
-            .as_ref()
-            .ok_or_else(|| Error::Other("Plugin editor is not open".to_string()))?;
-
-        unsafe {
-            if view.canResize() != kResultTrue {
-                let mut current = ViewRect {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                };
-                if view.getSize(&mut current) != kResultOk {
-                    return Err(Error::Other(
-                        "Plugin editor is fixed-size and its size could not be queried".to_string(),
-                    ));
-                }
-                return view_rect_size(&current);
-            }
-
-            let mut requested = ViewRect {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
-            // The view constrains `requested` in place. `kResultFalse` means it left the rect
-            // alone (nothing to constrain, or it wants a different size than asked for) — a
-            // refusal to adapt, not a broken call — so take whatever rect it ended up with and
-            // only reject result codes that mean the call itself failed.
-            let constraint_result = view.checkSizeConstraint(&mut requested);
-            let constrained = constraint_result == kResultOk
-                || constraint_result == kResultTrue
-                || constraint_result == kResultFalse
-                || constraint_result == kNotImplemented;
-            if !constrained {
-                return Err(Error::Other(format!(
-                    "Plugin failed to check the editor size constraint: {constraint_result:#x}"
-                )));
-            }
-            let accepted = view_rect_size(&requested)?;
-
-            // The SDK calls onSize only when the size actually changes; re-sending the current
-            // one makes VSTGUI-based editors rebuild their frame for nothing.
-            let mut current = ViewRect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            if view.getSize(&mut current) == kResultOk
-                && view_rect_size(&current).ok() == Some(accepted)
-            {
-                return Ok(accepted);
-            }
-
-            let resize_result = view.onSize(&mut requested);
-            if resize_result != kResultOk && resize_result != kResultTrue {
-                return Err(Error::Other(format!(
-                    "Plugin rejected editor resize: {resize_result:#x}"
-                )));
-            }
-            Ok(accepted)
-        }
+        self.editor.resize(width, height)
     }
 
     fn set_editor_scale_factor(&mut self, factor: f32) -> Result<bool> {
-        if !factor.is_finite() || factor <= 0.0 {
-            return Err(Error::Other(
-                "editor scale factor must be finite and greater than zero".to_string(),
-            ));
-        }
-        let supported = match self.plugin_view.as_ref() {
-            Some(view) => unsafe { set_view_scale_factor(view, factor)? },
-            None => false,
-        };
-        self.editor_scale_factor = factor;
-        Ok(supported)
+        self.editor.set_scale_factor(factor)
+    }
+
+    fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
+        self.editor.take_resize_request()
     }
 
     fn get_parameter_changes(&self) -> Vec<(u32, f64)> {
@@ -3493,10 +3512,6 @@ impl PluginInternal for PluginImpl {
         Some(crate::plugin::OutputEventConsumer::from_queue(
             self.output_events_owned.clone(),
         ))
-    }
-
-    fn take_editor_resize_request(&self) -> Option<(i32, i32)> {
-        self.editor_resize.lock().ok().and_then(|mut s| s.take())
     }
 
     fn latency_samples(&self) -> u32 {

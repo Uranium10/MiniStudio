@@ -50,8 +50,7 @@ const FORMANT_POLY_BINS: usize = FORMANT_POLY_FFT_SIZE / 2 + 1;
 const FORMANT_POLY_ENVELOPE_RADIUS: usize = 24;
 
 /// Declared latency whenever anything other than an explicitly-forced Mono is in play: the
-/// phase vocoder's own OLA design (see Colorizer, which uses the identical single-ring-cursor
-/// STFT/OLA pattern this reuses) needs a full FFT window of lookback before its first frame
+/// phase vocoder's own OLA design needs a full FFT window of lookback before its first frame
 /// closes. Auto reports this unconditionally - not "whatever the currently active engine costs" -
 /// because the active engine can change mid-stream, and a latency contract that moves around at
 /// runtime is worse than a host's PDC than a small, constant one. Users who need true low latency
@@ -514,7 +513,7 @@ impl FormantShifter {
                 let magnitude = bin.norm();
                 let phase = bin.arg();
                 let expected = 2.0 * PI * k as f32 / FORMANT_POLY_FFT_SIZE as f32 * hop;
-                let deviation = wrap_phase(phase - state.last_phase[k] - expected);
+                let deviation = spectral::wrap_phase(phase - state.last_phase[k] - expected);
                 state.last_phase[k] = phase;
                 let bin_omega = 2.0 * PI * k as f32 / FORMANT_POLY_FFT_SIZE as f32;
                 state.true_omega[k] = bin_omega + deviation / hop;
@@ -561,19 +560,19 @@ impl FormantShifter {
                 let source = state.source_bin[k] as usize;
                 let peak = state.region_peak[k] as usize;
                 let peak_source = state.source_bin[peak] as usize;
-                state.shifted_relative_phase[k] = wrap_phase(state.last_phase[source] - state.last_phase[peak_source]);
+                state.shifted_relative_phase[k] = spectral::wrap_phase(state.last_phase[source] - state.last_phase[peak_source]);
             }
             // Peaks accumulate their own phase; every other bin locks to its region's peak.
             for &peak in &state.peaks.clone() {
-                state.synthesis_phase[peak] = wrap_phase(state.synthesis_phase[peak] + state.shifted_true_omega[peak] * hop);
+                state.synthesis_phase[peak] = spectral::wrap_phase(state.synthesis_phase[peak] + state.shifted_true_omega[peak] * hop);
             }
             if state.peaks.is_empty() && bins > 0 {
-                state.synthesis_phase[0] = wrap_phase(state.synthesis_phase[0] + state.shifted_true_omega[0] * hop);
+                state.synthesis_phase[0] = spectral::wrap_phase(state.synthesis_phase[0] + state.shifted_true_omega[0] * hop);
             }
             for k in 0..bins {
                 let peak = state.region_peak[k] as usize;
                 if peak != k {
-                    state.synthesis_phase[k] = wrap_phase(state.synthesis_phase[peak] + state.shifted_relative_phase[k]);
+                    state.synthesis_phase[k] = spectral::wrap_phase(state.synthesis_phase[peak] + state.shifted_relative_phase[k]);
                 }
             }
             state.synthesis_phase[0] = 0.0;

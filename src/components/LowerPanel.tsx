@@ -7,6 +7,7 @@ import { COLORIZER_NAME } from '../effects/builtinEffects'
 import { useEngine } from '../hooks/useEngine'
 import { hydratePlugin, hydratePluginRef, scanPluginsOnce } from '../plugins/scan'
 import { openPluginEditorWhenReady } from '../plugins/editor'
+import { withPluginEditorModal } from '../plugins/editorModal'
 import { openDevicePreset, saveDevicePreset } from '../io/projectFiles'
 import { automationOptionsForTrack, useProjectStore, type LowerTab, type RackTarget } from '../store/projectStore'
 import { AutomationButton, EditableNumber, Knob, LevelMeter, ParameterAutomationProvider, subscribeAnalyzerFrame, subscribeMeterFrame } from './controls'
@@ -260,11 +261,15 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
   const showToast = useProjectStore((state) => state.showToast)
   const focused = useProjectStore((state) => state.focusedEffectId === effect.id)
   const engine = useEngine()
-  const setParam = (param: string, value: number) => { update(target, effect.id, { [param]: value }); engine.setEffectParam(effect.id, param, value) }
+  const setParam = (param: string, value: number) => {
+    update(target, effect.id, { [param]: value })
+    // Quality changes Colorizer's fixed latency. The graph signature owns this
+    // transition so PDC and the replacement DSP instance change atomically.
+    if (effect.type === 'builtin:resonator' && param === 'quality') return
+    engine.setEffectParam(effect.id, param, value)
+  }
   const toggleEffect = () => {
-    const bypassed = !effect.bypassed
     toggle(target, effect.id)
-    engine.setEffectBypass(effect.id, bypassed)
   }
   const automationItems = useCallback((parameterId: string | undefined, label: string, value: number): MenuItem[] => {
     if (target.kind !== 'track') return [{ kind: 'item', label: '오토메이션은 트랙 인서트에서만 지원됩니다.', disabled: true, run: () => showToast('오토메이션 레인은 트랙 이펙트에서 추가할 수 있습니다.') }]
@@ -277,14 +282,17 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
   }
   const savePreset = () => {
     void (async () => {
-      const state = effect.plugin ? await engine.savePluginState('effect', effect.id) : undefined
-      const path = await saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: deviceName(effect.type, effect.plugin), deviceType: effect.type, pluginUid: effect.plugin?.uid, params: { ...effect.params }, state })
+      const save = async () => {
+        const state = effect.plugin ? await engine.savePluginState('effect', effect.id) : undefined
+        return saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: deviceName(effect.type, effect.plugin), deviceType: effect.type, pluginUid: effect.plugin?.uid, params: { ...effect.params }, state })
+      }
+      const path = effect.plugin ? await withPluginEditorModal(engine, effect.id, save) : await save()
       if (path) showToast(`${deviceName(effect.type, effect.plugin)} 프리셋을 저장했습니다.`)
     })().catch((error) => showToast(`프리셋 저장 실패: ${String(error)}`))
   }
   const loadPreset = () => {
     void (async () => {
-      const preset = await openDevicePreset()
+      const preset = effect.plugin ? await withPluginEditorModal(engine, effect.id, openDevicePreset) : await openDevicePreset()
       if (!preset) return
       if (preset.deviceType !== effect.type || (effect.plugin && preset.pluginUid !== effect.plugin.uid)) throw new Error('현재 디바이스와 다른 종류의 프리셋입니다.')
       if (effect.plugin && preset.state) await engine.loadPluginState('effect', effect.id, preset.state)
@@ -299,11 +307,11 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
     // Only the grip starts reordering. Window-level pointer tracking keeps the
     // gesture alive outside this card and avoids Tauri's native file-drag path.
     <ParameterAutomationProvider items={automationItems}>
-    <article className={`device-card ${effect.type === 'builtin:multiband-compressor' ? 'multiband-card' : ''} ${effect.type === 'builtin:eq8' ? 'eq8-card' : ''} ${effect.type === 'builtin:mastering-limiter' ? 'limiter-card' : ''} ${effect.type === 'builtin:vocoder' ? 'vocoder-card' : ''} ${effect.type === 'builtin:clipper' ? 'clipper-card' : ''} ${effect.type === 'builtin:upward-compressor' ? 'upward-card' : ''} ${effect.type === 'builtin:roboter' ? 'roboter-card' : ''} ${effect.type === 'builtin:resonator' ? 'colorizer-card' : ''} ${effect.bypassed ? 'bypassed' : ''} ${focused ? 'effect-focused' : ''}`} data-effect-index={index} data-effect-id={effect.id} tabIndex={-1} onContextMenu={onContextMenu}>
+    <article className={`device-card ${effect.type === 'builtin:multiband-compressor' ? 'multiband-card' : ''} ${effect.type === 'builtin:eq8' ? 'eq8-card' : ''} ${effect.type === 'builtin:mastering-limiter' ? 'limiter-card' : ''} ${effect.type === 'builtin:vocoder' ? 'vocoder-card' : ''} ${effect.type === 'builtin:clipper' ? 'clipper-card' : ''} ${effect.type === 'builtin:compressor' ? 'compressor-card' : ''} ${effect.type === 'builtin:upward-compressor' ? 'upward-card' : ''} ${effect.type === 'builtin:transient-shaper' ? 'transient-card' : ''} ${effect.type === 'builtin:roboter' ? 'roboter-card' : ''} ${effect.type === 'builtin:resonator' ? 'colorizer-card' : ''} ${effect.bypassed ? 'bypassed' : ''} ${focused ? 'effect-focused' : ''}`} data-effect-category={effectCategory(effect.type)} data-effect-index={index} data-effect-id={effect.id} tabIndex={-1} onContextMenu={onContextMenu}>
       <header className="device-card-header"><div className="device-header-main"><span className="device-grip" onPointerDown={(event) => beginPointerReorder(event, { itemSelector: '[data-effect-index]', indexAttribute: 'data-effect-index', axis: 'horizontal', scrollSelector: '.device-chain', onCommit: onReorder })} title="드래그하여 체인 순서 변경"><GripVertical size={13} /></span><button className={effect.bypassed ? '' : 'powered'} title={effect.bypassed ? '전원 켜기' : '전원 끄기'} onClick={toggleEffect}><CirclePower size={13} /></button><strong title={effect.plugin ? '더블클릭하여 플러그인 창 열기' : undefined} onDoubleClick={(event) => { event.stopPropagation(); if (effect.plugin) openEditor() }}>{deviceName(effect.type, effect.plugin)}</strong><span>{effect.plugin?.format.toUpperCase() ?? effect.type.replace('builtin:', '').toUpperCase()}</span><div className="device-header-actions"><button onClick={() => setCollapsed(true)} title="접기"><Minus size={12} /></button><button className="device-close" onClick={() => remove(target, effect.id)} title="이펙트 제거"><X size={13} /></button></div></div><div className="device-header-sub"><button className={`device-bypass ${effect.bypassed ? 'active' : ''}`} onClick={toggleEffect} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setBypassMenu({ x: event.clientX, y: event.clientY }) }}>BYPASS {effect.bypassed ? 'ON' : 'OFF'}</button><button className="device-preset-button" title="프리셋 저장" onClick={savePreset}><Save size={11} /><span>SAVE</span></button><button className="device-preset-button" title="프리셋 불러오기" onClick={loadPreset}><FolderOpen size={11} /><span>LOAD</span></button>{effect.plugin && target.kind === 'track' && <DeviceAutomationModes trackId={target.id} targetKind="effect" targetId={effect.id} />}{hasSidechain && <SidechainControl effect={effect} target={target} />}{effect.plugin && effect.plugin.hasEditor !== false && <button className="device-editor-button" title="플러그인 창 열기" onClick={openEditor}><Piano size={12} /><span>EDIT</span></button>}</div></header>
       <div className="device-body">
         {(effect.type === 'builtin:eq' || effect.type === 'builtin:eq8') && <EqPanel effectId={effect.id} params={effect.params} bypassed={effect.bypassed} bandCount={effect.type === 'builtin:eq8' ? 8 : 4} setParam={setParam} />}
-        {effect.type === 'builtin:compressor' && <><div className="parameter-row"><Knob value={effect.params.threshold ?? -18} min={-60} max={0} step={0.1} defaultValue={-18} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={effect.params.ratio ?? 3} min={1} max={20} step={0.1} defaultValue={3} label="RATIO" format={(v) => `${v.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={(effect.params.attack ?? .01) * 1000} min={1} max={500} step={1} defaultValue={10} label="ATTACK" format={msFormat} onChange={(value) => setParam('attack', value / 1000)} /><Knob value={(effect.params.release ?? .2) * 1000} min={10} max={1000} step={1} defaultValue={200} label="RELEASE" format={msFormat} onChange={(value) => setParam('release', value / 1000)} /></div><div className="parameter-row"><Knob value={effect.params.knee ?? 12} min={0} max={24} step={0.5} defaultValue={12} label="KNEE" format={dbFormat} onChange={(value) => setParam('knee', value)} /><Knob value={effect.params.makeupDb ?? 0} min={-12} max={24} step={0.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam('makeupDb', value)} /></div></>}
+        {effect.type === 'builtin:compressor' && <CompressorPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:multiband-compressor' && <MultibandCompressorPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:utility' && <UtilityPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:distortion' && <DistortionPanel effectId={effect.id} params={effect.params} bypassed={effect.bypassed} setParam={setParam} />}
@@ -312,10 +320,10 @@ function DeviceCard({ effect, target, index, onReorder, onContextMenu }: { effec
         {effect.type === 'builtin:vocoder' && <VocoderPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:lfo-tremolo' && <TremoloPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:clipper' && <ClipperPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
-        {effect.type === 'builtin:upward-compressor' && <UpwardCompressorPanel params={effect.params} setParam={setParam} />}
+        {effect.type === 'builtin:upward-compressor' && <UpwardCompressorPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:transient-shaper' && <TransientShaperPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:roboter' && <RoboterPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
-        {effect.type === 'builtin:resonator' && <ColorizerPanel effectId={effect.id} params={effect.params} setParam={setParam} />}
+        {effect.type === 'builtin:resonator' && <ColorizerPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:formant-shifter' && <FormantShifterPanel params={effect.params} setParam={setParam} />}
         {effect.type === 'builtin:delay' && <><div className="delay-display"><i /><i /><i /><i /><i /></div><div className="parameter-row"><Knob value={effect.params.time ?? .25} min={.01} max={2} step={.01} defaultValue={.25} label="TIME" format={(v) => `${v.toFixed(2)} s`} onChange={(value) => setParam('time', value)} /><Knob value={effect.params.feedback ?? .3} min={0} max={.95} step={.01} defaultValue={.3} label="FEEDBACK" format={percentFormat} onChange={(value) => setParam('feedback', value)} /><Knob value={effect.params.damping ?? .35} min={.01} max={1} step={.01} defaultValue={.35} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div><ToggleRow label="PING PONG" on={(effect.params.pingPong ?? 0) >= 0.5} onToggle={(on) => setParam('pingPong', on ? 1 : 0)} /></>}
         {effect.type === 'builtin:reverb' && <><div className="reverb-display"><span /><span /><span /><span /></div><div className="parameter-row"><Knob value={effect.params.decaySec ?? 2.4} min={.1} max={20} step={.1} defaultValue={2.4} label="DECAY" format={(v) => `${v.toFixed(1)} s`} onChange={(value) => setParam('decaySec', value)} /><Knob value={effect.params.damping ?? .4} min={0} max={1} step={.01} defaultValue={.4} label="DAMPING" format={percentFormat} onChange={(value) => setParam('damping', value)} /><Knob value={effect.params.width ?? .8} min={0} max={1} step={.01} defaultValue={.8} label="WIDTH" format={percentFormat} onChange={(value) => setParam('width', value)} /><Knob value={effect.params.diffusion ?? .7} min={0} max={.92} step={.01} defaultValue={.7} label="DIFFUSE" format={percentFormat} onChange={(value) => setParam('diffusion', value)} /><Knob value={effect.params.mix ?? .25} min={0} max={1} step={.01} defaultValue={.25} label="DRY / WET" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div></>}
@@ -363,19 +371,22 @@ function TransientShaperPanel({ params, setParam }: { params: Record<string, num
   const speed = params.speed ?? .5
   const updatePad = (event: React.PointerEvent<HTMLDivElement>) => {
     const bounds = event.currentTarget.getBoundingClientRect()
-    setParam('thresholdDb', Math.max(-72, Math.min(0, -72 + (event.clientX - bounds.left) / Math.max(1, bounds.width) * 72)))
-    setParam('speed', Math.max(0, Math.min(1, 1 - (event.clientY - bounds.top) / Math.max(1, bounds.height))))
+    setParam('speed', Math.max(0, Math.min(1, (event.clientX - bounds.left) / Math.max(1, bounds.width))))
+    setParam('thresholdDb', Math.max(-72, Math.min(0, -(event.clientY - bounds.top) / Math.max(1, bounds.height) * 72)))
   }
   const down = (event: React.PointerEvent<HTMLDivElement>) => { event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId); updatePad(event) }
   const up = (event: React.PointerEvent<HTMLDivElement>) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId) }
-  const path = `M 4 58 C 24 58, 33 ${58 - attack * 22}, 48 ${58 - attack * 30} C 60 ${58 + attack * 7}, 76 ${58 - sustain * 16}, 112 ${58 - sustain * 16}`
+  const peakX = 28 + (1 - speed) * 25
+  const baseline = 61
+  const thresholdY = 7 + (-threshold / 72) * 57
+  const path = `M 4 ${baseline} C ${peakX * .45} ${baseline}, ${peakX * .72} ${baseline - attack * 25}, ${peakX} ${baseline - attack * 32} C ${peakX + 10 + (1 - speed) * 13} ${baseline + attack * 8}, ${82 + (1 - speed) * 9} ${baseline - sustain * 17}, 112 ${baseline - sustain * 17}`
   return <div className="transient-panel">
-    <div className="transient-display"><svg viewBox="0 0 116 76" preserveAspectRatio="none"><line x1="4" y1="58" x2="112" y2="58" /><path d={path} /></svg><span>ENVELOPE CONTOUR</span></div>
+    <div className="transient-display"><svg viewBox="0 0 116 76" preserveAspectRatio="none"><line className="baseline" x1="4" y1={baseline} x2="112" y2={baseline} /><line className="detector-threshold" x1="4" y1={thresholdY} x2="112" y2={thresholdY} /><path d={path} /></svg><span>ENVELOPE CONTOUR</span><b>{threshold.toFixed(1)} dB · {Math.round(speed * 100)}%</b></div>
     <div className="transient-main-controls">
       <Knob parameterId="attack" value={attack} min={-1} max={1} step={.01} defaultValue={0} label="ATTACK" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('attack', value)} />
       <Knob parameterId="sustain" value={sustain} min={-1} max={1} step={.01} defaultValue={0} label="SUSTAIN" format={(value) => `${value >= 0 ? '+' : ''}${Math.round(value * 100)}%`} onChange={(value) => setParam('sustain', value)} />
     </div>
-    <div className="transient-pad-wrap"><b>DETECTOR</b><div className="transient-pad" role="application" aria-label="Threshold and speed XY control" onPointerDown={down} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updatePad(event) }} onPointerUp={up} onPointerCancel={up}><i style={{ left: `${(threshold + 72) / 72 * 100}%`, top: `${(1 - speed) * 100}%` }} /></div><div><span>THRESH {threshold.toFixed(1)} dB</span><span>SPEED {Math.round(speed * 100)}%</span></div></div>
+    <div className="transient-pad-wrap"><b>DETECTOR · X SPEED / Y THRESHOLD</b><div className="transient-pad" role="application" aria-label="Speed and threshold XY control" onPointerDown={down} onPointerMove={(event) => { if (event.currentTarget.hasPointerCapture(event.pointerId)) updatePad(event) }} onPointerUp={up} onPointerCancel={up}><i style={{ left: `${speed * 100}%`, top: `${-threshold / 72 * 100}%` }} /></div><div><span>{threshold.toFixed(1)} dB</span><span>{Math.round(speed * 100)}%</span></div></div>
     <AutomationButton parameterId="clip" label="Clip" value={params.clip ?? 0} className={`transient-clip ${(params.clip ?? 0) >= .5 ? 'active' : ''}`} onClick={() => setParam('clip', (params.clip ?? 0) >= .5 ? 0 : 1)}><CirclePower size={13} /> CLIP</AutomationButton>
   </div>
 }
@@ -454,14 +465,56 @@ function ClipperFlowDisplay({ effectId }: { effectId: string }) {
   return <canvas ref={ref} className="clipper-flow" width="340" height="116" />
 }
 
-function UpwardCompressorPanel({ params, setParam }: { params: Record<string, number>; setParam(param: string, value: number): void }) {
+function CompressorPanel({ effectId, params, setParam }: { effectId: string; params: Record<string, number>; setParam(param: string, value: number): void }) {
+  const threshold = params.threshold ?? -18; const ratio = params.ratio ?? 3; const knee = params.knee ?? 12
+  return <div className="upward-panel compressor-panel">
+    <DynamicsGraph effectId={effectId} mode="downward" threshold={threshold} ratio={ratio} knee={knee} headline="GAIN REDUCTION" value={`${ratio.toFixed(1)}:1`} />
+    <div className="upward-controls compressor-controls parameter-row"><Knob value={threshold} min={-60} max={0} step={.1} defaultValue={-18} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={ratio} min={1} max={20} step={.1} defaultValue={3} label="RATIO" format={(value) => `${value.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={(params.attack ?? .01) * 1000} min={1} max={500} step={1} scale="log" defaultValue={10} label="ATTACK" format={msFormat} onChange={(value) => setParam('attack', value / 1000)} /><Knob value={(params.release ?? .2) * 1000} min={10} max={1000} step={1} scale="log" defaultValue={200} label="RELEASE" format={msFormat} onChange={(value) => setParam('release', value / 1000)} /><Knob value={knee} min={0} max={24} step={.5} defaultValue={12} label="KNEE" format={dbFormat} onChange={(value) => setParam('knee', value)} /><Knob value={params.makeupDb ?? 0} min={-12} max={24} step={.1} defaultValue={0} label="MAKEUP" format={dbFormat} onChange={(value) => setParam('makeupDb', value)} /></div>
+  </div>
+}
+
+function UpwardCompressorPanel({ effectId, params, setParam }: { effectId: string; params: Record<string, number>; setParam(param: string, value: number): void }) {
   const threshold = params.threshold ?? -32; const ratio = params.ratio ?? 3; const range = params.rangeDb ?? 12
-  const points = Array.from({ length: 73 }, (_, index) => { const input = -72 + index; const boost = input < threshold ? Math.min(range, (threshold - input) * (1 - 1 / ratio)) : 0; return `${index / 72 * 286},${94 - (input + boost + 72) / 72 * 84}` }).join(' ')
-  const thresholdX = (threshold + 72) / 72 * 286
   return <div className="upward-panel">
-    <div className="upward-graph"><svg viewBox="0 0 286 104" preserveAspectRatio="none"><defs><linearGradient id="upwardArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#6de6c0" stopOpacity=".42" /><stop offset="1" stopColor="#328c7d" stopOpacity=".03" /></linearGradient></defs><path className="unity" d="M0 94 L286 10" /><path className="area" d={`M0 94 L${points.replaceAll(' ', ' L')} L286 94 Z`} /><polyline points={points} /><line className="threshold" x1={thresholdX} x2={thresholdX} y1="7" y2="97" /><circle cx={thresholdX} cy={94 - (threshold + 72) / 72 * 84} r="3.5" /></svg><span>UPWARD RANGE</span><b>{dbFormat(range)}</b><small>{dbFormat(threshold)} THRESHOLD</small></div>
+    <DynamicsGraph effectId={effectId} mode="upward" threshold={threshold} ratio={ratio} range={range} headline="UPWARD RANGE" value={dbFormat(range)} />
     <div className="upward-controls parameter-row"><Knob value={threshold} min={-72} max={-6} step={.1} defaultValue={-32} label="THRESH" format={dbFormat} onChange={(value) => setParam('threshold', value)} /><Knob value={ratio} min={1} max={20} step={.1} defaultValue={3} label="RATIO" format={(value) => `${value.toFixed(1)}:1`} onChange={(value) => setParam('ratio', value)} /><Knob value={params.attackMs ?? 35} min={.1} max={500} step={.1} scale="log" defaultValue={35} label="ATTACK" format={msFormat} onChange={(value) => setParam('attackMs', value)} /><Knob value={params.releaseMs ?? 240} min={5} max={2000} step={1} scale="log" defaultValue={240} label="RELEASE" format={msFormat} onChange={(value) => setParam('releaseMs', value)} /><Knob value={range} min={0} max={36} step={.1} defaultValue={12} label="RANGE" format={dbFormat} onChange={(value) => setParam('rangeDb', value)} /><Knob value={params.stereoLink ?? 1} min={0} max={1} step={.01} defaultValue={1} label="LINK" format={percentFormat} onChange={(value) => setParam('stereoLink', value)} /><Knob value={params.mix ?? 1} min={0} max={1} step={.01} defaultValue={1} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /><Knob value={params.outputDb ?? 0} min={-24} max={24} step={.1} defaultValue={0} label="OUTPUT" format={dbFormat} onChange={(value) => setParam('outputDb', value)} /></div>
   </div>
+}
+
+function DynamicsGraph({ effectId, mode, threshold, ratio, knee = 0, range = 0, headline, value }: { effectId: string; mode: 'downward' | 'upward'; threshold: number; ratio: number; knee?: number; range?: number; headline: string; value: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const engine = useEngine()
+  const outputAt = (input: number) => {
+    if (mode === 'upward') return input + (input < threshold ? Math.min(range, (threshold - input) * (1 - 1 / ratio)) : 0)
+    const delta = input - threshold
+    const reduction = knee > 0 && Math.abs(delta) < knee / 2 ? (1 / ratio - 1) * (delta + knee / 2) ** 2 / (2 * knee) : delta > 0 ? (1 / ratio - 1) * delta : 0
+    return input + reduction
+  }
+  const points = Array.from({ length: 73 }, (_, index) => { const input = -72 + index; return `${index / 72 * 286},${94 - (outputAt(input) + 72) / 72 * 84}` }).join(' ')
+  const thresholdX = (threshold + 72) / 72 * 286
+  const thresholdY = 94 - (outputAt(threshold) + 72) / 72 * 84
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current; if (!canvas) return
+    const ratioPx = window.devicePixelRatio || 1; const width = Math.max(1, Math.round(canvas.clientWidth * ratioPx)); const height = Math.max(1, Math.round(canvas.clientHeight * ratioPx))
+    if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height }
+    const context = canvas.getContext('2d'); if (!context) return
+    const values = engine.getEffectSpectrum(effectId); const count = Math.floor(values.length / 2)
+    context.clearRect(0, 0, width, height)
+    const yAt = (amplitude: number) => height - Math.max(0, Math.min(1, (20 * Math.log10(Math.max(1e-6, amplitude)) + 72) / 72)) * height
+    const drawArea = (offset: number, stroke: string, top: string, bottom: string) => {
+      context.beginPath(); context.moveTo(0, height)
+      for (let index = 0; index < count; index += 1) context.lineTo(index / Math.max(1, count - 1) * width, yAt(values[offset + index] ?? 0))
+      context.lineTo(width, height); context.closePath()
+      const fill = context.createLinearGradient(0, 0, 0, height); fill.addColorStop(0, top); fill.addColorStop(1, bottom); context.fillStyle = fill; context.fill()
+      context.beginPath()
+      for (let index = 0; index < count; index += 1) { const x = index / Math.max(1, count - 1) * width; const y = yAt(values[offset + index] ?? 0); if (index) context.lineTo(x, y); else context.moveTo(x, y) }
+      context.strokeStyle = stroke; context.lineWidth = ratioPx; context.stroke()
+    }
+    drawArea(0, '#6d8794aa', '#6d87942a', '#33455005')
+    drawArea(count, mode === 'upward' ? '#6ce5bfcc' : '#e5be63cc', mode === 'upward' ? '#6ce5bf30' : '#e5be6330', '#17231f05')
+  }, [effectId, engine, mode])
+  useEffect(() => { draw(); return subscribeAnalyzerFrame(draw) }, [draw])
+  return <div className={`upward-graph dynamics-graph ${mode}`}><canvas ref={canvasRef} /><svg viewBox="0 0 286 104" preserveAspectRatio="none"><path className="unity" d="M0 94 L286 10" /><path className="area" d={`M0 94 L${points.replaceAll(' ', ' L')} L286 94 Z`} /><polyline points={points} /><line className="threshold" x1={thresholdX} x2={thresholdX} y1="7" y2="97" /><circle cx={thresholdX} cy={thresholdY} r="3.5" /></svg><span>{headline}</span><b>{value}</b><small>{dbFormat(threshold)} THRESHOLD · LIVE I/O</small></div>
 }
 
 const semitoneFormat = (value: number) => `${value > 0 ? '+' : ''}${value.toFixed(1)} st`
@@ -522,8 +575,8 @@ const COLORIZER_SCALES = [
 ] as const
 const COLORIZER_CUSTOM_SCALE = COLORIZER_SCALES.length
 
-function ColorizerPanel({ effectId, params, setParam }: { effectId: string; params: Record<string, number>; setParam(param: string, value: number): void }) {
-  const engine = useEngine(); const canvasRef = useRef<HTMLCanvasElement>(null)
+function ColorizerPanel({ params, setParam }: { params: Record<string, number>; setParam(param: string, value: number): void }) {
+  const quality = Math.round(params.quality ?? 0); const mapMode = quality >= 1
   const midi = (params.midi ?? 0) >= .5; const key = Math.max(0, Math.min(11, Math.round(params.key ?? 0))); const scale = Math.max(0, Math.min(COLORIZER_CUSTOM_SCALE, Math.round(params.scale ?? 0)))
   const applyPreset = (nextKey: number, nextScale: number) => {
     setParam('key', nextKey); setParam('scale', nextScale)
@@ -532,42 +585,19 @@ function ColorizerPanel({ effectId, params, setParam }: { effectId: string; para
     const enabled = new Set<number>(preset[1].map((interval) => (interval + nextKey) % 12))
     for (let pitch = 0; pitch < 12; pitch += 1) setParam(`pitch${pitch}`, enabled.has(pitch) ? 1 : 0)
   }
-  useEffect(() => {
-    const draw = () => drawColorizerSpectrum(canvasRef.current, engine.getEffectSpectrum(effectId))
-    draw(); return subscribeAnalyzerFrame(draw)
-  }, [effectId, engine])
   return <div className="colorizer-panel">
-    <div className="colorizer-spectrum"><canvas ref={canvasRef} /><span>40</span><span>120</span><span>500</span><span>2k</span><span>12k</span><b>HARMONIC MASK</b></div>
     <div className="colorizer-source">
-      <div className="colorizer-selects"><label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
+      <div className="colorizer-selects"><label>ENGINE<select value={quality} onChange={(event) => setParam('quality', Number(event.target.value))}><option value="0">Live</option><option value="1">Map</option></select></label><label>KEY<select value={key} disabled={midi} onChange={(event) => applyPreset(Number(event.target.value), scale)}>{COLORIZER_NOTES.map((note, index) => <option key={note} value={index}>{note}</option>)}</select></label><label>SCALE<select value={scale} disabled={midi} onChange={(event) => applyPreset(key, Number(event.target.value))}>{COLORIZER_SCALES.map(([name], index) => <option key={name} value={index}>{name}</option>)}<option value={COLORIZER_CUSTOM_SCALE}>Custom</option></select></label><button className={midi ? 'active' : ''} onClick={() => setParam('midi', midi ? 0 : 1)}>MIDI</button></div>
       <PitchClassKeyboard disabled={midi} active={COLORIZER_NOTES.map((_, pitch) => (params[`pitch${pitch}`] ?? 0) >= .5)} onToggle={(pitch) => { setParam(`pitch${pitch}`, (params[`pitch${pitch}`] ?? 0) >= .5 ? 0 : 1); setParam('scale', COLORIZER_CUSTOM_SCALE) }} />
       {midi && <div className="colorizer-midi-note">MIDI ROUTING NOT AVAILABLE YET · WAITING FOR NOTES</div>}
     </div>
-    <div className="colorizer-controls parameter-row"><Knob value={params.resonance ?? .62} min={0} max={1} step={.01} defaultValue={.62} label="RESONANCE" format={percentFormat} onChange={(value) => setParam('resonance', value)} /><Knob value={params.decay ?? .45} min={0} max={1} step={.01} defaultValue={.45} label="DECAY" format={percentFormat} onChange={(value) => setParam('decay', value)} /><Knob value={params.depth ?? .82} min={0} max={1} step={.01} defaultValue={.82} label="DEPTH" format={percentFormat} onChange={(value) => setParam('depth', value)} /><Knob value={params.mix ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div>
+    <div className="colorizer-controls parameter-row"><Knob value={params.resonance ?? .62} min={0} max={1} step={.01} defaultValue={.62} label={mapMode ? 'COLOR' : 'RESONANCE'} format={percentFormat} onChange={(value) => setParam('resonance', value)} />{mapMode ? <Knob value={params.transient ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="TRANSIENT" format={percentFormat} onChange={(value) => setParam('transient', value)} /> : <Knob value={params.decay ?? .45} min={0} max={1} step={.01} defaultValue={.45} label="DECAY" format={percentFormat} onChange={(value) => setParam('decay', value)} />}<Knob value={params.depth ?? .82} min={0} max={1} step={.01} defaultValue={.82} label={mapMode ? 'MAP' : 'DEPTH'} format={percentFormat} onChange={(value) => setParam('depth', value)} /><Knob value={params.mix ?? .72} min={0} max={1} step={.01} defaultValue={.72} label="MIX" format={percentFormat} onChange={(value) => setParam('mix', value)} /></div>
   </div>
 }
 
 function PitchClassKeyboard({ active, disabled, onToggle }: { active: boolean[]; disabled?: boolean; onToggle(pitch: number): void }) {
   const whites = [0, 2, 4, 5, 7, 9, 11]; const blacks = [[1, 10.7], [3, 25], [6, 53.6], [8, 67.9], [10, 82.1]] as const
   return <div className={`pitch-class-keyboard ${disabled ? 'disabled' : ''}`}>{whites.map((pitch, index) => <button key={pitch} className={`white ${active[pitch] ? 'active' : ''}`} style={{ left: `${index * (100 / 7)}%`, width: `${100 / 7}%` }} disabled={disabled} aria-pressed={active[pitch]} title={COLORIZER_NOTES[pitch]} onClick={() => onToggle(pitch)}><span>{COLORIZER_NOTES[pitch]}</span></button>)}{blacks.map(([pitch, left]) => <button key={pitch} className={`black ${active[pitch] ? 'active' : ''}`} style={{ left: `${left}%` }} disabled={disabled} aria-pressed={active[pitch]} title={COLORIZER_NOTES[pitch]} onClick={() => onToggle(pitch)}><span>{COLORIZER_NOTES[pitch]}</span></button>)}</div>
-}
-
-function drawColorizerSpectrum(canvas: HTMLCanvasElement | null, values: readonly number[]): void {
-  if (!canvas) return
-  const ratio = window.devicePixelRatio || 1; const width = Math.max(1, Math.round(canvas.clientWidth * ratio)); const height = Math.max(1, Math.round(canvas.clientHeight * ratio))
-  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height }
-  const context = canvas.getContext('2d'); if (!context) return
-  context.clearRect(0, 0, width, height); context.lineWidth = ratio
-  context.strokeStyle = '#29404b'; context.globalAlpha = .75
-  for (let row = 1; row < 4; row += 1) { const y = height * row / 4; context.beginPath(); context.moveTo(0, y); context.lineTo(width, y); context.stroke() }
-  for (let column = 1; column < 6; column += 1) { const x = width * column / 6; context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke() }
-  context.globalAlpha = 1; const count = 24
-  context.beginPath(); context.moveTo(0, height)
-  for (let index = 0; index < count; index += 1) { const x = index / (count - 1) * width; const y = height * (1 - Math.min(1, Math.max(0, values[index] ?? 0))); context.lineTo(x, y) }
-  context.lineTo(width, height); context.closePath(); const fill = context.createLinearGradient(0, 0, 0, height); fill.addColorStop(0, '#76e3ff80'); fill.addColorStop(1, '#327f9b08'); context.fillStyle = fill; context.fill()
-  context.beginPath()
-  for (let index = 0; index < count; index += 1) { const x = index / (count - 1) * width; const y = height * (1 - Math.min(1, Math.max(0, values[count + index] ?? 0)) * .88); if (index) context.lineTo(x, y); else context.moveTo(x, y) }
-  context.strokeStyle = '#ffd36a'; context.lineWidth = 1.6 * ratio; context.shadowColor = '#ffbd3b'; context.shadowBlur = 5 * ratio; context.stroke(); context.shadowBlur = 0
 }
 
 const ROBOTER_ACTIVE_ROLES = [[], [0], [1, 2], [0, 1, 2], [1, 2, 3, 4], [0, 1, 2, 3, 4]]
@@ -799,14 +829,17 @@ function InstrumentCard({ track }: { track: Track }) {
   }
   const savePreset = () => {
     void (async () => {
-      const state = instrument.plugin ? await engine.savePluginState('instrument', track.id) : undefined
-      const path = await saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: instrument.plugin?.name ?? 'DefaultSynth', deviceType: instrument.type, pluginUid: instrument.plugin?.uid, params: { ...instrument.params }, state })
+      const save = async () => {
+        const state = instrument.plugin ? await engine.savePluginState('instrument', track.id) : undefined
+        return saveDevicePreset({ format: 'ministudio-device-preset', version: 1, name: instrument.plugin?.name ?? 'DefaultSynth', deviceType: instrument.type, pluginUid: instrument.plugin?.uid, params: { ...instrument.params }, state })
+      }
+      const path = instrument.plugin ? await withPluginEditorModal(engine, track.id, save) : await save()
       if (path) useProjectStore.getState().showToast(`${instrument.plugin?.name ?? 'DefaultSynth'} 프리셋을 저장했습니다.`)
     })().catch((error) => useProjectStore.getState().showToast(`프리셋 저장 실패: ${String(error)}`))
   }
   const loadPreset = () => {
     void (async () => {
-      const preset = await openDevicePreset()
+      const preset = instrument.plugin ? await withPluginEditorModal(engine, track.id, openDevicePreset) : await openDevicePreset()
       if (!preset) return
       if (preset.deviceType !== instrument.type || (instrument.plugin && preset.pluginUid !== instrument.plugin.uid)) throw new Error('현재 악기와 다른 종류의 프리셋입니다.')
       if (instrument.plugin && preset.state) await engine.loadPluginState('instrument', track.id, preset.state)
@@ -1389,11 +1422,13 @@ function focusAutomationLane(trackId: string, laneId: string): void {
 }
 
 function DeviceAutomationModes({ trackId, targetKind, targetId }: { trackId: string; targetKind: 'effect' | 'instrument'; targetId: string }) {
-  const allLanes = useProjectStore((state) => state.project.tracks.find((track) => track.id === trackId)?.automationLanes)
+  const track = useProjectStore((state) => state.project.tracks.find((candidate) => candidate.id === trackId))
+  const allLanes = track?.automationLanes
   const lanes = useMemo(() => (allLanes ?? []).filter((lane) => lane.targetKind === targetKind && lane.targetId === targetId), [allLanes, targetId, targetKind])
-  const setMode = useProjectStore((state) => state.setAutomationLaneMode)
-  const active = lanes.length ? lanes[0]?.mode ?? 'read' : 'off'
-  return <div className="device-automation-modes" role="group" aria-label="플러그인 오토메이션 모드" title={lanes.length ? `${lanes.length}개 오토메이션 레인` : '연결된 오토메이션 레인 없음'}>{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${active === mode ? 'active' : ''}`} disabled={!lanes.length} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => lanes.forEach((lane) => setMode(trackId, lane.id, mode))} />)}</div>
+  const setMode = useProjectStore((state) => state.setDeviceAutomationMode)
+  const deviceMode = targetKind === 'instrument' ? track?.instrument?.automationMode : track?.effects.find((effect) => effect.id === targetId)?.automationMode
+  const active = deviceMode ?? lanes[0]?.mode ?? 'off'
+  return <div className="device-automation-modes" role="group" aria-label="플러그인 오토메이션 모드" title={lanes.length ? `${lanes.length}개 오토메이션 레인` : '쓰기/래치 후 움직인 파라미터의 레인을 자동 생성합니다.'}>{(['off', 'write', 'read', 'latch'] as const).map((mode) => <button key={mode} className={`${mode} ${active === mode ? 'active' : ''}`} aria-label={{ off: '오토메이션 끄기', write: '오토메이션 쓰기', read: '오토메이션 읽기', latch: '오토메이션 래치' }[mode]} onClick={() => setMode(trackId, targetKind, targetId, mode)} />)}</div>
 }
 
 function parameterLabelsMatch(control: string, option: string): boolean {
@@ -1413,9 +1448,12 @@ const EFFECT_CATALOG: EffectCatalogEntry[] = [
   { type: 'builtin:distortion', description: '3-band Tube · Tape · Saturation · Exciter', category: 'Color & Drive' }, { type: 'builtin:waveshaper', description: '3-mode · 4× oversampled shaper', category: 'Color & Drive' }, { type: 'builtin:disperser', description: 'Cascaded all-pass phase dispersion', category: 'Color & Drive' },
   { type: 'builtin:lfo-tremolo', description: 'Volume · pan LFO modulation', category: 'Modulation' }, { type: 'builtin:vocoder', description: '24-band carrier / modulator vocoder', category: 'Modulation' },
   { type: 'builtin:roboter', description: 'Auto-key pitch correction · 5-voice harmonizer', category: 'Pitch & Vocal' },
-  { type: 'builtin:resonator', description: 'Harmonic STFT resonator · scale mask', category: 'Pitch & Vocal' },
+  { type: 'builtin:resonator', description: 'Live modal colour · polyphonic spectral pitch map', category: 'Pitch & Vocal' },
   { type: 'builtin:formant-shifter', description: 'PSOLA mono / phase-vocoder poly, auto-selected', category: 'Pitch & Vocal' },
   { type: 'builtin:delay', description: 'Stereo echo', category: 'Time & Space' }, { type: 'builtin:reverb', description: 'FDN room reverb', category: 'Time & Space' },
   { type: 'builtin:utility', description: 'Stereo utility · bass mono', category: 'Utility & Other' },
 ]
+function effectCategory(type: EffectType): string {
+  return EFFECT_CATALOG.find((effect) => effect.type === type)?.category ?? 'External'
+}
 function deviceName(type: string, plugin?: ExternalPluginRef): string { return plugin?.name ?? ({ 'builtin:eq': '4band-EQ', 'builtin:eq8': '8band-EQ', 'builtin:utility': 'Utility', 'builtin:compressor': 'Compressor', 'builtin:upward-compressor': 'Upward Compressor', 'builtin:transient-shaper': 'Transient Shaper', 'builtin:multiband-compressor': 'Multiband Compressor', 'builtin:clipper': 'Clipper', 'builtin:distortion': 'Distortion', 'builtin:disperser': 'Disperser', 'builtin:roboter': 'Roboter', 'builtin:resonator': COLORIZER_NAME, 'builtin:formant-shifter': 'Formant Shifter', 'builtin:mastering-limiter': 'Mastering Limiter', 'builtin:vocoder': 'Vocoder', 'builtin:lfo-tremolo': 'LFO Tremolo', 'builtin:delay': 'Echo Space', 'builtin:reverb': 'Room Reverb', 'builtin:waveshaper': 'Drive Shaper' } as Record<string, string>)[type] ?? 'External Plug-in' }

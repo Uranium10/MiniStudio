@@ -1448,6 +1448,12 @@ async fn engine_open_plugin_editor(
                 .collect::<Vec<_>>();
             (control, closing)
         };
+        #[cfg(target_os = "windows")]
+        control.set_editor_owner_window(
+            app.get_window("main")
+                .and_then(|window| window.hwnd().ok())
+                .map_or(0, |handle| handle.0 as u64),
+        );
         for (old_id, old_control) in closing {
             let old_instance_id = PluginInstanceId(old_id.clone());
             let old_generation = state
@@ -2033,6 +2039,7 @@ fn engine_set_plugin_editor_host_state(
     target_id: String,
     bypassed: bool,
     automation: u8,
+    app: AppHandle<AppRuntime>,
     state: State<'_, NativeEngineState>,
 ) -> Result<(), EngineError> {
     let control = state
@@ -2046,12 +2053,40 @@ fn engine_set_plugin_editor_host_state(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .contains(&target_id);
+    #[cfg(target_os = "windows")]
+    let owner_window = app
+        .get_window("main")
+        .and_then(|window| window.hwnd().ok())
+        .map_or(0, |handle| handle.0 as u64);
+    #[cfg(not(target_os = "windows"))]
+    let owner_window = 0;
     control.set_editor_state(audio::dsp::PluginEditorState {
         bypassed,
         automation: automation.min(3),
         pinned,
+        owner_window,
+        modal: false,
     });
     Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn engine_set_plugin_editor_modal(
+    target_id: String,
+    modal: bool,
+    state: State<'_, NativeEngineState>,
+) -> Result<(), EngineError> {
+    let control = state
+        .engine
+        .lock()
+        .map_err(|_| EngineError::Internal("native engine control lock is poisoned".into()))?
+        .plugin_control(&target_id)
+        .map_err(EngineError::from)?;
+    tauri::async_runtime::spawn_blocking(move || control.set_editor_modal(modal))
+        .await
+        .map_err(|error| EngineError::Internal(error.to_string()))?
+        .map_err(EngineError::from)
 }
 
 #[tauri::command]
@@ -2657,6 +2692,7 @@ fn specta_builder() -> Builder<AppRuntime> {
             engine_open_plugin_editor,
             engine_close_plugin_editor,
             engine_set_plugin_editor_host_state,
+            engine_set_plugin_editor_modal,
             engine_plugin_editor_is_open,
             engine_set_plugin_editor_pinned,
             engine_save_plugin_state,

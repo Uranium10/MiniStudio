@@ -4,7 +4,7 @@
 //! for VST3 plugin GUIs.
 
 use crate::error::{Error, Result};
-use crate::plugin::Plugin;
+use crate::plugin::{Plugin, PluginEditorHandle};
 use crate::process_isolation::{EditorHostAction, EditorHostState};
 use std::sync::{Arc, Mutex};
 
@@ -21,16 +21,17 @@ use winapi::{
     shared::windef::{HDC, HWND, POINT, RECT},
     um::libloaderapi::GetModuleHandleW,
     um::wingdi::{
-        GetStockObject, LineTo, MoveToEx, SelectObject, SetBkMode, SetDCBrushColor,
-        SetDCPenColor, SetTextColor, DC_BRUSH, DC_PEN, DEFAULT_GUI_FONT, TRANSPARENT,
+        Ellipse, GetStockObject, LineTo, MoveToEx, Rectangle, SelectObject, SetBkMode,
+        SetDCBrushColor, SetDCPenColor, SetTextColor, DC_BRUSH, DC_PEN, DEFAULT_GUI_FONT,
+        NULL_BRUSH, TRANSPARENT,
     },
     um::winuser::{
-        BeginPaint, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawTextW, EndPaint, FillRect,
+        BeginPaint, CreateWindowExW, DefWindowProcW, DestroyWindow, DrawTextW, EnableWindow, EndPaint, FillRect,
         GetClientRect, GetDpiForWindow, GetWindowLongPtrW, GetWindowTextW, InvalidateRect,
         LoadCursorW, MoveWindow, RegisterClassExW, ScreenToClient,
         SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackMouseEvent, UpdateWindow, CS_DROPSHADOW,
         CW_USEDEFAULT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, PAINTSTRUCT,
+        GWLP_HWNDPARENT, GWLP_USERDATA, HTCAPTION, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, PAINTSTRUCT,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_SHOW, TME_LEAVE,
         TRACKMOUSEEVENT, WM_CLOSE, WM_DPICHANGED,
         WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP,
@@ -48,13 +49,13 @@ const HOST_CHROME_HEIGHT_DIP: i32 = HOST_CHROME_TOP_HEIGHT_DIP + HOST_CHROME_ACT
 #[cfg(target_os = "windows")]
 const HOST_CHROME_BUTTON_WIDTH_DIP: i32 = 42;
 #[cfg(target_os = "windows")]
-const HOST_CHROME_BYPASS_WIDTH_DIP: i32 = 78;
+const HOST_CHROME_BYPASS_WIDTH_DIP: i32 = 42;
 #[cfg(target_os = "windows")]
-const HOST_CHROME_SAVE_WIDTH_DIP: i32 = 54;
+const HOST_CHROME_SAVE_WIDTH_DIP: i32 = 42;
 #[cfg(target_os = "windows")]
-const HOST_CHROME_LOAD_WIDTH_DIP: i32 = 68;
+const HOST_CHROME_LOAD_WIDTH_DIP: i32 = 42;
 #[cfg(target_os = "windows")]
-const HOST_CHROME_SIDECHAIN_WIDTH_DIP: i32 = 82;
+const HOST_CHROME_SIDECHAIN_WIDTH_DIP: i32 = 42;
 #[cfg(target_os = "windows")]
 const HOST_CHROME_AUTOMATION_LABEL_WIDTH_DIP: i32 = 72;
 #[cfg(target_os = "windows")]
@@ -103,6 +104,8 @@ struct HostChromeState {
     hovered: Option<HostChromeButton>,
     tracking_mouse_leave: bool,
     interactive_move: bool,
+    owner_window: u64,
+    modal: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -349,6 +352,76 @@ unsafe fn draw_chrome_label(hdc: HDC, rect: &RECT, label: &str, text_color: u32)
     );
 }
 
+/// Compact vector icons shared by the native host chrome. Their cyan/red/neutral state colors
+/// mirror the device-rack controls without introducing an SVG/WebView dependency into helpers.
+#[cfg(target_os = "windows")]
+unsafe fn draw_chrome_icon(
+    hdc: HDC,
+    rect: &RECT,
+    button: HostChromeButton,
+    stroke: u32,
+    dpi: u32,
+) {
+    let pen = GetStockObject(DC_PEN as i32);
+    let brush = GetStockObject(NULL_BRUSH as i32);
+    let previous_pen = SelectObject(hdc, pen);
+    let previous_brush = SelectObject(hdc, brush);
+    SetDCPenColor(hdc, stroke);
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let r = scale_dip(6, dpi).max(4);
+    let small = scale_dip(3, dpi).max(2);
+    match button {
+        HostChromeButton::Power => {
+            Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+            MoveToEx(hdc, cx, cy - r - 2, std::ptr::null_mut());
+            LineTo(hdc, cx, cy + 1);
+        }
+        HostChromeButton::Pin => {
+            MoveToEx(hdc, cx - r + 1, cy - r, std::ptr::null_mut());
+            LineTo(hdc, cx + r, cy - r);
+            LineTo(hdc, cx + small, cy - 1);
+            LineTo(hdc, cx + small, cy + small);
+            LineTo(hdc, cx - small, cy + small);
+            LineTo(hdc, cx - small, cy - 1);
+            LineTo(hdc, cx - r + 1, cy - r);
+            MoveToEx(hdc, cx, cy + small, std::ptr::null_mut());
+            LineTo(hdc, cx, cy + r + 2);
+        }
+        HostChromeButton::Bypass => {
+            Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+            MoveToEx(hdc, cx - r + 1, cy + r - 1, std::ptr::null_mut());
+            LineTo(hdc, cx + r, cy - r);
+        }
+        HostChromeButton::Save => {
+            Rectangle(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+            Rectangle(hdc, cx - small, cy + 1, cx + small + 1, cy + r + 1);
+            MoveToEx(hdc, cx - small, cy - r, std::ptr::null_mut());
+            LineTo(hdc, cx - small, cy - 1);
+            LineTo(hdc, cx + small, cy - 1);
+            LineTo(hdc, cx + small, cy - r);
+        }
+        HostChromeButton::Load => {
+            MoveToEx(hdc, cx - r, cy - r + 2, std::ptr::null_mut());
+            LineTo(hdc, cx - 1, cy - r + 2);
+            LineTo(hdc, cx + 2, cy - small);
+            LineTo(hdc, cx + r, cy - small);
+            LineTo(hdc, cx + r, cy + r);
+            LineTo(hdc, cx - r, cy + r);
+            LineTo(hdc, cx - r, cy - r + 2);
+        }
+        HostChromeButton::Sidechain => {
+            Ellipse(hdc, cx - r - 1, cy - small, cx + 1, cy + r);
+            Ellipse(hdc, cx, cy - r, cx + r + 2, cy + small + 1);
+            MoveToEx(hdc, cx - small, cy + small, std::ptr::null_mut());
+            LineTo(hdc, cx + small + 1, cy - small);
+        }
+        _ => {}
+    }
+    SelectObject(hdc, previous_brush);
+    SelectObject(hdc, previous_pen);
+}
+
 /// Paint the host-owned toolbar. It is intentionally GDI-only: no WebView,
 /// compositor or second UI thread is introduced into the plug-in process.
 #[cfg(target_os = "windows")]
@@ -498,44 +571,41 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
         );
     }
 
-    draw_chrome_label(
+    draw_chrome_icon(
         hdc,
         &power_rect,
-        "전원",
+        HostChromeButton::Power,
         if bypassed {
             color(105, 125, 135)
         } else {
             color(99, 221, 245)
         },
+        dpi,
     );
-    draw_chrome_label(
+    draw_chrome_icon(
         hdc,
         &pin_rect,
-        "고정",
+        HostChromeButton::Pin,
         if pinned {
             color(242, 200, 91)
         } else {
             color(126, 151, 165)
         },
+        dpi,
     );
 
-    for (button, label, active_color) in [
+    for (button, active_color) in [
         (
             HostChromeButton::Bypass,
-            "바이패스",
             if bypassed {
                 color(197, 92, 91)
             } else {
                 color(103, 139, 155)
             },
         ),
-        (HostChromeButton::Save, "저장", color(103, 139, 155)),
-        (HostChromeButton::Load, "불러오기", color(103, 139, 155)),
-        (
-            HostChromeButton::Sidechain,
-            "사이드체인",
-            color(103, 139, 155),
-        ),
+        (HostChromeButton::Save, color(103, 139, 155)),
+        (HostChromeButton::Load, color(103, 139, 155)),
+        (HostChromeButton::Sidechain, color(103, 139, 155)),
     ] {
         let Some(rect) = layout.button_rect(button) else {
             continue;
@@ -549,7 +619,16 @@ unsafe fn paint_host_chrome(hwnd: HWND) {
                 color(13, 23, 31)
             },
         );
-        draw_chrome_label(hdc, &rect, label, active_color);
+        draw_chrome_icon(hdc, &rect, button, active_color, dpi);
+        if button == HostChromeButton::Bypass && bypassed {
+            let underline = RECT {
+                left: rect.left + scale_dip(7, dpi),
+                top: rect.bottom - scale_dip(2, dpi),
+                right: rect.right - scale_dip(7, dpi),
+                bottom: rect.bottom - scale_dip(1, dpi),
+            };
+            fill_rect(hdc, &underline, active_color);
+        }
     }
 
     if let Some(label_rect) = layout.automation_label_rect() {
@@ -901,6 +980,9 @@ struct XcbWindowState {
 /// A plugin window that manages the native window and plugin editor lifecycle
 pub struct PluginWindow {
     plugin: Arc<Mutex<Plugin>>,
+    /// GUI-only capability detached from processor/control ownership. All potentially blocking
+    /// vendor editor calls use this handle, never `plugin.lock()`.
+    editor: Option<PluginEditorHandle>,
     #[cfg(target_os = "macos")]
     native_window: Option<Retained<NSWindow>>,
     /// The view the plugin attached its editor into. Kept so a plugin-initiated resize can
@@ -922,8 +1004,13 @@ pub struct PluginWindow {
 impl PluginWindow {
     /// Create a new plugin window for the given plugin
     pub fn new(plugin: Arc<Mutex<Plugin>>) -> Self {
+        let editor = plugin
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .editor_handle();
         Self {
             plugin,
+            editor,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -938,14 +1025,23 @@ impl PluginWindow {
         }
     }
 
+    /// Query the editor size through the detached GUI capability.
+    pub fn preferred_size(&self) -> Result<(i32, i32)> {
+        self.editor
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Other("Plugin does not expose a detached GUI editor handle".to_string())
+            })?
+            .size()
+    }
+
     /// Open the plugin window
     pub fn open(&mut self) -> Result<()> {
+        let editor = self.editor.clone().ok_or_else(|| {
+            Error::Other("Plugin does not expose a detached GUI editor handle".to_string())
+        })?;
         // Check if plugin has editor
-        let has_editor = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .has_editor();
+        let has_editor = editor.has_editor();
         if !has_editor {
             return Err(Error::Other(
                 "Plugin does not have a GUI editor".to_string(),
@@ -967,12 +1063,7 @@ impl PluginWindow {
             .clone();
 
         // Try to get editor size
-        let (width, height) = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get_editor_size()
-            .unwrap_or((800, 600));
+        let (width, height) = editor.size().unwrap_or((800, 600));
 
         // Create native window
         #[cfg(target_os = "macos")]
@@ -1029,10 +1120,7 @@ impl PluginWindow {
                     Retained::as_ptr(&container_view) as *mut std::ffi::c_void
                 )
             };
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(window_handle)?;
+            editor.open(window_handle)?;
 
             // Match the window to the editor size, then show and center it.
             window.setContentSize(container_frame.size);
@@ -1128,17 +1216,14 @@ impl PluginWindow {
                 // It remains alive until after the editor is detached in `close()`.
                 let window_handle =
                     crate::plugin::WindowHandle::from_hwnd(container as *mut std::ffi::c_void);
-                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(scale_factor) = dpi_scale_factor(dpi) {
-                    if let Err(error) = plugin.set_editor_scale_factor(scale_factor) {
-                        drop(plugin);
+                    if let Err(error) = editor.set_scale_factor(scale_factor) {
                         DestroyWindow(hwnd);
                         return Err(error);
                     }
                 }
-                match plugin.open_editor(window_handle) {
+                match editor.open(window_handle) {
                     Ok(()) => {
-                        drop(plugin);
                         host_chrome_states()
                             .lock()
                             .unwrap_or_else(|poison| poison.into_inner())
@@ -1155,7 +1240,6 @@ impl PluginWindow {
                         self.editor_container = Some(container);
                     }
                     Err(e) => {
-                        drop(plugin);
                         DestroyWindow(hwnd);
                         return Err(e);
                     }
@@ -1214,10 +1298,7 @@ impl PluginWindow {
             let _ = connection.flush();
 
             let handle = crate::plugin::WindowHandle::from_x11(window.resource_id());
-            self.plugin
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .open_editor(handle)?;
+            editor.open(handle)?;
 
             self.native_window = Some(XcbWindowState { connection, window });
         }
@@ -1255,18 +1336,14 @@ impl PluginWindow {
         if self.native_window.is_none() {
             return Ok(());
         }
-        let Some(mut plugin) = self.try_lock_plugin() else {
+        let Some(editor) = self.editor.as_ref() else {
             return Ok(());
         };
 
         let scale_result = self
             .take_pending_scale_factor()
-            .map(|factor| plugin.set_editor_scale_factor(factor));
-        let resize = plugin.take_editor_resize_request();
-
-        // Released before touching the native window: on Windows, resizing it may synchronously
-        // dispatch window messages back into host code that wants this same lock.
-        drop(plugin);
+            .map(|factor| editor.set_scale_factor(factor));
+        let resize = editor.take_resize_request();
 
         if let Some((width, height)) = resize {
             self.resize_native_window(width, height);
@@ -1311,13 +1388,17 @@ impl PluginWindow {
                     chrome.automation,
                     next_automation,
                     chrome.pinned != state.pinned,
+                    chrome.owner_window != state.owner_window,
+                    chrome.modal != state.modal,
                 );
                 chrome.bypassed = state.bypassed;
                 chrome.automation = next_automation;
                 chrome.pinned = state.pinned;
+                chrome.owner_window = state.owner_window;
+                chrome.modal = state.modal;
                 Some(changed)
             });
-            if let Some((bypass_changed, old_automation, new_automation, pin_changed)) = changed {
+            if let Some((bypass_changed, old_automation, new_automation, pin_changed, owner_changed, modal_changed)) = changed {
                 unsafe {
                     if bypass_changed {
                         invalidate_host_button(hwnd, HostChromeButton::Power);
@@ -1333,10 +1414,16 @@ impl PluginWindow {
                         invalidate_host_button(hwnd, automation_button(old_automation));
                         invalidate_host_button(hwnd, automation_button(new_automation));
                     }
-                    if pin_changed {
+                    if owner_changed {
+                        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, state.owner_window as isize);
+                    }
+                    if modal_changed {
+                        EnableWindow(hwnd, i32::from(!state.modal));
+                    }
+                    if pin_changed || owner_changed || modal_changed {
                         SetWindowPos(
                             hwnd,
-                            if state.pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                            if !state.modal && state.pinned { HWND_TOPMOST } else { HWND_NOTOPMOST },
                             0,
                             0,
                             0,
@@ -1350,17 +1437,6 @@ impl PluginWindow {
         }
         #[cfg(not(target_os = "windows"))]
         let _ = state;
-    }
-
-    /// Take the plugin lock without blocking, recovering a lock poisoned by an unrelated panic
-    /// (a poisoned mutex is permanent, and treating it as failure would stop servicing the
-    /// editor for the rest of the session).
-    fn try_lock_plugin(&self) -> Option<std::sync::MutexGuard<'_, Plugin>> {
-        match self.plugin.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        }
     }
 
     /// The newest DPI the window procedure recorded for this window, as a VST3 content scale.
@@ -1445,11 +1521,9 @@ impl PluginWindow {
         // A poisoned lock (an earlier panic on the audio thread) is recovered rather than
         // skipped, exactly as every other lock site here does: skipping it would destroy the
         // native window with the plugin's view still attached to it.
-        let _ = self
-            .plugin
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .close_editor();
+        if let Some(editor) = self.editor.as_ref() {
+            let _ = editor.close();
+        }
 
         // Then close the native window
         #[cfg(target_os = "macos")]

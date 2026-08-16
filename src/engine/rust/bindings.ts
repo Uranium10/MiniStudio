@@ -47,6 +47,7 @@ export const commands = {
 	engineOpenPluginEditor: (targetKind: string, targetId: string, foreground: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_open_plugin_editor", { targetKind, targetId, foreground })),
 	engineClosePluginEditor: (targetKind: string, targetId: string) => typedError<null, EngineError>(__TAURI_INVOKE("engine_close_plugin_editor", { targetKind, targetId })),
 	engineSetPluginEditorHostState: (targetId: string, bypassed: boolean, automation: number) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_host_state", { targetId, bypassed, automation })),
+	engineSetPluginEditorModal: (targetId: string, modal: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_modal", { targetId, modal })),
 	enginePluginEditorIsOpen: (targetKind: string, targetId: string) => typedError<boolean, EngineError>(__TAURI_INVOKE("engine_plugin_editor_is_open", { targetKind, targetId })),
 	engineSetPluginEditorPinned: (targetId: string, pinned: boolean) => typedError<null, EngineError>(__TAURI_INVOKE("engine_set_plugin_editor_pinned", { targetId, pinned })),
 	engineSavePluginState: (targetKind: string, targetId: string) => typedError<number[], EngineError>(__TAURI_INVOKE("engine_save_plugin_state", { targetKind, targetId })),
@@ -140,6 +141,8 @@ export type EngineSnapshot = {
 	multibandLevels: MultibandLevels[],
 	distortionSpectra: ((number | null)[])[],
 	limiterMetrics: LimiterMetrics[],
+	/**  Bounded native editor gestures drained from plug-in realtime endpoints. */
+	pluginParameterChanges: PluginParameterChange[],
 };
 
 export type EqFrequencyResponse = {
@@ -324,6 +327,12 @@ export type PluginDescriptor = {
 	audioOutputBuses: number,
 	supportsSidechain: boolean,
 	parameters: PluginParameterDescriptor[],
+};
+
+export type PluginParameterChange = {
+	targetId: string,
+	parameterId: string,
+	value: number | null,
 };
 
 export type PluginParameterDescriptor = {

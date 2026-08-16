@@ -97,3 +97,36 @@ cargo build --manifest-path src-tauri/Cargo.toml --profile dev-dsp --bin ministu
 continuous-edit history coalescing, and transient playhead behavior.
 `src/components/PianoRoll.performance.test.ts` performs 10,000 viewport lookups
 over 5,000 sorted notes and enforces a conservative 250 ms regression ceiling.
+
+## Performance Tier P1 entry baseline
+
+Before scheduler/silence propagation work, the Windows VST3 helper must preserve realtime audio
+while a native vendor editor is created or moved. The helper therefore separates its GUI-only
+controller/view capability from processor ownership, uses bounded lock-free editor feedback, treats
+single deadline misses as diagnostics, and coalesces terminal recovery requests.
+
+The entry baseline was verified on 2026-08-16 at 48 kHz / 256 frames:
+
+- Serum: native editor creation overlapped 192 realtime blocks; output stayed non-silent and the
+  endpoint reported zero deadline misses.
+- BBC Symphony Orchestra: native editor creation overlapped 96 realtime blocks; the endpoint
+  reported zero deadline misses and the custom window pin/close lifecycle passed.
+- `cargo test --workspace`: passed.
+- frontend: 17 files / 98 tests passed and the production Vite build completed.
+- `dev-dsp` MiniStudio application build: passed.
+
+P1 may introduce scheduler-owned Running/Tail/Sleeping states. It must not revive the old
+working-set-trim loop: a helper may reclaim resources only after the graph has put its node into a
+real Sleeping state and preserved PDC, wake events and plug-in lifetime.
+
+## P1 preflight usability boundary
+
+- Piano-roll creation and keyboard audition use one note lifecycle: held gestures release on pointer
+  up with a 360 ms minimum, while one-shot move/listen previews use 360 ms and teardown still sends
+  immediate Note Off.
+- Downstream DSP/VST parameter and bypass edits no longer alter the graph signature, avoiding graph
+  rebuilds and silent blocks during ordinary rack work.
+- VST3 editor feedback is bounded and rides the existing realtime completion rather than adding a
+  control poll or plug-in mutex. Project updates are coalesced by target and covered by store tests.
+- Serum editor/audio overlap and BBC editor/topmost/unpin/close passed with installed plug-ins after
+  the ownership changes; both used the optimized `dev-dsp` executable.

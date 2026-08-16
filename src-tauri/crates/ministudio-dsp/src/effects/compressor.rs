@@ -1,3 +1,67 @@
+const DYNAMICS_HISTORY_POINTS: usize = DISTORTION_SPECTRUM_BINS / 2;
+
+/// Fixed-capacity, control-rate I/O history shared by both dynamics processors.
+/// One peak pair is committed every 10 ms; the audio callback performs O(1)
+/// work per sample and never allocates, locks, or shifts an array.
+struct DynamicsHistory {
+    input: [f32; DYNAMICS_HISTORY_POINTS],
+    output: [f32; DYNAMICS_HISTORY_POINTS],
+    write: usize,
+    samples_until_commit: usize,
+    commit_interval: usize,
+    input_peak: f32,
+    output_peak: f32,
+}
+impl DynamicsHistory {
+    fn new() -> Self {
+        Self {
+            input: [0.0; DYNAMICS_HISTORY_POINTS],
+            output: [0.0; DYNAMICS_HISTORY_POINTS],
+            write: 0,
+            samples_until_commit: 480,
+            commit_interval: 480,
+            input_peak: 0.0,
+            output_peak: 0.0,
+        }
+    }
+    fn prepare(&mut self, sample_rate: f32) {
+        self.commit_interval = (sample_rate / 100.0).round().max(1.0) as usize;
+        self.reset();
+    }
+    #[inline(always)]
+    fn observe(&mut self, input: f32, output: f32) {
+        self.input_peak = self.input_peak.max(input.abs());
+        self.output_peak = self.output_peak.max(output.abs());
+        self.samples_until_commit -= 1;
+        if self.samples_until_commit != 0 {
+            return;
+        }
+        self.input[self.write] = self.input_peak;
+        self.output[self.write] = self.output_peak;
+        self.write = increment_wrap(self.write, DYNAMICS_HISTORY_POINTS);
+        self.samples_until_commit = self.commit_interval;
+        self.input_peak = 0.0;
+        self.output_peak = 0.0;
+    }
+    fn snapshot(&self) -> [f32; DISTORTION_SPECTRUM_BINS] {
+        let mut output = [0.0; DISTORTION_SPECTRUM_BINS];
+        for index in 0..DYNAMICS_HISTORY_POINTS {
+            let source = (self.write + index) % DYNAMICS_HISTORY_POINTS;
+            output[index] = self.input[source];
+            output[DYNAMICS_HISTORY_POINTS + index] = self.output[source];
+        }
+        output
+    }
+    fn reset(&mut self) {
+        self.input.fill(0.0);
+        self.output.fill(0.0);
+        self.write = 0;
+        self.samples_until_commit = self.commit_interval;
+        self.input_peak = 0.0;
+        self.output_peak = 0.0;
+    }
+}
+
 pub struct Compressor {
     sr: f32,
     threshold: f32,
@@ -12,6 +76,7 @@ pub struct Compressor {
     stereo_link: bool,
     auto_makeup: bool,
     gain_reduction_db: f32,
+    history: DynamicsHistory,
     bypassed: bool,
 }
 impl Compressor {
@@ -30,6 +95,7 @@ impl Compressor {
             stereo_link: true,
             auto_makeup: false,
             gain_reduction_db: 0.0,
+            history: DynamicsHistory::new(),
             bypassed: false,
         }
     }
@@ -52,7 +118,8 @@ impl Compressor {
 }
 impl DspEffect for Compressor {
     fn prepare(&mut self, s: f32, _: usize, _: usize) {
-        self.sr = s
+        self.sr = s;
+        self.history.prepare(s);
     }
     fn process(&mut self, events: &[NoteEvent], b: &mut AudioBuffer, n: usize) {
         self.process_with_sidechain(events, b, None, n)
@@ -70,6 +137,7 @@ impl DspEffect for Compressor {
         let attack_coefficient = (-1.0 / (self.attack.max(0.01) * 0.001 * self.sr)).exp();
         let release_coefficient = (-1.0 / (self.release.max(0.01) * 0.001 * self.sr)).exp();
         for i in 0..n {
+            let input_peak = b.channels[0][i].abs().max(b.channels[1][i].abs());
             let mut detector = [0.0; MAX_CHANNELS];
             for ch in 0..MAX_CHANNELS {
                 let peak = sidechain
@@ -108,6 +176,10 @@ impl DspEffect for Compressor {
                     b.channels[ch][i] *= self.envelope[ch]
                 }
             }
+            self.history.observe(
+                input_peak,
+                b.channels[0][i].abs().max(b.channels[1][i].abs()),
+            );
         }
         self.gain_reduction_db = -20.0 * self.envelope[0].max(self.envelope[1]).max(1e-10).log10()
     }
@@ -133,6 +205,10 @@ impl DspEffect for Compressor {
     fn reset(&mut self) {
         self.envelope = [1.0; MAX_CHANNELS];
         self.rms = [0.0; MAX_CHANNELS];
-        self.gain_reduction_db = 0.0
+        self.gain_reduction_db = 0.0;
+        self.history.reset()
+    }
+    fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        Some(self.history.snapshot())
     }
 }

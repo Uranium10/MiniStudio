@@ -91,6 +91,34 @@ fn compressor_uses_external_sidechain_detector() {
     assert!(buffer.channels[0][MAX_BLOCK_SIZE - 1] < 0.1)
 }
 #[test]
+fn dynamics_processors_publish_fixed_realtime_io_history() {
+    let mut effects: [Box<dyn DspEffect>; 2] = [
+        Box::new(Compressor::new()),
+        Box::new(UpwardCompressor::new()),
+    ];
+    for effect in &mut effects {
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        for block in 0..4 {
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let sample = block * MAX_BLOCK_SIZE + frame;
+                let value = (2.0 * PI * 220.0 * sample as f32 / 48_000.0).sin() * 0.3;
+                buffer.channels[0][frame] = value;
+                buffer.channels[1][frame] = value;
+            }
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        }
+        let history = effect.effect_spectrum().expect("dynamics I/O history");
+        assert!(history.iter().all(|value| value.is_finite()));
+        assert!(history[..DYNAMICS_HISTORY_POINTS]
+            .iter()
+            .any(|value| *value > 0.1));
+        assert!(history[DYNAMICS_HISTORY_POINTS..]
+            .iter()
+            .any(|value| *value > 0.01));
+    }
+}
+#[test]
 fn multiband_compressor_processes_finite_audio() {
     let mut effect = MultibandCompressor::new();
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
@@ -181,6 +209,7 @@ fn every_builtin_effect_has_an_audited_latency_contract() {
         "builtin:lfo-tremolo",
         "builtin:upward-compressor",
         "builtin:transient-shaper",
+        "builtin:resonator",
     ];
     for kind in zero_latency {
         let effect = create_builtin_effect(kind, &HashMap::new(), false, 48_000.0).expect(kind);
@@ -195,7 +224,6 @@ fn every_builtin_effect_has_an_audited_latency_contract() {
         ("builtin:distortion", 2),
         ("builtin:clipper", 2),
         ("builtin:mastering-limiter", 240),
-        ("builtin:resonator", COLORIZER_FFT_SIZE),
     ] {
         let effect = create_builtin_effect(kind, &HashMap::new(), false, 48_000.0).expect(kind);
         assert_eq!(
@@ -690,67 +718,36 @@ fn roboter_harmony_changes_fade_and_processing_stays_finite() {
     assert_eq!(roboter.chroma_history.capacity(), history_capacity)
 }
 #[test]
-fn colorizer_reports_and_realizes_exact_latency() {
+fn colorizer_is_zero_latency_and_preserves_the_immediate_dry_path() {
     let mut effect = Colorizer::new();
     effect.set_param("mix", 0.0);
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
-    let mut observed = None;
-    for block in 0..6 {
-        let mut buffer = AudioBuffer::new();
-        if block == 0 {
-            buffer.channels[0][0] = 1.0;
-            buffer.channels[1][0] = 1.0;
-        }
-        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
-        for frame in 0..MAX_BLOCK_SIZE {
-            if buffer.channels[0][frame].abs() > 0.99 {
-                observed = Some(block * MAX_BLOCK_SIZE + frame);
-                break;
-            }
-        }
-    }
-    assert_eq!(effect.latency_samples(), COLORIZER_FFT_SIZE);
-    assert_eq!(observed, Some(COLORIZER_FFT_SIZE))
+    let mut buffer = AudioBuffer::new();
+    buffer.channels[0][0] = 1.0;
+    buffer.channels[1][0] = 1.0;
+    effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    assert_eq!(effect.latency_samples(), 0);
+    assert!((buffer.channels[0][0] - 1.0).abs() < 1e-6);
+    assert!((buffer.channels[1][0] - 1.0).abs() < 1e-6)
 }
 #[test]
-fn colorizer_hann_cola_reconstructs_below_minus_60_db() {
+fn colorizer_depth_zero_is_sample_transparent_without_ola() {
     let mut effect = Colorizer::new();
     effect.set_param("depth", 0.0);
-    effect.set_param("decay", 0.0);
     effect.set_param("mix", 1.0);
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
-    let total = COLORIZER_FFT_SIZE + COLORIZER_HOP_SIZE * 12;
-    let input: Vec<f32> = (0..total)
-        .map(|sample| {
-            let time = sample as f32 / 48_000.0;
-            (2.0 * PI * 173.0 * time).sin() * 0.23
-                + (2.0 * PI * 997.0 * time).sin() * 0.17
-                + (2.0 * PI * 4_123.0 * time).sin() * 0.09
-        })
-        .collect();
-    let mut output = Vec::with_capacity(total);
-    for start in (0..total).step_by(MAX_BLOCK_SIZE) {
-        let frames = (total - start).min(MAX_BLOCK_SIZE);
-        let mut buffer = AudioBuffer::new();
-        buffer.channels[0][..frames].copy_from_slice(&input[start..start + frames]);
-        buffer.channels[1][..frames].copy_from_slice(&input[start..start + frames]);
-        effect.process(&[], &mut buffer, frames);
-        output.extend_from_slice(&buffer.channels[0][..frames]);
+    let mut buffer = AudioBuffer::new();
+    let mut expected = [0.0_f32; MAX_BLOCK_SIZE];
+    for frame in 0..MAX_BLOCK_SIZE {
+        expected[frame] = (2.0 * PI * 997.0 * frame as f32 / 48_000.0).sin() * 0.31;
+        buffer.channels[0][frame] = expected[frame];
+        buffer.channels[1][frame] = -expected[frame];
     }
-    let start = COLORIZER_FFT_SIZE + COLORIZER_HOP_SIZE * 3;
-    let mut signal = 0.0_f64;
-    let mut error = 0.0_f64;
-    for index in start..total {
-        let expected = input[index - COLORIZER_FFT_SIZE];
-        signal += f64::from(expected * expected);
-        let delta = output[index] - expected;
-        error += f64::from(delta * delta);
+    effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+    for frame in 0..MAX_BLOCK_SIZE {
+        assert!((buffer.channels[0][frame] - expected[frame]).abs() < 1e-6);
+        assert!((buffer.channels[1][frame] + expected[frame]).abs() < 1e-6);
     }
-    let relative_db = 10.0 * (error.max(1e-30) / signal.max(1e-30)).log10();
-    assert!(
-        relative_db < -60.0,
-        "COLA reconstruction error {relative_db:.1} dB"
-    )
 }
 #[test]
 fn colorizer_mask_tracks_pitch_classes_across_octaves() {
@@ -761,16 +758,22 @@ fn colorizer_mask_tracks_pitch_classes_across_octaves() {
     for pitch in 0..12 {
         effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
     }
-    effect.rebuild_mask();
+    effect.rebuild_modes();
+    assert!(effect.active_modes >= 6);
+    assert!(effect.modes[..effect.active_modes]
+        .iter()
+        .all(|mode| mode.pitch_class == 0));
     for frequency in [65.406_f32, 130.813, 261.626, 523.251, 1046.502] {
-        let bin = (frequency * COLORIZER_FFT_SIZE as f32 / 48_000.0).round() as usize;
         assert!(
-            effect.mask_target[bin] > 0.72,
-            "C octave {frequency} Hz was closed"
+            effect.modes[..effect.active_modes]
+                .iter()
+                .any(|mode| (mode.frequency - frequency).abs() < frequency * 0.001),
+            "C octave {frequency} Hz was not represented"
         )
     }
-    let off_bin = (369.994 * COLORIZER_FFT_SIZE as f32 / 48_000.0).round() as usize;
-    assert!(effect.mask_target[off_bin] < 0.2)
+    assert!(!effect.modes[..effect.active_modes]
+        .iter()
+        .any(|mode| (mode.frequency - 369.994).abs() < 0.5))
 }
 #[test]
 fn colorizer_decay_is_finite_and_midi_gate_closes_without_notes() {
@@ -781,8 +784,7 @@ fn colorizer_decay_is_finite_and_midi_gate_closes_without_notes() {
     effect.set_param("midi", 1.0);
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
     assert!(effect.wants_midi());
-    effect.rebuild_mask();
-    assert!(effect.mask_target.iter().all(|gain| *gain == 0.0));
+    assert_eq!(effect.active_modes, 0);
     let event = NoteEvent {
         sample_offset: 0,
         kind: NoteEventKind::NoteOn {
@@ -796,8 +798,8 @@ fn colorizer_decay_is_finite_and_midi_gate_closes_without_notes() {
     for block in 0..20 {
         let mut buffer = AudioBuffer::new();
         if block == 0 {
-            buffer.channels[0][COLORIZER_HOP_SIZE / 2] = 1.0;
-            buffer.channels[1][COLORIZER_HOP_SIZE / 2] = 1.0;
+            buffer.channels[0][0] = 1.0;
+            buffer.channels[1][0] = 1.0;
             effect.process(&[event], &mut buffer, MAX_BLOCK_SIZE);
         } else {
             effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
@@ -808,28 +810,56 @@ fn colorizer_decay_is_finite_and_midi_gate_closes_without_notes() {
         }
     }
     assert_eq!(effect.midi_mask, 1);
+    assert!(effect.active_modes > 0);
     assert!(energy.is_finite());
     assert!(effect.decay_coefficient() < 1.0)
 }
 #[test]
-fn colorizer_held_phase_is_stable_and_realtime_buffers_do_not_grow() {
+fn colorizer_selected_pitch_rings_more_strongly_than_an_unselected_pitch() {
+    fn render(frequency: f32) -> f64 {
+        let mut effect = Colorizer::new();
+        effect.set_param("mix", 1.0);
+        effect.set_param("depth", 1.0);
+        effect.set_param("decay", 0.2);
+        for pitch in 0..12 {
+            effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
+        }
+        effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+        let mut energy = 0.0_f64;
+        for block in 0..24 {
+            let mut buffer = AudioBuffer::new();
+            for frame in 0..MAX_BLOCK_SIZE {
+                let sample = block * MAX_BLOCK_SIZE + frame;
+                let value = (2.0 * PI * frequency * sample as f32 / 48_000.0).sin() * 0.2;
+                buffer.channels[0][frame] = value;
+                buffer.channels[1][frame] = value;
+            }
+            effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+            if block > 8 {
+                energy += buffer.channels[0][..MAX_BLOCK_SIZE]
+                    .iter()
+                    .map(|sample| f64::from(sample * sample))
+                    .sum::<f64>();
+            }
+        }
+        energy
+    }
+    let selected = render(261.625_55);
+    let rejected = render(369.994_42);
+    assert!(
+        selected > rejected * 2.0,
+        "selected={selected} rejected={rejected}"
+    )
+}
+#[test]
+fn colorizer_fixed_state_stays_finite_across_long_realtime_processing() {
     let mut effect = Colorizer::new();
     effect.set_param("decay", 0.88);
-    effect.set_param("depth", 0.0);
+    effect.set_param("depth", 1.0);
     effect.set_param("mix", 1.0);
     effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
-    let capacities: [(usize, usize, usize, usize, usize); MAX_CHANNELS] =
-        std::array::from_fn(|channel| {
-            (
-                effect.channels[channel].input_ring.capacity(),
-                effect.channels[channel].ola_ring.capacity(),
-                effect.channels[channel].spectrum.capacity(),
-                effect.channels[channel].scratch.capacity(),
-                effect.channels[channel].held.capacity(),
-            )
-        });
-    let mut output = Vec::new();
-    for block in 0..20 {
+    let mode_count = effect.active_modes;
+    for block in 0..80 {
         let mut buffer = AudioBuffer::new();
         if block < 8 {
             for frame in 0..MAX_BLOCK_SIZE {
@@ -840,35 +870,137 @@ fn colorizer_held_phase_is_stable_and_realtime_buffers_do_not_grow() {
             }
         }
         effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
-        output.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
+        assert!(buffer
+            .channels
+            .iter()
+            .all(|channel| channel[..MAX_BLOCK_SIZE]
+                .iter()
+                .all(|sample| sample.is_finite())));
     }
-    let tail_start = COLORIZER_FFT_SIZE + 8 * MAX_BLOCK_SIZE + COLORIZER_HOP_SIZE;
-    let period = (48_000.0_f32 / 445.3125).round() as usize;
-    let mut correlation = 0.0_f64;
-    let mut left_energy = 0.0_f64;
-    let mut right_energy = 0.0_f64;
-    for index in tail_start..output.len() - period {
-        correlation += f64::from(output[index] * output[index + period]);
-        left_energy += f64::from(output[index] * output[index]);
-        right_energy += f64::from(output[index + period] * output[index + period]);
+    assert_eq!(effect.active_modes, mode_count);
+    assert!(effect.active_modes <= COLORIZER_MAX_MODES)
+}
+
+#[test]
+fn colorizer_map_reports_and_preserves_its_fixed_bypass_latency() {
+    let mut effect = Colorizer::new();
+    effect.set_param("quality", 1.0);
+    effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+    effect.set_bypassed(true);
+    assert_eq!(effect.latency_samples(), COLORIZER_MAP_FFT_SIZE);
+
+    let mut rendered = Vec::with_capacity(MAX_BLOCK_SIZE * 2);
+    for block in 0..2 {
+        let mut buffer = AudioBuffer::new();
+        if block == 0 {
+            buffer.channels[0][0] = 0.75;
+            buffer.channels[1][0] = -0.5;
+        }
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        rendered.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
     }
-    let normalized = correlation / (left_energy * right_energy).sqrt().max(1e-20);
+    let peak = rendered
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))
+        .unwrap();
+    assert_eq!(peak.0, COLORIZER_MAP_FFT_SIZE);
+    assert!((*peak.1 - 0.75).abs() < 1e-6);
+}
+
+#[test]
+fn colorizer_map_moves_a_stable_c_sharp_toward_the_enabled_c_class() {
+    fn tone_energy(signal: &[f32], frequency: f32, sample_rate: f32) -> f64 {
+        let mut real = 0.0_f64;
+        let mut imaginary = 0.0_f64;
+        for (index, sample) in signal.iter().enumerate() {
+            let phase =
+                2.0 * std::f64::consts::PI * frequency as f64 * index as f64 / sample_rate as f64;
+            real += f64::from(*sample) * phase.cos();
+            imaginary -= f64::from(*sample) * phase.sin();
+        }
+        real * real + imaginary * imaginary
+    }
+
+    let sample_rate = 48_000.0;
+    let input_frequency = 277.182_65_f32;
+    let target_frequency = 261.625_55_f32;
+    let mut effect = Colorizer::new();
+    effect.set_param("quality", 1.0);
+    effect.set_param("mix", 1.0);
+    effect.set_param("depth", 1.0);
+    effect.set_param("transient", 0.0);
+    effect.set_param("resonance", 1.0);
+    for pitch in 0..12 {
+        effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
+    }
+    effect.prepare(sample_rate, MAX_BLOCK_SIZE, MAX_CHANNELS);
+
+    let mut output = Vec::with_capacity(MAX_BLOCK_SIZE * 24);
+    for block in 0..24 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            let sample = block * MAX_BLOCK_SIZE + frame;
+            let value = (2.0 * PI * input_frequency * sample as f32 / sample_rate).sin() * 0.25;
+            buffer.channels[0][frame] = value;
+            buffer.channels[1][frame] = value;
+        }
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        if block >= 8 {
+            output.extend_from_slice(&buffer.channels[0][..MAX_BLOCK_SIZE]);
+        }
+    }
+    let target = tone_energy(&output, target_frequency, sample_rate);
+    let source = tone_energy(&output, input_frequency, sample_rate);
+    assert!(target > source * 2.0, "target={target} source={source}");
+    assert!(effect.effect_spectrum().is_some());
+}
+
+#[test]
+fn colorizer_map_keeps_linked_stereo_polarity_and_level_relationship() {
+    let mut effect = Colorizer::new();
+    effect.set_param("quality", 1.0);
+    effect.set_param("mix", 1.0);
+    effect.set_param("depth", 1.0);
+    effect.set_param("transient", 0.0);
+    for pitch in 0..12 {
+        effect.set_param(&format!("pitch{pitch}"), if pitch == 0 { 1.0 } else { 0.0 });
+    }
+    effect.prepare(48_000.0, MAX_BLOCK_SIZE, MAX_CHANNELS);
+
+    let mut maximum_error = 0.0_f32;
+    let mut maximum_level = 0.0_f32;
+    let mut worst = (0.0_f32, 0.0_f32);
+    for block in 0..20 {
+        let mut buffer = AudioBuffer::new();
+        for frame in 0..MAX_BLOCK_SIZE {
+            let sample = block * MAX_BLOCK_SIZE + frame;
+            let left = (2.0 * PI * 277.182_65 * sample as f32 / 48_000.0).sin() * 0.3;
+            buffer.channels[0][frame] = left;
+            buffer.channels[1][frame] = left * -0.5;
+        }
+        effect.process(&[], &mut buffer, MAX_BLOCK_SIZE);
+        if block >= 8 {
+            for frame in 0..MAX_BLOCK_SIZE {
+                maximum_level = maximum_level.max(buffer.channels[0][frame].abs());
+                let error = (buffer.channels[1][frame] + buffer.channels[0][frame] * 0.5).abs();
+                if error > maximum_error {
+                    maximum_error = error;
+                    worst = (buffer.channels[0][frame], buffer.channels[1][frame]);
+                }
+            }
+        }
+    }
+    assert!(maximum_level > 0.05);
+    let spectral_error = effect.map.processor.stereo_relation_error(-0.5);
     assert!(
-        normalized > 0.9,
-        "unstable held phase correlation {normalized:.3}"
+        spectral_error.1 < 1e-4,
+        "spectral frame itself lost the linked-stereo relationship: {spectral_error:?}"
     );
-    for channel in 0..MAX_CHANNELS {
-        assert_eq!(
-            capacities[channel],
-            (
-                effect.channels[channel].input_ring.capacity(),
-                effect.channels[channel].ola_ring.capacity(),
-                effect.channels[channel].spectrum.capacity(),
-                effect.channels[channel].scratch.capacity(),
-                effect.channels[channel].held.capacity(),
-            )
-        )
-    }
+    assert!(
+        maximum_error < maximum_level * 2e-4,
+        "stereo relationship drifted: error={maximum_error} level={maximum_level} worst={worst:?}"
+    );
 }
 
 fn vowel_formants(sample_rate: f32) -> [Biquad; 2] {

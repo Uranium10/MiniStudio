@@ -37,6 +37,10 @@ pub struct PluginEditorState {
     pub bypassed: bool,
     pub automation: u8,
     pub pinned: bool,
+    /// Native DAW owner window. Zero means no platform owner is available.
+    pub owner_window: u64,
+    /// A DAW-owned modal dialog is active for this editor.
+    pub modal: bool,
 }
 
 /// Main-thread/control-plane access to an external plug-in instance.
@@ -73,6 +77,16 @@ pub trait PluginControl: Send + Sync {
         self.take_editor_actions()
     }
     fn set_editor_state(&self, _state: PluginEditorState) {}
+    /// Set the native owner before opening so the editor never appears behind the DAW.
+    fn set_editor_owner_window(&self, _owner_window: u64) {}
+    /// Temporarily disable the editor while a DAW-owned modal dialog is active.
+    fn set_editor_modal(&self, _modal: bool) -> Result<(), String> {
+        Ok(())
+    }
+    /// Drain normalized parameter values reported by the native editor/processor.
+    fn take_parameter_changes(&self) -> Vec<(String, f32)> {
+        Vec::new()
+    }
     /// Apply native topmost/floating state and return only after the platform owner acknowledges
     /// the transition. This is a control-plane call and must never run from the audio callback.
     fn set_editor_pinned(&self, _pinned: bool) -> Result<(), String> {
@@ -145,6 +159,8 @@ fn db_to_gain(db: f32) -> f32 {
 include!("common/core.rs");
 include!("common/biquad.rs");
 include!("common/helpers.rs");
+#[allow(dead_code)]
+mod spectral;
 include!("effects/mod.rs");
 
 pub fn create_builtin_effect(

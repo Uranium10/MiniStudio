@@ -24,6 +24,7 @@ export type EffectType =
 
 export type PluginFormat = 'vst3' | 'clap'
 export type PluginParameterDescriptor = { id: string; name: string; module: string; min: number; max: number; defaultValue: number }
+export type PluginParameterChange = { targetId: string; parameterId: string; value: number }
 export type ExternalPluginRef = {
   format: PluginFormat
   uid: string
@@ -96,6 +97,7 @@ export type EffectInstance = {
   params: Record<string, number>
   plugin?: ExternalPluginRef
   sidechain?: { enabled: boolean; sourceTrackId: string | null }
+  automationMode?: 'off' | 'write' | 'read' | 'latch'
 }
 
 export type AutomationPoint = { id: string; timeSec: number; value: number; /** Outgoing segment bend, -1…1. */ curve?: number }
@@ -139,7 +141,7 @@ export type MidiClip = {
   muted: boolean
   color: string | null
 }
-export type InstrumentInstance = { id: string; type: 'builtin:testtone' | `vst3:${string}` | `clap:${string}`; params: Record<string, number>; bypassed: boolean; plugin?: ExternalPluginRef }
+export type InstrumentInstance = { id: string; type: 'builtin:testtone' | `vst3:${string}` | `clap:${string}`; params: Record<string, number>; bypassed: boolean; plugin?: ExternalPluginRef; automationMode?: 'off' | 'write' | 'read' | 'latch' }
 
 export type Track = {
   id: string

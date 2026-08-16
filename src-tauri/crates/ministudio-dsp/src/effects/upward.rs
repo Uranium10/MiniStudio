@@ -10,6 +10,7 @@ pub struct UpwardCompressor {
     output: Smoother,
     detector: [f32; MAX_CHANNELS],
     gain: [f32; MAX_CHANNELS],
+    history: DynamicsHistory,
     bypassed: bool,
 }
 impl UpwardCompressor {
@@ -26,6 +27,7 @@ impl UpwardCompressor {
             output: Smoother::new(1.0, 48_000.0, 0.01),
             detector: [0.0; MAX_CHANNELS],
             gain: [1.0; MAX_CHANNELS],
+            history: DynamicsHistory::new(),
             bypassed: false,
         }
     }
@@ -44,6 +46,7 @@ impl DspEffect for UpwardCompressor {
         self.sample_rate = sample_rate;
         self.mix = Smoother::new(self.mix.target, sample_rate, 0.01);
         self.output = Smoother::new(self.output.target, sample_rate, 0.01);
+        self.history.prepare(sample_rate);
     }
     fn process(&mut self, _events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
         if self.bypassed {
@@ -75,6 +78,12 @@ impl DspEffect for UpwardCompressor {
                 buffer.channels[channel][frame] =
                     denormal((dry[channel] * (1.0 - mix) + wet * mix) * output);
             }
+            self.history.observe(
+                dry[0].abs().max(dry[1].abs()),
+                buffer.channels[0][frame]
+                    .abs()
+                    .max(buffer.channels[1][frame].abs()),
+            );
         }
     }
     fn set_param(&mut self, id: &str, value: f32) {
@@ -95,6 +104,10 @@ impl DspEffect for UpwardCompressor {
     }
     fn reset(&mut self) {
         self.detector = [0.0; MAX_CHANNELS];
-        self.gain = [1.0; MAX_CHANNELS]
+        self.gain = [1.0; MAX_CHANNELS];
+        self.history.reset()
+    }
+    fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
+        Some(self.history.snapshot())
     }
 }

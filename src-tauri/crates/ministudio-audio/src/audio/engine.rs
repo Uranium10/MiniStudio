@@ -19,7 +19,7 @@ use super::{
         db_to_gain, AudioBackendInfo, AudioDeviceInfo, AudioSettings, DecodeProgress, EffectSpec,
         EngineSnapshot, EqFrequencyResponse, ExportProgress, ExportRequest, ExportResult,
         GraphSnapshot, Level, LimiterMetrics, MidiInputPortInfo, MultibandLevels, NativeAssetInfo,
-        StereoLevel, StreamStatus,
+        PluginParameterChange, StereoLevel, StreamStatus,
     },
     COMMAND_CAPACITY, MAX_BLOCK_SIZE, MAX_EFFECT_METERS, MAX_TRACKS, RETIRED_GRAPH_CAPACITY,
 };
@@ -1328,6 +1328,19 @@ impl NativeEngine {
             .values()
             .map(|control| control.realtime_deadline_misses())
             .sum();
+        let mut plugin_parameter_changes = Vec::with_capacity(32);
+        for (target_id, control) in &self.bindings.plugin_controls {
+            for (parameter_id, value) in control.take_parameter_changes() {
+                if plugin_parameter_changes.len() >= 1024 {
+                    break;
+                }
+                plugin_parameter_changes.push(PluginParameterChange {
+                    target_id: target_id.clone(),
+                    parameter_id,
+                    value,
+                });
+            }
+        }
         EngineSnapshot {
             playhead_sec: frame.position as f64 / f64::from(self.settings.sample_rate),
             track_levels,
@@ -1359,6 +1372,7 @@ impl NativeEngine {
             multiband_levels,
             distortion_spectra,
             limiter_metrics,
+            plugin_parameter_changes,
         }
     }
     pub fn backends(&self) -> Vec<AudioBackendInfo> {

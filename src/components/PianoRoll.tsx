@@ -89,7 +89,7 @@ export function PianoRoll() {
   const [genericCc, setGenericCc] = useState(11)
   const centredClipId = useRef<string | null>(null)
   const auditionId = useRef(2_000_000)
-  const activeAuditions = useRef(new Map<number, { trackId: string; pitch: number; timer: number | null }>())
+  const activeAuditions = useRef(new Map<number, { trackId: string; pitch: number; startedAt: number; timer: number | null }>())
   const lastNoteLengthRef = useRef(gridTicks)
   const pixelsPerTick = pixelsPerQuarter / MIDI_PPQ
   const clipStartTick = clip ? tempoMap.secondsToTicks(clip.startSec) : 0
@@ -120,11 +120,17 @@ export function PianoRoll() {
   const activeCc = eventLane === 'pitchBend' ? MIDI_PITCH_BEND_LANE : eventLane === 'sustain' ? 64 : eventLane === 'vibrato' ? 1 : genericCc
   const activeControllerLane = clip?.ccLanes.find((lane) => lane.cc === activeCc)
 
-  const stopAudition = useCallback((id: number | null) => {
+  const stopAudition = useCallback((id: number | null, minimumDurationMs = 0) => {
     if (id === null) return
     const active = activeAuditions.current.get(id)
     if (!active) return
     if (active.timer !== null) window.clearTimeout(active.timer)
+    const remaining = minimumDurationMs - (performance.now() - active.startedAt)
+    if (remaining > 1) {
+      const timer = window.setTimeout(() => stopAudition(id), remaining)
+      activeAuditions.current.set(id, { ...active, timer })
+      return
+    }
     activeAuditions.current.delete(id)
     engine.midiNote(active.trackId, id, active.pitch, 0, false)
   }, [engine])
@@ -132,16 +138,17 @@ export function PianoRoll() {
     if (!track || track.kind !== 'instrument' || !track.instrument || !preview) return null
     const id = auditionId.current++
     engine.midiNote(track.id, id, pitch, keyboardVelocity / 127, true)
-    activeAuditions.current.set(id, { trackId: track.id, pitch, timer: null })
+    const startedAt = performance.now()
+    activeAuditions.current.set(id, { trackId: track.id, pitch, startedAt, timer: null })
     if (durationMs !== null) {
       const timer = window.setTimeout(() => stopAudition(id), durationMs)
-      activeAuditions.current.set(id, { trackId: track.id, pitch, timer })
+      activeAuditions.current.set(id, { trackId: track.id, pitch, startedAt, timer })
     }
     return id
   }, [engine, keyboardVelocity, preview, stopAudition, track])
-  const audition = useCallback((pitch: number) => { startAudition(pitch, 180) }, [startAudition])
+  const audition = useCallback((pitch: number) => { startAudition(pitch, 360) }, [startAudition])
   const beginHeldAudition = useCallback((pitch: number) => startAudition(pitch, null), [startAudition])
-  const endHeldAudition = useCallback((id: number | null) => stopAudition(id), [stopAudition])
+  const endHeldAudition = useCallback((id: number | null) => stopAudition(id, 360), [stopAudition])
 
   // A clip/track switch or closing the piano roll must never leave an audition
   // voice held in the native engine or an isolated plug-in process.
@@ -191,10 +198,11 @@ export function PianoRoll() {
   useEffect(() => {
     if (!clip) return
     const scroll = scrollRef.current
-    let frame = requestAnimationFrame(() => drawNotes(notesRef.current, clip.notes, selected, canvasWidth, contentHeight, noteHeight, pixelsPerTick, scroll, rollMode === 'drum'))
+    const draw = () => drawNotes(notesRef.current, clip.notes, selected, canvasWidth, contentHeight, noteHeight, pixelsPerTick, scroll, rollMode === 'drum', dragRef.current?.mode === 'create' ? undefined : dragRef.current?.note.id)
+    let frame = requestAnimationFrame(draw)
     const onScroll = () => {
       cancelAnimationFrame(frame)
-      frame = requestAnimationFrame(() => drawNotes(notesRef.current, clip.notes, selected, canvasWidth, contentHeight, noteHeight, pixelsPerTick, scroll, rollMode === 'drum'))
+      frame = requestAnimationFrame(draw)
     }
     scroll?.addEventListener('scroll', onScroll, { passive: true })
     return () => { cancelAnimationFrame(frame); scroll?.removeEventListener('scroll', onScroll) }
@@ -269,10 +277,11 @@ export function PianoRoll() {
     if (!hit && (tool === 'paint' || ((event.ctrlKey || event.metaKey) && (tool === 'arrow' || tool === 'range')))) {
       const pitch = snapPitch(127 - Math.floor(y / noteHeight))
       const anchor = snapTick(x / pixelsPerTick, event.shiftKey)
-      const id = useProjectStore.getState().addMidiNote(editor.trackId, editor.clipId, { pitch, velocity: keyboardVelocity, startTicks: anchor, lengthTicks: gridTicks, releaseVelocity: 64, muted: false })
-      if (!id) return
       const heldAuditionId = beginHeldAudition(pitch)
-      const note: MidiNote = { id, pitch, velocity: keyboardVelocity, startTicks: anchor, lengthTicks: gridTicks, releaseVelocity: 64, muted: false }
+      // Keep the provisional note in the overlay only. Mutating the MIDI clip here would
+      // schedule a graph replacement while the pointer is still down, which can retire the
+      // live audition voice before the user has finished drawing the note.
+      const note: MidiNote = { id: `preview-${crypto.randomUUID()}`, pitch, velocity: keyboardVelocity, startTicks: anchor, lengthTicks: gridTicks, releaseVelocity: 64, muted: false }
       dragRef.current = { mode: 'create', note, startX: x, startY: y, latestTick: anchor, latestPitch: pitch, latestLength: gridTicks, copy: false }
       setNoteCursor('ew-resize')
       const move = (pointer: PointerEvent) => {
@@ -282,16 +291,18 @@ export function PianoRoll() {
         drag.latestLength = Math.max(pointer.shiftKey ? 1 : gridTicks, Math.abs(current - anchor) || gridTicks)
         drawOverlay(overlayRef.current, canvasWidth, contentHeight, -1, drag, noteHeight, pixelsPerTick, scrollRef.current?.scrollLeft ?? 0, activeTicks * pixelsPerTick)
       }
-      const up = () => {
+      const finish = (commit: boolean) => {
         const drag = dragRef.current; dragRef.current = null; setNoteCursor('default')
-        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up)
+        window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', pointerUp); window.removeEventListener('pointercancel', pointerCancel)
         endHeldAudition(heldAuditionId)
-        if (drag) {
+        if (commit && drag) {
           lastNoteLengthRef.current = drag.latestLength
-          useProjectStore.getState().updateMidiNotes(editor.trackId, editor.clipId, [id], { startTicks: drag.latestTick, lengthTicks: drag.latestLength })
+          useProjectStore.getState().addMidiNote(editor.trackId, editor.clipId, { pitch: drag.latestPitch, velocity: drag.note.velocity, startTicks: drag.latestTick, lengthTicks: drag.latestLength, releaseVelocity: drag.note.releaseVelocity, muted: drag.note.muted })
         }
       }
-      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up, { once: true }); window.addEventListener('pointercancel', up, { once: true })
+      const pointerUp = () => finish(true)
+      const pointerCancel = () => finish(false)
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', pointerUp, { once: true }); window.addEventListener('pointercancel', pointerCancel, { once: true })
       return
     }
     if (!hit) {
@@ -316,6 +327,9 @@ export function PianoRoll() {
     const resize = Math.abs(x - (hit.startTicks + hit.lengthTicks) * pixelsPerTick) <= 7
     setNoteCursor(resize ? 'ew-resize' : 'grabbing')
     dragRef.current = { mode: resize ? 'resize' : 'move', note: { ...hit }, startX: x, startY: y, latestTick: hit.startTicks, latestPitch: hit.pitch, latestLength: hit.lengthTicks, copy: event.altKey && !resize }
+    // The static note layer otherwise keeps painting the original full length beneath the
+    // shorter overlay, making shrink previews appear to do nothing.
+    drawNotes(notesRef.current, clip.notes, selected, canvasWidth, contentHeight, noteHeight, pixelsPerTick, scrollRef.current, rollMode === 'drum', hit.id)
     const move = (pointer: PointerEvent) => {
       const drag = dragRef.current; if (!drag) return
       if (drag.mode === 'resize') drag.latestLength = Math.max(pointer.shiftKey ? 1 : gridTicks, snapTick(drag.note.lengthTicks + (pointer.clientX - event.clientX) / pixelsPerTick, pointer.shiftKey))
@@ -333,10 +347,15 @@ export function PianoRoll() {
       else {
         const deltaTick = drag.latestTick - drag.note.startTicks
         const deltaPitch = drag.latestPitch - drag.note.pitch
-        if (deltaTick === 0 && deltaPitch === 0) return
-        if (drag.copy) useProjectStore.getState().duplicateMidiNotes(editor.trackId, editor.clipId, ids, deltaTick, deltaPitch)
-        else useProjectStore.getState().updateMidiNoteBatch(editor.trackId, editor.clipId, (currentClip?.notes.filter((item) => ids.includes(item.id)) ?? []).map((note) => ({ id: note.id, patch: { startTicks: Math.max(0, note.startTicks + deltaTick), pitch: snapPitch(note.pitch + deltaPitch) } })))
+        if (deltaTick !== 0 || deltaPitch !== 0) {
+          if (drag.copy) useProjectStore.getState().duplicateMidiNotes(editor.trackId, editor.clipId, ids, deltaTick, deltaPitch)
+          else useProjectStore.getState().updateMidiNoteBatch(editor.trackId, editor.clipId, (currentClip?.notes.filter((item) => ids.includes(item.id)) ?? []).map((note) => ({ id: note.id, patch: { startTicks: Math.max(0, note.startTicks + deltaTick), pitch: snapPitch(note.pitch + deltaPitch) } })))
+        }
       }
+      requestAnimationFrame(() => {
+        const committed = useProjectStore.getState().project.tracks.find((item) => item.id === editor.trackId)?.midiClips.find((item) => item.id === editor.clipId)
+        if (committed) drawNotes(notesRef.current, committed.notes, useProjectStore.getState().selectedNoteIds, canvasWidth, contentHeight, noteHeight, pixelsPerTick, scrollRef.current, rollMode === 'drum')
+      })
     }
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up, { once: true })
   }
@@ -645,7 +664,7 @@ function drawGrid(canvas: HTMLCanvasElement | null, width: number, height: numbe
   }
 }
 
-function drawNotes(canvas: HTMLCanvasElement | null, notes: MidiNote[], selected: string[], width: number, height: number, rowHeight: number, ppt: number, scroll: HTMLDivElement | null, drumMode: boolean) {
+function drawNotes(canvas: HTMLCanvasElement | null, notes: MidiNote[], selected: string[], width: number, height: number, rowHeight: number, ppt: number, scroll: HTMLDivElement | null, drumMode: boolean, hiddenNoteId?: string) {
   const context = setupCanvas(canvas, width, height)
   if (!context) return
   const selectedSet = new Set(selected)
@@ -658,6 +677,7 @@ function drawNotes(canvas: HTMLCanvasElement | null, notes: MidiNote[], selected
   for (let index = start; index < notes.length; index += 1) {
     const note = notes[index]!
     if (note.startTicks > endTick) break
+    if (note.id === hiddenNoteId) continue
     const x = note.startTicks * ppt - scrollLeft
     const y = (127 - note.pitch) * rowHeight + 1
     const w = Math.max(3, note.lengthTicks * ppt - 1)

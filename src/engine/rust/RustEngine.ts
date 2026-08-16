@@ -4,7 +4,7 @@ import type { IAudioEngine } from '../IAudioEngine'
 import type {
   AudioAssetInfo, AudioBackendInfo, AudioDeviceInfo, AudioSettings, EngineCapabilities, EqFrequencyResponse, MidiInputPortInfo,
   GraphSnapshot, Level, LimiterMetrics, MultibandLevels, OfflineRenderRequest, OfflineRenderResult, PluginDescriptor,
-  ExportSettings, ProjectState, StreamStatus,
+  ExportSettings, PluginParameterChange, ProjectState, StreamStatus,
   ExportProgress as UiExportProgress,
 } from '../types'
 import { NotSupportedError } from '../types'
@@ -21,6 +21,7 @@ export class RustEngine implements IAudioEngine {
   private pollTimer: number | null = null
   private playheadSec = 0
   private readonly listeners = new Set<(sec: number) => void>()
+  private readonly pluginParameterListeners = new Set<(changes: PluginParameterChange[]) => void>()
   private trackLevels: Record<string, Level> = {}
   private masterLevel: Level = { peak: 0, rms: 0 }
   private streamStatus: StreamStatus = idleStatus
@@ -198,6 +199,10 @@ export class RustEngine implements IAudioEngine {
       queueMicrotask(() => this.flushMidiNotes())
     }
   }
+  onPluginParameterChanges(cb: (changes: PluginParameterChange[]) => void): () => void {
+    this.pluginParameterListeners.add(cb)
+    return () => this.pluginParameterListeners.delete(cb)
+  }
   midiAllNotesOff(trackId: string): void {
     this.liveMidiNotes.set(trackId, new Set())
     this.flushMidiNotes()
@@ -244,6 +249,9 @@ export class RustEngine implements IAudioEngine {
   }
   async loadPluginState(targetKind: 'effect' | 'instrument', targetId: string, state: number[]): Promise<void> {
     if (isTauriRuntime()) await unwrapCommand(commands.engineLoadPluginState(targetKind, targetId, state))
+  }
+  async setPluginEditorModal(targetId: string, modal: boolean): Promise<void> {
+    if (isTauriRuntime()) await unwrapCommand(commands.engineSetPluginEditorModal(targetId, modal))
   }
   async renderOffline(_req: OfflineRenderRequest): Promise<OfflineRenderResult> { throw new NotSupportedError('VST3 rendering is available in phase three.') }
 
@@ -294,6 +302,10 @@ export class RustEngine implements IAudioEngine {
     try {
       const state = await unwrapCommand(commands.enginePollState())
       playing = state.playing
+      if (state.pluginParameterChanges.length) {
+        const changes = state.pluginParameterChanges.map((change) => ({ targetId: change.targetId, parameterId: change.parameterId, value: finite(change.value) }))
+        for (const listener of this.pluginParameterListeners) listener(changes)
+      }
       this.playheadSec = finite(state.playheadSec, this.playheadSec)
       if (state.graphRevision !== this.graphRevision) {
         this.graphRevision = state.graphRevision

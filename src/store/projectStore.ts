@@ -1,6 +1,6 @@
 // Central Zustand project, selection, view, and undo/redo state.
 import { create } from 'zustand'
-import type { AudioAssetInfo, AudioSourceRef, AutomationLane, Clip, EffectInstance, ExternalPluginRef, MidiClip, MidiControlPoint, MidiNote, ProjectState, TimeSignature, Track } from '../engine'
+import type { AudioAssetInfo, AudioSourceRef, AutomationLane, Clip, EffectInstance, ExternalPluginRef, MidiClip, MidiControlPoint, MidiNote, PluginParameterChange, ProjectState, TimeSignature, Track } from '../engine'
 import { MIDI_PITCH_BEND_LANE, MIDI_PPQ, normalizeTempoMap, secondsPerBeat, TempoMap, type TempoMapData } from '../engine'
 import { createEmptyProject } from './demoProject'
 
@@ -104,6 +104,8 @@ type ProjectStore = {
   removeAutomationLane(trackId: string, laneId: string): void
   replaceAutomationLane(trackId: string, laneId: string, lane: AutomationOption): void
   setAutomationLaneMode(trackId: string, laneId: string, mode: NonNullable<AutomationLane['mode']>): void
+  setDeviceAutomationMode(trackId: string, targetKind: 'instrument' | 'effect', targetId: string, mode: NonNullable<AutomationLane['mode']>): void
+  applyPluginParameterChanges(changes: PluginParameterChange[]): void
   setAutomationLaneHeight(trackId: string, laneId: string, value: number): void
   upsertAutomationPoint(trackId: string, laneId: string, point: { id?: string; timeSec: number; value: number }): string | null
   setAutomationCurve(trackId: string, laneId: string, pointId: string, curve: number): void
@@ -587,7 +589,12 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       if (!track) return
       track.automationLanes ??= []
       if (track.automationLanes.some((item) => item.targetKind === lane.targetKind && item.targetId === lane.targetId && item.parameterId === lane.parameterId)) return
-      track.automationLanes.push({ ...lane, id: crypto.randomUUID(), points: [], mode: 'read' })
+      const deviceMode = lane.targetKind === 'instrument'
+        ? track.instrument?.automationMode
+        : lane.targetKind === 'effect'
+          ? track.effects.find((effect) => effect.id === lane.targetId)?.automationMode
+          : undefined
+      track.automationLanes.push({ ...lane, id: crypto.randomUUID(), points: [], mode: deviceMode ?? 'read' })
       track.automationOpen = true
     }),
     removeAutomationLane: (trackId, laneId) => mutateProject((project) => {
@@ -605,6 +612,73 @@ export const useProjectStore = create<ProjectStore>((set, get) => {
       const lane = project.tracks.find((candidate) => candidate.id === trackId)?.automationLanes?.find((candidate) => candidate.id === laneId)
       if (lane) lane.mode = mode
     }),
+    setDeviceAutomationMode: (trackId, targetKind, targetId, mode) => mutateProject((project) => {
+      const track = project.tracks.find((candidate) => candidate.id === trackId)
+      if (!track) return
+      if (targetKind === 'instrument' && track.instrument && track.id === targetId) track.instrument.automationMode = mode
+      if (targetKind === 'effect') {
+        const effect = track.effects.find((candidate) => candidate.id === targetId)
+        if (effect) effect.automationMode = mode
+      }
+      for (const lane of track.automationLanes ?? []) if (lane.targetKind === targetKind && lane.targetId === targetId) lane.mode = mode
+    }),
+    applyPluginParameterChanges: (changes) => {
+      if (!changes.length) return
+      const current = get().project
+      const next = cloneProject(current)
+      const playheadSec = get().playheadSec
+      const touchedTargets = new Set<string>()
+      let changed = false
+
+      for (const change of changes) {
+        const parameterId = change.parameterId.replace(/^param:/, '')
+        const instrumentIndex = next.tracks.findIndex((track) => track.id === change.targetId && track.instrument?.plugin)
+        if (instrumentIndex >= 0) {
+          let track = next.tracks[instrumentIndex]!
+          const instrument = track.instrument!
+          track = { ...track, instrument: { ...instrument, params: { ...instrument.params, [parameterId]: change.value } } }
+          track = ensurePluginGestureLane(track, 'instrument', track.id, change.parameterId, change.value, instrument.automationMode)
+          track = recordArmedAutomation(track, playheadSec, 'instrument', track.id, change.parameterId, change.value, current.transport.isPlaying)
+          next.tracks[instrumentIndex] = track
+          touchedTargets.add(change.targetId)
+          changed = true
+          continue
+        }
+
+        const effectTrackIndex = next.tracks.findIndex((track) => track.effects.some((effect) => effect.id === change.targetId))
+        if (effectTrackIndex >= 0) {
+          let track = next.tracks[effectTrackIndex]!
+          const effectIndex = track.effects.findIndex((effect) => effect.id === change.targetId)
+          const effect = track.effects[effectIndex]!
+          const effects = track.effects.slice()
+          effects[effectIndex] = { ...effect, params: { ...effect.params, [parameterId]: change.value } }
+          track = { ...track, effects }
+          track = ensurePluginGestureLane(track, 'effect', effect.id, change.parameterId, change.value, effect.automationMode)
+          track = recordArmedAutomation(track, playheadSec, 'effect', effect.id, change.parameterId, change.value, current.transport.isPlaying)
+          next.tracks[effectTrackIndex] = track
+          touchedTargets.add(change.targetId)
+          changed = true
+          continue
+        }
+
+        const busIndex = next.buses.findIndex((bus) => bus.effects.some((effect) => effect.id === change.targetId))
+        if (busIndex >= 0) {
+          const bus = next.buses[busIndex]!
+          next.buses[busIndex] = { ...bus, effects: bus.effects.map((effect) => effect.id === change.targetId ? { ...effect, params: { ...effect.params, [parameterId]: change.value } } : effect) }
+          touchedTargets.add(change.targetId)
+          changed = true
+          continue
+        }
+
+        const masterIndex = next.master.effects.findIndex((effect) => effect.id === change.targetId)
+        if (masterIndex >= 0) {
+          next.master.effects[masterIndex] = { ...next.master.effects[masterIndex]!, params: { ...next.master.effects[masterIndex]!.params, [parameterId]: change.value } }
+          touchedTargets.add(change.targetId)
+          changed = true
+        }
+      }
+      if (changed) commitProject(current, next, `plugin-gesture:${[...touchedTargets].sort().join(',')}`)
+    },
     setAutomationLaneHeight: (trackId, laneId, value) => {
       const current = get().project
       const trackIndex = current.tracks.findIndex((track) => track.id === trackId)
@@ -1507,7 +1581,7 @@ export function effectDefaults(type: EffectInstance['type']): Record<string, num
   if (type === 'builtin:transient-shaper') return { attack: 0, sustain: 0, thresholdDb: -36, speed: .5, clip: 0 }
   if (type === 'builtin:roboter') return { amount: .72, number: 0 }
   if (type === 'builtin:formant-shifter') return { mode: 0, pitchSemitones: 0, formantSemitones: 0, formantLink: 1, mix: 1, outputDb: 0 }
-  if (type === 'builtin:resonator') return { midi: 0, key: 0, scale: 0, pitch0: 1, pitch1: 0, pitch2: 1, pitch3: 0, pitch4: 1, pitch5: 1, pitch6: 0, pitch7: 1, pitch8: 0, pitch9: 1, pitch10: 0, pitch11: 1, resonance: .62, decay: .45, depth: .82, mix: .72 }
+  if (type === 'builtin:resonator') return { quality: 1, midi: 0, key: 0, scale: 0, pitch0: 1, pitch1: 0, pitch2: 1, pitch3: 0, pitch4: 1, pitch5: 1, pitch6: 0, pitch7: 1, pitch8: 0, pitch9: 1, pitch10: 0, pitch11: 1, resonance: .62, decay: .45, transient: .72, depth: .82, mix: .72 }
   if (type === 'builtin:utility') return { inputMode: 0, invertLeft: 0, invertRight: 0, width: 1, gainDb: 0, balance: 0, mono: 0, bassMono: 0, bassFreq: 120, mute: 0, dcBlock: 0 }
   if (type === 'builtin:delay') return { time: 0.25, feedback: 0.3, mix: 0.25, damping: 0.35, pingPong: 0 }
   if (type === 'builtin:reverb') return { decaySec: 2.4, damping: 0.4, width: 0.8, diffusion: 0.7, mix: 0.25 }
@@ -1565,6 +1639,19 @@ function recordArmedAutomation(track: Track, playheadSec: number, targetKind: Au
   return { ...track, automationLanes: lanes }
 }
 
+function ensurePluginGestureLane(track: Track, targetKind: 'instrument' | 'effect', targetId: string, parameterId: string, value: number, mode?: AutomationLane['mode']): Track {
+  if (mode !== 'write' && mode !== 'latch') return track
+  const normalized = parameterId.replace(/^param:/, '')
+  if ((track.automationLanes ?? []).some((lane) => lane.targetKind === targetKind && lane.targetId === targetId && lane.parameterId.replace(/^param:/, '') === normalized)) return track
+  const option = automationOptionsForTrack(track).find((candidate) => candidate.targetKind === targetKind && candidate.targetId === targetId && candidate.parameterId.replace(/^param:/, '') === normalized)
+    ?? { targetKind, targetId, parameterId: `param:${normalized}`, category: targetKind === 'instrument' ? track.instrument?.plugin?.name ?? 'INSTRUMENT' : track.effects.find((effect) => effect.id === targetId)?.plugin?.name ?? 'INSERT', label: normalized, min: 0, max: 1, defaultValue: value }
+  return {
+    ...track,
+    automationOpen: true,
+    automationLanes: [...(track.automationLanes ?? []), { ...option, id: crypto.randomUUID(), points: [], mode }],
+  }
+}
+
 /** Builds the categorized, stable automation menu for a track and its device chain. */
 export function automationOptionsForTrack(track: Track): AutomationOption[] {
   const options: AutomationOption[] = [
@@ -1583,18 +1670,21 @@ export function automationOptionsForTrack(track: Track): AutomationOption[] {
     const name = track.instrument.plugin?.name ?? track.instrument.type.replace('builtin:', '')
     const params = { ...track.instrument.params }
     const pluginParams = track.instrument.plugin?.parameters ?? []
-    addParams('instrument', track.id, name, params)
-    for (const parameter of pluginParams) options.push({ targetKind: 'instrument', targetId: track.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
+    if (pluginParams.length) {
+      for (const parameter of pluginParams) options.push({ targetKind: 'instrument', targetId: track.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
+    } else addParams('instrument', track.id, name, params)
   }
   for (const effect of track.effects) {
     const name = effect.plugin?.name ?? effect.type.replace('builtin:', '')
     const params = { ...effectDefaults(effect.type), ...effect.params }
-    if (effect.type === 'builtin:transient-shaper') {
+    const pluginParams = effect.plugin?.parameters ?? []
+    if (pluginParams.length) {
+      for (const parameter of pluginParams) options.push({ targetKind: 'effect', targetId: effect.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
+    } else if (effect.type === 'builtin:transient-shaper') {
       const ranges: Record<string, { min: number; max: number }> = { attack: { min: -1, max: 1 }, sustain: { min: -1, max: 1 }, thresholdDb: { min: -72, max: 0 }, speed: { min: 0, max: 1 }, clip: { min: 0, max: 1 } }
       for (const [parameterId, value] of Object.entries(params)) options.push({ targetKind: 'effect', targetId: effect.id, parameterId, category: name, label: titleParameter(parameterId), min: ranges[parameterId]?.min ?? 0, max: ranges[parameterId]?.max ?? 1, defaultValue: value })
     } else addParams('effect', effect.id, name, params)
     options.push({ targetKind: 'effect', targetId: effect.id, parameterId: '__bypass', category: name, label: 'Bypass', min: 0, max: 1, defaultValue: effect.bypassed ? 1 : 0 })
-    for (const parameter of effect.plugin?.parameters ?? []) options.push({ targetKind: 'effect', targetId: effect.id, parameterId: `param:${parameter.id}`, category: name, label: parameter.module ? `${parameter.module} · ${parameter.name}` : parameter.name, min: parameter.min, max: parameter.max, defaultValue: parameter.defaultValue })
   }
   return options
 }

@@ -15,11 +15,11 @@ import { ShortcutsDialog } from './components/ShortcutsDialog'
 import { StartupDialog } from './components/StartupDialog'
 import { VirtualPiano } from './components/VirtualPiano'
 import { useFineRangeControls } from './components/controls'
-import { describeEngineError, effectiveBusGainDb, effectiveMasterGainDb, type AutomationLane, type IAudioEngine, type PluginDescriptor, type ProjectState } from './engine'
+import { describeEngineError, effectiveBusGainDb, effectiveMasterGainDb, type AutomationLane, type ExternalPluginRef, type IAudioEngine, type PluginDescriptor, type ProjectState } from './engine'
 import { useEngine } from './hooks/useEngine'
 import { markSessionClean, writeRecoverySnapshot } from './io/autosave'
 import { installMidiInputCoordinator } from './midi/MidiInputCoordinator'
-import { scanPluginsOnce } from './plugins/scan'
+import { hydratePluginRef, scanPluginsOnce } from './plugins/scan'
 import { installPluginShellBridge } from './plugins/shellBridge'
 import { useShortcuts } from './shortcuts/useShortcuts'
 import { useProjectStore } from './store/projectStore'
@@ -42,6 +42,28 @@ export default function App() {
   useEffect(() => installPluginShellBridge(engine), [engine])
 
   useEffect(() => { void scanPluginsOnce(engine).catch(() => undefined) }, [engine])
+
+  useEffect(() => {
+    const attempted = new Set<string>()
+    const hydrate = (project: ProjectState) => {
+      const refs: Array<{ reference: ExternalPluginRef; instrument: boolean }> = []
+      for (const track of project.tracks) {
+        if (track.instrument?.plugin) refs.push({ reference: track.instrument.plugin, instrument: true })
+        for (const effect of track.effects) if (effect.plugin) refs.push({ reference: effect.plugin, instrument: false })
+      }
+      for (const bus of project.buses) for (const effect of bus.effects) if (effect.plugin) refs.push({ reference: effect.plugin, instrument: false })
+      for (const effect of project.master.effects) if (effect.plugin) refs.push({ reference: effect.plugin, instrument: false })
+      for (const { reference, instrument } of refs) {
+        if (reference.parameters?.length || (reference.parameters !== undefined && reference.paramCount === 0)) continue
+        const key = `${reference.format}:${reference.uid}:${reference.path}`
+        if (attempted.has(key)) continue
+        attempted.add(key)
+        void hydratePluginRef(engine, reference, instrument).then((hydrated) => mergeHydratedPluginReference(hydrated)).catch(() => undefined)
+      }
+    }
+    hydrate(useProjectStore.getState().project)
+    return useProjectStore.subscribe((state, previous) => { if (state.project !== previous.project) hydrate(state.project) })
+  }, [engine])
 
   useEffect(() => {
     let saveTimer = 0
@@ -137,6 +159,8 @@ export default function App() {
     applyReadAutomation(engine, store.project, sec)
   }), [engine])
 
+  useEffect(() => engine.onPluginParameterChanges((changes) => useProjectStore.getState().applyPluginParameterChanges(changes)), [engine])
+
   useEffect(() => installMidiInputCoordinator(engine), [engine])
 
   useEffect(() => {
@@ -205,6 +229,25 @@ function refreshProjectPluginMetadata(plugins: PluginDescriptor[]): boolean {
   return changed
 }
 
+function mergeHydratedPluginReference(hydrated: ExternalPluginRef): void {
+  if (!hydrated.parameters?.length) return
+  const project = structuredClone(useProjectStore.getState().project)
+  let changed = false
+  const merge = (reference: typeof hydrated, params: Record<string, number>) => {
+    if (!reference || reference.format !== hydrated.format || reference.uid !== hydrated.uid) return
+    Object.assign(reference, hydrated)
+    for (const parameter of hydrated.parameters ?? []) if (!(parameter.id in params)) params[parameter.id] = parameter.defaultValue
+    changed = true
+  }
+  for (const track of project.tracks) {
+    if (track.instrument?.plugin) merge(track.instrument.plugin, track.instrument.params)
+    for (const effect of track.effects) if (effect.plugin) merge(effect.plugin, effect.params)
+  }
+  for (const bus of project.buses) for (const effect of bus.effects) if (effect.plugin) merge(effect.plugin, effect.params)
+  for (const effect of project.master.effects) if (effect.plugin) merge(effect.plugin, effect.params)
+  if (changed) useProjectStore.setState({ project })
+}
+
 function automationValueAt(lane: AutomationLane, sec: number): number | null {
   if (!lane.points.length) return null
   const points = lane.points
@@ -251,14 +294,14 @@ function graphStructureSignature(project: ProjectState): string {
       for (const lane of clip.ccLanes) { fields.push(lane.cc); for (const point of lane.points) fields.push(point.ticks, point.value) }
     }
     if (track.instrument) fields.push(track.instrument.id, track.instrument.type, track.instrument.bypassed)
-    for (const effect of track.effects) fields.push(effect.id, effect.type, effect.bypassed, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '')
+    for (const effect of track.effects) fields.push(effect.id, effect.type, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '', effect.type === 'builtin:resonator' ? Math.round(effect.params.quality ?? 0) : '')
     for (const send of track.sends) fields.push(send.id, send.targetBusId, send.preFader)
   }
   for (const bus of project.buses) {
     fields.push(bus.id)
-    for (const effect of bus.effects) fields.push(effect.id, effect.type, effect.bypassed, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '')
+    for (const effect of bus.effects) fields.push(effect.id, effect.type, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '', effect.type === 'builtin:resonator' ? Math.round(effect.params.quality ?? 0) : '')
   }
-  for (const effect of project.master.effects) fields.push(effect.id, effect.type, effect.bypassed, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '')
+  for (const effect of project.master.effects) fields.push(effect.id, effect.type, effect.sidechain?.enabled ?? false, effect.sidechain?.sourceTrackId ?? '', effect.type === 'builtin:resonator' ? Math.round(effect.params.quality ?? 0) : '')
   return fields.join('|')
 }
 
@@ -271,14 +314,23 @@ function collectRealtimeValues(project: ProjectState): Map<string, number | bool
     values.set(`track-solo:${track.id}`, track.solo)
     for (const send of track.sends) values.set(`send:${send.id}`, send.gainDb)
     if (track.instrument) for (const [param, value] of Object.entries(track.instrument.params)) values.set(`instrument:${track.id}:${param}`, value)
-    for (const effect of track.effects) for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+    for (const effect of track.effects) {
+      values.set(`effect-bypass:${effect.id}`, effect.bypassed)
+      for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+    }
   }
   for (const bus of project.buses) {
     values.set(`bus-volume:${bus.id}`, effectiveBusGainDb(bus))
-    for (const effect of bus.effects) for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+    for (const effect of bus.effects) {
+      values.set(`effect-bypass:${effect.id}`, effect.bypassed)
+      for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+    }
   }
   values.set('master-volume', effectiveMasterGainDb(project.master))
-  for (const effect of project.master.effects) for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+  for (const effect of project.master.effects) {
+    values.set(`effect-bypass:${effect.id}`, effect.bypassed)
+    for (const [param, value] of Object.entries(effect.params)) values.set(`effect:${effect.id}:${param}`, value)
+  }
   return values
 }
 
@@ -292,13 +344,22 @@ function applyRealtimeChanges(engine: IAudioEngine, project: ProjectState, previ
     if (changed(`track-solo:${track.id}`)) engine.setTrackSolo(track.id, track.solo)
     for (const send of track.sends) if (changed(`send:${send.id}`)) engine.setSendLevel(send.id, send.gainDb)
     if (track.instrument) for (const [param, value] of Object.entries(track.instrument.params)) if (changed(`instrument:${track.id}:${param}`)) engine.setInstrumentParam(track.id, param, value)
-    for (const effect of track.effects) for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+    for (const effect of track.effects) {
+      if (changed(`effect-bypass:${effect.id}`)) engine.setEffectBypass(effect.id, effect.bypassed)
+      for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+    }
   }
   for (const bus of project.buses) {
     if (changed(`bus-volume:${bus.id}`)) engine.setBusVolume(bus.id, effectiveBusGainDb(bus))
-    for (const effect of bus.effects) for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+    for (const effect of bus.effects) {
+      if (changed(`effect-bypass:${effect.id}`)) engine.setEffectBypass(effect.id, effect.bypassed)
+      for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+    }
   }
   if (changed('master-volume')) engine.setMasterVolume(effectiveMasterGainDb(project.master))
-  for (const effect of project.master.effects) for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+  for (const effect of project.master.effects) {
+    if (changed(`effect-bypass:${effect.id}`)) engine.setEffectBypass(effect.id, effect.bypassed)
+    for (const [param, value] of Object.entries(effect.params)) if (changed(`effect:${effect.id}:${param}`)) engine.setEffectParam(effect.id, param, value)
+  }
   return next
 }

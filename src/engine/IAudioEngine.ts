@@ -37,6 +37,7 @@ export interface IAudioEngine {
   seek(sec: number): Promise<void>
   getPlayheadSec(): number
   onPlayhead(cb: (sec: number) => void): () => void
+  onPluginParameterChanges(cb: (changes: import('./types').PluginParameterChange[]) => void): () => void
   setTrackVolume(trackId: string, gainDb: number): void
   setTrackPan(trackId: string, pan: number): void
   setTrackMute(trackId: string, muted: boolean): void
@@ -74,6 +75,7 @@ export interface IAudioEngine {
   openPluginEditor(targetKind: 'effect' | 'instrument', targetId: string, foreground?: boolean): Promise<void>
   closePluginEditor(targetKind: 'effect' | 'instrument', targetId: string): Promise<void>
   isPluginEditorOpen(targetKind: 'effect' | 'instrument', targetId: string): Promise<boolean>
+  setPluginEditorModal(targetId: string, modal: boolean): Promise<void>
   savePluginState(targetKind: 'effect' | 'instrument', targetId: string): Promise<number[]>
   loadPluginState(targetKind: 'effect' | 'instrument', targetId: string, state: number[]): Promise<void>
   renderOffline(req: OfflineRenderRequest): Promise<OfflineRenderResult>

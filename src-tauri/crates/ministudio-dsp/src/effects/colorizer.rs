@@ -1,9 +1,87 @@
-const COLORIZER_FFT_SIZE: usize = 4096;
-const COLORIZER_HOP_SIZE: usize = COLORIZER_FFT_SIZE / 4;
-const COLORIZER_BINS: usize = COLORIZER_FFT_SIZE / 2 + 1;
-const COLORIZER_MASK_SMOOTH_FRAMES: usize = 4;
+const COLORIZER_MAX_MODES: usize = 96;
+const COLORIZER_LOWEST_MIDI: usize = 36;
+const COLORIZER_HIGHEST_MIDI: usize = 119;
 const MAX_ACTIVE_PITCHES: usize = 12;
-const COLORIZER_METER_BINS: usize = DISTORTION_SPECTRUM_BINS / 2;
+const COLORIZER_MAP_FFT_SIZE: usize = 1024;
+const COLORIZER_MAP_HOP_SIZE: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorizerQuality {
+    /// Immediate modal colour with no algorithmic latency.
+    Live,
+    /// Polyphonic spectral pitch-class mapping with transient preservation.
+    Map,
+}
+
+struct ColorizerMap {
+    engine: spectral::stft::StftEngine,
+    processor: spectral::pitch_map::PitchMapProcessor,
+    dry_delay: [Vec<f32>; MAX_CHANNELS],
+    dry_position: usize,
+    meter: [f32; DISTORTION_SPECTRUM_BINS],
+}
+
+impl ColorizerMap {
+    fn new(sample_rate: f32) -> Self {
+        let plan = spectral::stft::StftPlan::new(spectral::stft::StftConfig::new(
+            COLORIZER_MAP_FFT_SIZE,
+            COLORIZER_MAP_HOP_SIZE,
+        ))
+        .expect("Colorizer uses a compile-time validated STFT configuration");
+        Self {
+            engine: spectral::stft::StftEngine::new(plan),
+            processor: spectral::pitch_map::PitchMapProcessor::new(
+                sample_rate,
+                COLORIZER_MAP_FFT_SIZE,
+                COLORIZER_MAP_HOP_SIZE,
+            ),
+            dry_delay: std::array::from_fn(|_| vec![0.0; COLORIZER_MAP_FFT_SIZE]),
+            dry_position: 0,
+            meter: [0.0; DISTORTION_SPECTRUM_BINS],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.engine.reset();
+        self.processor.reset();
+        for channel in &mut self.dry_delay {
+            channel.fill(0.0);
+        }
+        self.dry_position = 0;
+        self.meter.fill(0.0);
+    }
+
+    #[inline]
+    fn process_sample(
+        &mut self,
+        input: [f32; MAX_CHANNELS],
+        target_mask: u16,
+        amount: f32,
+        transient_preserve: f32,
+        color: f32,
+    ) -> ([f32; MAX_CHANNELS], [f32; MAX_CHANNELS]) {
+        let mut delayed = [0.0; MAX_CHANNELS];
+        for channel in 0..MAX_CHANNELS {
+            delayed[channel] = self.dry_delay[channel][self.dry_position];
+            self.dry_delay[channel][self.dry_position] = input[channel];
+        }
+        self.dry_position += 1;
+        if self.dry_position == COLORIZER_MAP_FFT_SIZE {
+            self.dry_position = 0;
+        }
+
+        let processor = &mut self.processor;
+        let meter = &mut self.meter;
+        let mapped = self.engine.process_sample(input, |frame| {
+            processor.process(frame, target_mask, amount, transient_preserve, color);
+            meter.fill(0.0);
+            meter[..spectral::analysis::HPCP_BINS]
+                .copy_from_slice(processor.analyzer().hpcp());
+            meter[spectral::analysis::HPCP_BINS] = processor.analyzer().transient().strength;
+        });
+        (delayed, mapped)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -13,8 +91,8 @@ enum ChordSource {
     MidiInput,
 }
 
-/// Fixed-capacity control-rate pitch snapshot. It is deliberately independent
-/// from both UI presets and MIDI routing so spectral DSP only sees pitch data.
+/// Fixed-capacity control snapshot. MIDI and manual scale selection converge
+/// here before the realtime resonator coefficients are rebuilt.
 #[derive(Clone, Copy, Debug)]
 struct ActivePitches {
     pitches: [u8; MAX_ACTIVE_PITCHES],
@@ -46,45 +124,46 @@ impl ActivePitches {
     }
 }
 
-struct ColorizerChannel {
-    input_ring: Vec<f32>,
-    dry_delay: Vec<f32>,
-    ola_ring: Vec<f32>,
-    spectrum: Vec<Complex32>,
-    scratch: Vec<Complex32>,
-    held: Vec<f32>,
-    phase: Vec<f32>,
-    previous_magnitude: Vec<f32>,
+/// One complex modal resonator. Coefficients are prepared only when the scale,
+/// sample rate, resonance or decay changes; processing is a pair of fused
+/// multiply/add recurrences per channel with no allocation, FFT or OLA delay.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct ColorizerMode {
+    frequency: f32,
+    pitch_class: u8,
+    cosine: f32,
+    sine: f32,
+    radius: f32,
+    injection: f32,
+    weight: f32,
+    real: [f32; MAX_CHANNELS],
+    imaginary: [f32; MAX_CHANNELS],
 }
-impl ColorizerChannel {
-    fn new(scratch_len: usize) -> Self {
-        Self {
-            input_ring: vec![0.0; COLORIZER_FFT_SIZE],
-            dry_delay: vec![0.0; COLORIZER_FFT_SIZE],
-            ola_ring: vec![0.0; COLORIZER_FFT_SIZE],
-            spectrum: vec![Complex32::new(0.0, 0.0); COLORIZER_FFT_SIZE],
-            scratch: vec![Complex32::new(0.0, 0.0); scratch_len],
-            held: vec![0.0; COLORIZER_BINS],
-            phase: vec![0.0; COLORIZER_BINS],
-            previous_magnitude: vec![0.0; COLORIZER_BINS],
-        }
-    }
+impl ColorizerMode {
+    const EMPTY: Self = Self {
+        frequency: 0.0,
+        pitch_class: 0,
+        cosine: 1.0,
+        sine: 0.0,
+        radius: 0.0,
+        injection: 0.0,
+        weight: 0.0,
+        real: [0.0; MAX_CHANNELS],
+        imaginary: [0.0; MAX_CHANNELS],
+    };
     fn clear(&mut self) {
-        self.input_ring.fill(0.0);
-        self.dry_delay.fill(0.0);
-        self.ola_ring.fill(0.0);
-        self.spectrum.fill(Complex32::new(0.0, 0.0));
-        self.scratch.fill(Complex32::new(0.0, 0.0));
-        self.held.fill(0.0);
-        self.phase.fill(0.0);
-        self.previous_magnitude.fill(0.0);
+        self.real = [0.0; MAX_CHANNELS];
+        self.imaginary = [0.0; MAX_CHANNELS];
     }
 }
 
-/// Harmonic STFT resonator shown to users as `Colorizer`.
+/// Dual-backend chromatic processor shown to users as `Colorizer`.
 ///
-/// FFT plans, scratch, rings, masks, and phase state are all prepared before
-/// processing. `process` performs no heap allocation or locking.
+/// `Live` is the zero-latency fixed modal bank: selected pitch classes ring
+/// across octaves without executing an FFT. `Map` is an explicit higher-cost
+/// path that moves linked-stereo harmonic families onto the selected pitch grid
+/// while preserving transients and reporting its fixed STFT latency to PDC.
 struct Colorizer {
     sample_rate: f32,
     bypassed: bool,
@@ -96,30 +175,16 @@ struct Colorizer {
     resonance: f32,
     decay: f32,
     depth: f32,
+    transient_preserve: f32,
     mix: Smoother,
-    mask_current: Vec<f32>,
-    mask_start: Vec<f32>,
-    mask_target: Vec<f32>,
-    mask_dirty: bool,
-    mask_smooth_remaining: usize,
-    window: Vec<f32>,
-    forward: Arc<dyn Fft<f32>>,
-    inverse: Arc<dyn Fft<f32>>,
-    channels: [ColorizerChannel; MAX_CHANNELS],
-    ring_position: usize,
-    samples_seen: usize,
-    samples_until_frame: usize,
-    meter: [f32; DISTORTION_SPECTRUM_BINS],
+    quality: ColorizerQuality,
+    map: ColorizerMap,
+    modes: [ColorizerMode; COLORIZER_MAX_MODES],
+    active_modes: usize,
 }
 impl Colorizer {
     fn new() -> Self {
-        let mut planner = FftPlanner::<f32>::new();
-        let forward = planner.plan_fft_forward(COLORIZER_FFT_SIZE);
-        let inverse = planner.plan_fft_inverse(COLORIZER_FFT_SIZE);
-        let scratch_len = forward
-            .get_inplace_scratch_len()
-            .max(inverse.get_inplace_scratch_len());
-        Self {
+        let mut effect = Self {
             sample_rate: 48_000.0,
             bypassed: false,
             source: ChordSource::Manual,
@@ -130,24 +195,15 @@ impl Colorizer {
             resonance: 0.62,
             decay: 0.45,
             depth: 0.82,
+            transient_preserve: 0.72,
             mix: Smoother::new(0.72, 48_000.0, 0.015),
-            mask_current: vec![1.0; COLORIZER_BINS],
-            mask_start: vec![1.0; COLORIZER_BINS],
-            mask_target: vec![1.0; COLORIZER_BINS],
-            mask_dirty: true,
-            mask_smooth_remaining: 0,
-            window: vec![0.0; COLORIZER_FFT_SIZE],
-            forward,
-            inverse,
-            channels: [
-                ColorizerChannel::new(scratch_len),
-                ColorizerChannel::new(scratch_len),
-            ],
-            ring_position: 0,
-            samples_seen: 0,
-            samples_until_frame: COLORIZER_FFT_SIZE,
-            meter: [0.0; DISTORTION_SPECTRUM_BINS],
-        }
+            quality: ColorizerQuality::Live,
+            map: ColorizerMap::new(48_000.0),
+            modes: [ColorizerMode::EMPTY; COLORIZER_MAX_MODES],
+            active_modes: 0,
+        };
+        effect.rebuild_modes();
+        effect
     }
     fn active_mask(&self) -> u16 {
         match self.source {
@@ -160,86 +216,59 @@ impl Colorizer {
         let _confidence = pitches.confidence;
         if pitches.changed {
             self.applied_mask = pitches.mask();
-            self.mask_dirty = true;
+            self.rebuild_modes();
         }
     }
-    fn rebuild_mask(&mut self) {
-        if !self.mask_dirty {
-            return;
-        }
-        self.mask_start.copy_from_slice(&self.mask_current);
-        let pitch_mask = self.active_mask();
-        let midi_closed = self.source == ChordSource::MidiInput && pitch_mask == 0;
-        let sigma = 1.55 * (1.0 - self.resonance).powi(2) + 0.075;
-        let bin_width = self.sample_rate / COLORIZER_FFT_SIZE as f32;
-        for (bin, gain) in self.mask_target.iter_mut().enumerate() {
-            let frequency = bin as f32 * self.sample_rate / COLORIZER_FFT_SIZE as f32;
-            if midi_closed {
-                *gain = 0.0;
-                continue;
-            }
-            let harmonic_mask = if (40.0..=12_000.0).contains(&frequency) && pitch_mask != 0 {
-                let midi_pitch = 69.0 + 12.0 * (frequency / 440.0).log2();
-                let pitch_class = midi_pitch.rem_euclid(12.0);
-                // A bell narrower than one FFT bin can miss a low note
-                // completely. Widen only as much as the local bin resolution
-                // requires, preserving the requested logarithmic Q elsewhere.
-                let resolution_sigma = if frequency > bin_width * 0.55 {
-                    12.0 * ((frequency + bin_width * 0.5) / (frequency - bin_width * 0.5)).log2()
-                        * 0.55
-                } else {
-                    3.0
-                };
-                let effective_sigma = sigma.max(resolution_sigma);
-                let mut sum = 0.0_f32;
-                for pitch in 0..12 {
-                    if pitch_mask & (1 << pitch) == 0 {
-                        continue;
-                    }
-                    let direct = (pitch_class - pitch as f32).abs();
-                    let distance = direct.min(12.0 - direct);
-                    sum += (-0.5 * (distance / effective_sigma).powi(2)).exp();
-                }
-                sum.min(1.0)
-            } else {
-                0.0
-            };
-            *gain = harmonic_mask + (1.0 - harmonic_mask) * (1.0 - self.depth);
-        }
-        self.mask_smooth_remaining = COLORIZER_MASK_SMOOTH_FRAMES;
-        self.mask_dirty = false;
-    }
-    fn advance_mask(&mut self) {
-        self.rebuild_mask();
-        if self.mask_smooth_remaining == 0 {
-            return;
-        }
-        let completed = COLORIZER_MASK_SMOOTH_FRAMES - self.mask_smooth_remaining + 1;
-        let amount = completed as f32 / COLORIZER_MASK_SMOOTH_FRAMES as f32;
-        for bin in 0..COLORIZER_BINS {
-            self.mask_current[bin] =
-                self.mask_start[bin] + (self.mask_target[bin] - self.mask_start[bin]) * amount;
-        }
-        self.mask_smooth_remaining -= 1;
-    }
-    fn settle_mask_before_audio(&mut self) {
-        if self.samples_seen != 0 {
-            return;
-        }
-        self.rebuild_mask();
-        self.mask_current.copy_from_slice(&self.mask_target);
-        self.mask_smooth_remaining = 0;
+    fn decay_seconds(&self) -> f32 {
+        let base = 0.018 + self.decay * self.decay * 1.25;
+        base * (0.4 + self.resonance * 1.6)
     }
     fn decay_coefficient(&self) -> f32 {
-        if self.decay <= 1e-5 {
-            return 0.0;
-        }
-        let seconds = 0.035 * (240.0_f32).powf(self.decay);
-        (-(COLORIZER_HOP_SIZE as f32) / (seconds * self.sample_rate))
-            .exp()
-            .min(0.999_95)
+        (-1.0 / (self.decay_seconds() * self.sample_rate.max(8_000.0))).exp()
     }
-    fn handle_event(&mut self, event: NoteEventKind) {
+    fn rebuild_modes(&mut self) {
+        let mask = self.active_mask();
+        let pitch_count = mask.count_ones().max(1) as f32;
+        let radius = self.decay_coefficient().clamp(0.0, 0.999_995);
+        // The positive-frequency pole sees half of a real sinusoid. 2*(1-r)
+        // therefore approaches unity gain on a matching steady tone.
+        let injection = (2.0 * (1.0 - radius)).max(1e-6);
+        let normalization = 1.1 / pitch_count.powf(0.2);
+        let nyquist_guard = self.sample_rate * 0.45;
+        let mut count = 0;
+        for midi in COLORIZER_LOWEST_MIDI..=COLORIZER_HIGHEST_MIDI {
+            let pitch_class = (midi % 12) as u8;
+            if mask & (1 << pitch_class) == 0 {
+                continue;
+            }
+            let frequency = 440.0 * 2.0_f32.powf((midi as f32 - 69.0) / 12.0);
+            if frequency >= nyquist_guard || count == COLORIZER_MAX_MODES {
+                continue;
+            }
+            let phase = 2.0 * PI * frequency / self.sample_rate;
+            // Slight high-frequency damping keeps dense scales smooth without
+            // masking the bright selected partials that provide the color.
+            let spectral_weight = (1.0 + (frequency / 7_500.0).powi(2)).powf(-0.18);
+            self.modes[count] = ColorizerMode {
+                frequency,
+                pitch_class,
+                cosine: phase.cos(),
+                sine: phase.sin(),
+                radius,
+                injection,
+                weight: normalization * spectral_weight,
+                real: [0.0; MAX_CHANNELS],
+                imaginary: [0.0; MAX_CHANNELS],
+            };
+            count += 1;
+        }
+        for mode in &mut self.modes[count..] {
+            *mode = ColorizerMode::EMPTY;
+        }
+        self.active_modes = count;
+        self.applied_mask = mask;
+    }
+    fn handle_event(&mut self, event: NoteEventKind) -> bool {
         match event {
             NoteEventKind::NoteOn {
                 pitch, velocity, ..
@@ -250,7 +279,7 @@ impl Colorizer {
                 self.midi_notes[pitch as usize] = self.midi_notes[pitch as usize].saturating_sub(1)
             }
             NoteEventKind::AllNotesOff => self.midi_notes.fill(0),
-            _ => return,
+            _ => return false,
         }
         let mut mask = 0_u16;
         for (pitch, count) in self.midi_notes.iter().enumerate() {
@@ -260,64 +289,50 @@ impl Colorizer {
         }
         if mask != self.midi_mask {
             self.midi_mask = mask;
-            self.update_active_pitches();
+            true
+        } else {
+            false
         }
     }
-    fn render_frame(&mut self) {
-        self.advance_mask();
-        let decay = self.decay_coefficient();
-        self.meter[..COLORIZER_METER_BINS].fill(0.0);
-        for channel in &mut self.channels {
-            process_colorizer_frame(
-                channel,
-                &self.forward,
-                &self.inverse,
-                &self.window,
-                &self.mask_current,
-                self.sample_rate,
-                self.ring_position,
-                decay,
-                &mut self.meter[..COLORIZER_METER_BINS],
-            );
+
+    #[inline]
+    fn process_live_sample(&mut self, dry: [f32; MAX_CHANNELS]) -> [f32; MAX_CHANNELS] {
+        let mut resonant = [0.0_f32; MAX_CHANNELS];
+        for mode in &mut self.modes[..self.active_modes] {
+            for channel in 0..MAX_CHANNELS {
+                let real = mode.real[channel];
+                let imaginary = mode.imaginary[channel];
+                let next_real = mode.radius * (real * mode.cosine - imaginary * mode.sine)
+                    + dry[channel] * mode.injection;
+                let next_imaginary =
+                    mode.radius * (real * mode.sine + imaginary * mode.cosine);
+                mode.real[channel] = denormal(next_real);
+                mode.imaginary[channel] = denormal(next_imaginary);
+                resonant[channel] += next_real * mode.weight;
+            }
         }
-        for value in &mut self.meter[..COLORIZER_METER_BINS] {
-            *value *= 0.5;
-        }
-        for index in 0..COLORIZER_METER_BINS {
-            let frequency = colorizer_meter_frequency(index);
-            let bin = ((frequency * COLORIZER_FFT_SIZE as f32 / self.sample_rate).round() as usize)
-                .min(COLORIZER_BINS - 1);
-            self.meter[COLORIZER_METER_BINS + index] = self.mask_current[bin];
-        }
+        let depth = self.depth.clamp(0.0, 1.0);
+        std::array::from_fn(|channel| {
+            let colored = dry[channel] + resonant[channel] * depth;
+            if colored.abs() > 3.0 {
+                let excess = colored.abs() - 3.0;
+                colored.signum() * (3.0 + excess / (1.0 + excess))
+            } else {
+                colored
+            }
+        })
     }
 }
 impl DspEffect for Colorizer {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, _channels: usize) {
         self.sample_rate = sample_rate.max(8_000.0);
-        let mut planner = FftPlanner::<f32>::new();
-        self.forward = planner.plan_fft_forward(COLORIZER_FFT_SIZE);
-        self.inverse = planner.plan_fft_inverse(COLORIZER_FFT_SIZE);
-        let scratch_len = self
-            .forward
-            .get_inplace_scratch_len()
-            .max(self.inverse.get_inplace_scratch_len());
-        self.channels = [
-            ColorizerChannel::new(scratch_len),
-            ColorizerChannel::new(scratch_len),
-        ];
-        for (index, value) in self.window.iter_mut().enumerate() {
-            *value = 0.5 - 0.5 * (2.0 * PI * index as f32 / COLORIZER_FFT_SIZE as f32).cos();
-        }
         self.mix = Smoother::new(self.mix.target, self.sample_rate, 0.015);
+        self.map = ColorizerMap::new(self.sample_rate);
+        self.rebuild_modes();
         self.reset();
-        self.mask_dirty = true;
-        self.rebuild_mask();
-        self.mask_current.copy_from_slice(&self.mask_target);
-        self.mask_smooth_remaining = 0;
-        self.applied_mask = self.active_mask();
     }
     fn process(&mut self, events: &[NoteEvent], buffer: &mut AudioBuffer, frames: usize) {
-        if self.bypassed {
+        if self.bypassed && self.quality == ColorizerQuality::Live {
             return;
         }
         debug_assert!(events
@@ -326,30 +341,46 @@ impl DspEffect for Colorizer {
         let mut event_index = 0;
         for frame in 0..frames.min(MAX_BLOCK_SIZE) {
             if self.source == ChordSource::MidiInput {
+                let mut chord_changed = false;
                 while event_index < events.len()
                     && events[event_index].sample_offset as usize == frame
                 {
-                    self.handle_event(events[event_index].kind);
+                    chord_changed |= self.handle_event(events[event_index].kind);
                     event_index += 1;
                 }
+                if chord_changed {
+                    // A whole chord arriving at one sample rebuilds the fixed
+                    // bank once, not once per individual note event.
+                    self.update_active_pitches();
+                }
             }
-            let mix = self.mix.next();
-            for channel in 0..MAX_CHANNELS {
-                let input = buffer.channels[channel][frame];
-                let state = &mut self.channels[channel];
-                state.input_ring[self.ring_position] = input;
-                let dry = state.dry_delay[self.ring_position];
-                state.dry_delay[self.ring_position] = input;
-                let wet = state.ola_ring[self.ring_position];
-                state.ola_ring[self.ring_position] = 0.0;
-                buffer.channels[channel][frame] = denormal(dry + (wet - dry) * mix);
-            }
-            self.ring_position = increment_wrap(self.ring_position, COLORIZER_FFT_SIZE);
-            self.samples_seen = self.samples_seen.saturating_add(1);
-            self.samples_until_frame -= 1;
-            if self.samples_until_frame == 0 {
-                self.render_frame();
-                self.samples_until_frame = COLORIZER_HOP_SIZE;
+            let dry = [buffer.channels[0][frame], buffer.channels[1][frame]];
+            let mix = self.mix.next().clamp(0.0, 1.0);
+            match self.quality {
+                ColorizerQuality::Live => {
+                    let wet = self.process_live_sample(dry);
+                    for channel in 0..MAX_CHANNELS {
+                        buffer.channels[channel][frame] =
+                            denormal(dry[channel] + (wet[channel] - dry[channel]) * mix);
+                    }
+                }
+                ColorizerQuality::Map => {
+                    let target_mask = self.active_mask();
+                    let (delayed, wet) = self.map.process_sample(
+                        dry,
+                        target_mask,
+                        self.depth,
+                        self.transient_preserve,
+                        self.resonance,
+                    );
+                    for channel in 0..MAX_CHANNELS {
+                        buffer.channels[channel][frame] = if self.bypassed {
+                            delayed[channel]
+                        } else {
+                            denormal(delayed[channel] + (wet[channel] - delayed[channel]) * mix)
+                        };
+                    }
+                }
             }
         }
     }
@@ -364,20 +395,25 @@ impl DspEffect for Colorizer {
                 if source != self.source {
                     self.source = source;
                     self.applied_mask = self.active_mask();
-                    self.mask_dirty = true;
-                    self.settle_mask_before_audio();
+                    self.rebuild_modes();
                 }
             }
             "resonance" => {
                 self.resonance = value.clamp(0.0, 1.0);
-                self.mask_dirty = true;
-                self.settle_mask_before_audio();
+                self.rebuild_modes();
             }
-            "decay" => self.decay = value.clamp(0.0, 1.0),
-            "depth" => {
-                self.depth = value.clamp(0.0, 1.0);
-                self.mask_dirty = true;
-                self.settle_mask_before_audio();
+            "decay" => {
+                self.decay = value.clamp(0.0, 1.0);
+                self.rebuild_modes();
+            }
+            "depth" => self.depth = value.clamp(0.0, 1.0),
+            "transient" => self.transient_preserve = value.clamp(0.0, 1.0),
+            "quality" => {
+                self.quality = if value >= 0.5 {
+                    ColorizerQuality::Map
+                } else {
+                    ColorizerQuality::Live
+                }
             }
             "mix" => self.mix.set_target(value.clamp(0.0, 1.0)),
             _ if id.starts_with("pitch") => {
@@ -389,7 +425,6 @@ impl DspEffect for Colorizer {
                             self.manual_mask &= !(1 << pitch)
                         }
                         self.update_active_pitches();
-                        self.settle_mask_before_audio();
                     }
                 }
             }
@@ -400,123 +435,30 @@ impl DspEffect for Colorizer {
         self.bypassed = bypassed;
     }
     fn reset(&mut self) {
-        for channel in &mut self.channels {
-            channel.clear();
+        for mode in &mut self.modes {
+            mode.clear();
         }
         self.midi_notes.fill(0);
         self.midi_mask = 0;
-        self.applied_mask = self.active_mask();
-        self.mask_dirty = true;
-        self.ring_position = 0;
-        self.samples_seen = 0;
-        self.samples_until_frame = COLORIZER_FFT_SIZE;
-        self.meter.fill(0.0);
+        self.map.reset();
+        self.rebuild_modes();
     }
     fn tail_samples(&self) -> usize {
-        if self.decay <= 1e-5 {
-            COLORIZER_FFT_SIZE
-        } else {
-            let seconds = 0.035 * (240.0_f32).powf(self.decay);
-            COLORIZER_FFT_SIZE + (seconds * 9.21 * self.sample_rate) as usize
+        match self.quality {
+            ColorizerQuality::Live => (self.decay_seconds() * 9.21 * self.sample_rate) as usize,
+            ColorizerQuality::Map => COLORIZER_MAP_FFT_SIZE,
         }
     }
     fn latency_samples(&self) -> usize {
-        COLORIZER_FFT_SIZE
+        match self.quality {
+            ColorizerQuality::Live => 0,
+            ColorizerQuality::Map => COLORIZER_MAP_FFT_SIZE,
+        }
     }
     fn wants_midi(&self) -> bool {
         self.source == ChordSource::MidiInput
     }
     fn effect_spectrum(&self) -> Option<[f32; DISTORTION_SPECTRUM_BINS]> {
-        Some(self.meter)
+        (self.quality == ColorizerQuality::Map).then_some(self.map.meter)
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process_colorizer_frame(
-    channel: &mut ColorizerChannel,
-    forward: &Arc<dyn Fft<f32>>,
-    inverse: &Arc<dyn Fft<f32>>,
-    window: &[f32],
-    mask: &[f32],
-    sample_rate: f32,
-    ring_position: usize,
-    decay: f32,
-    meter: &mut [f32],
-) {
-    for index in 0..COLORIZER_FFT_SIZE {
-        let input_index = (ring_position + index) % COLORIZER_FFT_SIZE;
-        channel.spectrum[index] =
-            Complex32::new(channel.input_ring[input_index] * window[index], 0.0);
-    }
-    forward.process_with_scratch(&mut channel.spectrum, &mut channel.scratch);
-    let mut flux = 0.0_f32;
-    let mut energy = 1e-12_f32;
-    for bin in 0..COLORIZER_BINS {
-        let magnitude = channel.spectrum[bin].norm();
-        flux += (magnitude - channel.previous_magnitude[bin]).max(0.0);
-        energy += magnitude;
-        channel.previous_magnitude[bin] = magnitude;
-    }
-    let frame_decay = if flux / energy > 0.18 {
-        decay * 0.35
-    } else {
-        decay
-    };
-    for bin in 0..COLORIZER_BINS {
-        let input = channel.spectrum[bin];
-        let input_magnitude = input.norm();
-        let filtered = input_magnitude * mask[bin];
-        let previous = channel.held[bin];
-        let held = if frame_decay <= 1e-8 {
-            filtered
-        } else {
-            filtered.max(previous * frame_decay)
-        };
-        channel.held[bin] = denormal(held);
-        if held <= 1e-20 {
-            channel.spectrum[bin] = Complex32::new(0.0, 0.0);
-            continue;
-        }
-        let input_phase = input.arg();
-        let expected =
-            2.0 * PI * bin as f32 * COLORIZER_HOP_SIZE as f32 / COLORIZER_FFT_SIZE as f32;
-        let propagated = wrap_phase(channel.phase[bin] + expected);
-        let fresh = (filtered / (held + 1e-20)).clamp(0.0, 1.0);
-        let phase_vector = Complex32::from_polar(fresh, input_phase)
-            + Complex32::from_polar(1.0 - fresh, propagated);
-        let phase = if phase_vector.norm_sqr() > 1e-12 {
-            phase_vector.arg()
-        } else {
-            propagated
-        };
-        channel.phase[bin] = wrap_phase(phase);
-        channel.spectrum[bin] = Complex32::from_polar(held, phase);
-        if bin > 0 && bin < COLORIZER_FFT_SIZE / 2 {
-            channel.spectrum[COLORIZER_FFT_SIZE - bin] = channel.spectrum[bin].conj();
-        }
-    }
-    inverse.process_with_scratch(&mut channel.spectrum, &mut channel.scratch);
-    let normalization = 1.0 / (COLORIZER_FFT_SIZE as f32 * 1.5);
-    for index in 0..COLORIZER_FFT_SIZE {
-        let output_index = (ring_position + index) % COLORIZER_FFT_SIZE;
-        channel.ola_ring[output_index] +=
-            channel.spectrum[index].re * window[index] * normalization;
-    }
-    for (index, value) in meter.iter_mut().enumerate() {
-        let frequency = colorizer_meter_frequency(index);
-        let bin = ((frequency * COLORIZER_FFT_SIZE as f32 / sample_rate).round() as usize)
-            .min(COLORIZER_BINS - 1);
-        let amplitude = channel.held[bin] * (2.0 / COLORIZER_FFT_SIZE as f32);
-        *value += amplitude.max(0.0).sqrt().min(1.0);
-    }
-}
-
-#[inline(always)]
-fn colorizer_meter_frequency(index: usize) -> f32 {
-    40.0 * (12_000.0_f32 / 40.0).powf(index as f32 / (COLORIZER_METER_BINS - 1) as f32)
-}
-
-#[inline(always)]
-fn wrap_phase(phase: f32) -> f32 {
-    (phase + PI).rem_euclid(2.0 * PI) - PI
 }

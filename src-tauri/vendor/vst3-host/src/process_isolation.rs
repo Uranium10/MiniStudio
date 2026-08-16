@@ -1017,6 +1017,12 @@ pub struct EditorHostState {
     pub automation: u8,
     /// Whether the platform window must remain in the always-on-top z-order band.
     pub pinned: bool,
+    /// Cross-process HWND of the DAW main window on Windows; zero on other platforms.
+    #[serde(default)]
+    pub owner_window: u64,
+    /// Whether a DAW-owned modal dialog temporarily disables this editor.
+    #[serde(default)]
+    pub modal: bool,
 }
 
 /// The helper process's write half of the request/response protocol.

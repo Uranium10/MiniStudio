@@ -31,10 +31,11 @@ or heap allocation. `tests/realtime_architecture.rs` rejects direct regressions 
 
 ## Bounded failure behavior
 
-A VST3 transport timeout latches the realtime endpoint fault, increments a lock-free deadline
-counter, produces a safe block, and signals the control actor through a dedicated fault event. The
-control owner then respawns/restores the helper and reattaches the same mapping. Recovery never runs
-inline in the callback. GUI latency alone is not an audio failure.
+A VST3 transport timeout increments a lock-free deadline counter and produces a safe block. A late
+response is retired without corrupting the next request; only a sustained run of misses or an
+invalid transport state latches the endpoint fault and signals the control actor through a dedicated
+fault event. The control owner then respawns/restores the helper and reattaches the same mapping.
+Recovery never runs inline in the callback. GUI latency alone is not an audio failure.
 
 Stream errors increment an atomic xrun counter. Device initialization first tries the selected
 backend/device and then the operating-system default. Failed streams are restarted from the control
@@ -53,6 +54,16 @@ Project time is represented as `u64` samples inside the renderer. Clip edges, fa
 tempo boundaries are calculated at sample precision. Sends and sidechains use deterministic taps;
 feedback within one callback is prevented with the documented one-block source delay. Track paths
 are delayed to the longest effective latency and the maximum is published as `pdcSamples`.
+
+Effect parameter and bypass edits are realtime commands, not graph topology. The frontend's graph
+signature therefore excludes downstream effect parameters and bypass flags, and one authoritative
+store-to-engine synchronizer submits the change. Switching or adjusting a later DSP/VST keeps the
+existing graph, plug-in instance, upstream tails and audio stream alive.
+
+Native VST3 editor gestures cross the helper boundary in a fixed-capacity response array. The audio
+endpoint transfers them into a lock-free bounded queue after each completed block; the control
+snapshot drains at most 1024 changes and the project store applies one coalesced gesture transaction.
+No editor, project-history or automation-lane operation runs from the callback.
 
 ## Remaining migration gate
 

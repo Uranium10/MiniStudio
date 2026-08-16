@@ -28,7 +28,7 @@ const BUILTIN_EFFECTS: Array<{ type: EffectType; name: string; description: stri
   { type: 'builtin:vocoder', name: 'Vocoder', description: '24-band sidechain / oscillator vocoder' },
   { type: 'builtin:lfo-tremolo', name: 'LFO Tremolo', description: 'Volume and pan modulation' },
   { type: 'builtin:roboter', name: 'Roboter', description: 'Auto-key pitch correction and harmonizer' },
-  { type: 'builtin:resonator', name: COLORIZER_NAME, description: 'Harmonic spectral resonator' },
+  { type: 'builtin:resonator', name: COLORIZER_NAME, description: 'Live modal colour · polyphonic spectral pitch map' },
   { type: 'builtin:formant-shifter', name: 'Formant Shifter', description: 'Auto Mono/Poly pitch + formant shift' },
   { type: 'builtin:delay', name: 'Echo Space', description: 'Stereo echo' },
   { type: 'builtin:reverb', name: 'Room Reverb', description: 'FDN room reverb' },

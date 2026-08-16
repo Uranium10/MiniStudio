@@ -13,8 +13,8 @@ be rounded to the block boundary. Effects that return `false` from
 - Colorizer keeps the MIDI choice visible and reports that routing is not yet
   available. With MIDI enabled and no routed notes, its pitch mask is closed.
 - Manual pitch classes remain a deterministic source for development and sound
-  design. Switching sources updates the spectral mask with frame interpolation;
-  it does not reset or cut the existing tail.
+  design. The DSP core is a fixed-capacity chromatic modal bank with no FFT/OLA
+  latency; source changes rebuild coefficients without allocation.
 
 ## Planned graph edges
 
@@ -33,4 +33,4 @@ be rounded to the block boundary. Effects that return `false` from
 
 The DSP core must receive only its fixed-capacity active-pitch snapshot. Source
 selection (`Manual`, future `AutoDetect`, or `MidiInput`) stays at the adapter
-boundary and must not leak into the spectral algorithm.
+boundary and must not leak into the modal processing loop.

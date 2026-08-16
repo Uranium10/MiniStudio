@@ -10,6 +10,7 @@ use crate::{
     midi::{MidiChannel, MidiEvent},
     Plugin,
 };
+use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
@@ -26,9 +27,11 @@ pub const MAX_REALTIME_FRAMES: usize = 4096;
 pub const MAX_REALTIME_MIDI_EVENTS: usize = 1024;
 /// Maximum sample-accurate parameter changes per block.
 pub const MAX_REALTIME_PARAMETER_EVENTS: usize = 1024;
+/// Maximum plug-in-originated parameter values returned by one block.
+pub const MAX_REALTIME_PARAMETER_FEEDBACK: usize = 256;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"MSRT");
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const STATE_IDLE: u32 = 0;
 const STATE_REQUESTED: u32 = 1;
 const STATE_PROCESSING: u32 = 2;
@@ -37,6 +40,14 @@ const STATE_SHUTDOWN: u32 = 4;
 const STATUS_OK: i32 = 0;
 const STATUS_BAD_SHAPE: i32 = -1;
 const STATUS_PLUGIN_ERROR: i32 = -2;
+/// A scheduling hiccup is diagnostic data, not proof that the helper died. Consecutive misses
+/// are tolerated while an already-submitted block is still in flight; a sustained stall is
+/// promoted to a terminal transport fault and handed to the recovery actor.
+const MAX_CONSECUTIVE_DEADLINE_MISSES: u32 = 16;
+
+fn deadline_miss_is_terminal(consecutive: u32) -> bool {
+    consecutive >= MAX_CONSECUTIVE_DEADLINE_MISSES
+}
 
 fn editor_action_bit(action: crate::process_isolation::EditorHostAction) -> u32 {
     use crate::process_isolation::EditorHostAction::*;
@@ -148,6 +159,8 @@ struct RealtimeBlock {
     output_channel_count: u16,
     midi_count: u16,
     parameter_count: u16,
+    parameter_feedback_count: u16,
+    _count_padding: u16,
     editor_action_bits: AtomicU32,
     input_bus_channels: [u16; MAX_REALTIME_BUSES],
     output_bus_channels: [u16; MAX_REALTIME_BUSES],
@@ -155,6 +168,7 @@ struct RealtimeBlock {
     output_bus_active: [u8; MAX_REALTIME_BUSES],
     midi: [RealtimeMidiMessage; MAX_REALTIME_MIDI_EVENTS],
     parameters: [RealtimeParameterChange; MAX_REALTIME_PARAMETER_EVENTS],
+    parameter_feedback: [RealtimeParameterChange; MAX_REALTIME_PARAMETER_FEEDBACK],
     input_samples: [f32; MAX_REALTIME_CHANNELS * MAX_REALTIME_FRAMES],
     output_samples: [f32; MAX_REALTIME_CHANNELS * MAX_REALTIME_FRAMES],
 }
@@ -200,6 +214,8 @@ pub struct RealtimeClient {
     sample_rate: f64,
     faulted: Arc<AtomicBool>,
     deadline_misses: Arc<AtomicU64>,
+    consecutive_deadline_misses: Arc<AtomicU32>,
+    parameter_feedback: Arc<ArrayQueue<(u32, f64)>>,
     pending_midi: [RealtimeMidiMessage; MAX_REALTIME_MIDI_EVENTS],
     pending_midi_count: usize,
     pending_parameters: [RealtimeParameterChange; MAX_REALTIME_PARAMETER_EVENTS],
@@ -219,6 +235,24 @@ pub struct EditorActionReader {
 pub struct RealtimeFaultReader {
     #[cfg(target_os = "windows")]
     shared: std::sync::Weak<RealtimeMapping>,
+}
+
+/// Control-side drain for parameter values produced by the native editor or processor.
+/// The audio endpoint publishes into a fixed queue; reading it never calls the plug-in or helper.
+#[derive(Clone)]
+pub struct RealtimeParameterReader {
+    feedback: Arc<ArrayQueue<(u32, f64)>>,
+}
+
+impl RealtimeParameterReader {
+    /// Drain all values currently waiting for the non-realtime host control plane.
+    pub fn take(&self) -> Vec<(u32, f64)> {
+        let mut changes = Vec::with_capacity(self.feedback.len());
+        while let Some(change) = self.feedback.pop() {
+            changes.push(change);
+        }
+        changes
+    }
 }
 
 unsafe impl Send for RealtimeFaultReader {}
@@ -313,6 +347,7 @@ pub struct RealtimeRecoveryHandle {
     descriptor: RealtimeDescriptor,
     faulted: Arc<AtomicBool>,
     deadline_misses: Arc<AtomicU64>,
+    consecutive_deadline_misses: Arc<AtomicU32>,
 }
 
 impl RealtimeRecoveryHandle {
@@ -323,6 +358,8 @@ impl RealtimeRecoveryHandle {
 
     /// Clear a deadline fault after a replacement helper has attached.
     pub fn reset_after_recovery(&self) {
+        self.consecutive_deadline_misses
+            .store(0, AtomicOrdering::Release);
         self.faulted.store(false, AtomicOrdering::Release);
     }
 
@@ -362,6 +399,14 @@ impl RealtimeClient {
             descriptor: self.descriptor.clone(),
             faulted: Arc::clone(&self.faulted),
             deadline_misses: Arc::clone(&self.deadline_misses),
+            consecutive_deadline_misses: Arc::clone(&self.consecutive_deadline_misses),
+        }
+    }
+
+    /// Clone the non-realtime reader for editor/processor parameter feedback.
+    pub fn parameter_reader(&self) -> RealtimeParameterReader {
+        RealtimeParameterReader {
+            feedback: Arc::clone(&self.parameter_feedback),
         }
     }
     /// Create and initialize a host-owned mapping and its request/response events.
@@ -477,6 +522,8 @@ impl RealtimeClient {
             sample_rate,
             faulted: Arc::new(AtomicBool::new(false)),
             deadline_misses: Arc::new(AtomicU64::new(0)),
+            consecutive_deadline_misses: Arc::new(AtomicU32::new(0)),
+            parameter_feedback: Arc::new(ArrayQueue::new(MAX_REALTIME_PARAMETER_FEEDBACK)),
             pending_midi: [RealtimeMidiMessage::EMPTY; MAX_REALTIME_MIDI_EVENTS],
             pending_midi_count: 0,
             pending_parameters: [RealtimeParameterChange::EMPTY; MAX_REALTIME_PARAMETER_EVENTS],
@@ -561,7 +608,27 @@ impl RealtimeClient {
         }
 
         let block = unsafe { &mut *self.shared.block };
-        if block.magic != MAGIC || block.version != VERSION || block.state != STATE_IDLE {
+        if block.magic != MAGIC || block.version != VERSION {
+            self.faulted.store(true, AtomicOrdering::Release);
+            self.signal_fault();
+            silence_outputs(buffers);
+            return Err(Error::ProcessError(
+                "realtime shared-memory state is invalid".to_string(),
+            ));
+        }
+        // A response may arrive just after the previous callback's bounded wait expired. Retire
+        // that late block and continue; it is a deadline miss, not a corrupt transport. While the
+        // previous block is still running we cannot overwrite its shared memory, so this callback
+        // returns a safe silent block and leaves the in-flight request untouched.
+        if block.state == STATE_DONE && block.response_sequence == self.sequence {
+            block.state = STATE_IDLE;
+            self.consecutive_deadline_misses
+                .store(0, AtomicOrdering::Release);
+        } else if matches!(block.state, STATE_REQUESTED | STATE_PROCESSING) {
+            self.record_deadline_miss();
+            silence_outputs(buffers);
+            return Err(Error::PluginTimeout);
+        } else if block.state != STATE_IDLE {
             self.faulted.store(true, AtomicOrdering::Release);
             self.signal_fault();
             silence_outputs(buffers);
@@ -576,6 +643,7 @@ impl RealtimeClient {
         block.output_channel_count = output_channels as u16;
         block.midi_count = self.pending_midi_count as u16;
         block.parameter_count = self.pending_parameter_count as u16;
+        block.parameter_feedback_count = 0;
         block.midi[..self.pending_midi_count]
             .copy_from_slice(&self.pending_midi[..self.pending_midi_count]);
         block.parameters[..self.pending_parameter_count]
@@ -618,9 +686,7 @@ impl RealtimeClient {
         match unsafe { WaitForSingleObject(response, deadline_ms) } {
             WAIT_OBJECT_0 => {}
             258 => {
-                self.deadline_misses.fetch_add(1, AtomicOrdering::Relaxed);
-                self.faulted.store(true, AtomicOrdering::Release);
-                self.signal_fault();
+                self.record_deadline_miss();
                 silence_outputs(buffers);
                 return Err(Error::PluginTimeout);
             }
@@ -650,6 +716,12 @@ impl RealtimeClient {
                 block.status
             )));
         }
+        let feedback_count = usize::from(block.parameter_feedback_count)
+            .min(MAX_REALTIME_PARAMETER_FEEDBACK);
+        for feedback in &block.parameter_feedback[..feedback_count] {
+            self.parameter_feedback
+                .force_push((feedback.id, f64::from_bits(feedback.value_bits)));
+        }
         let mut channel_index = 0usize;
         for bus in &mut buffers.outputs {
             for channel in &mut bus.channels {
@@ -662,6 +734,8 @@ impl RealtimeClient {
             }
         }
         block.state = STATE_IDLE;
+        self.consecutive_deadline_misses
+            .store(0, AtomicOrdering::Release);
         Ok(())
     }
 
@@ -676,6 +750,8 @@ impl RealtimeClient {
 
     /// Clear a latched timeout after a helper has been replaced and reattached.
     pub fn reset_after_recovery(&self) {
+        self.consecutive_deadline_misses
+            .store(0, AtomicOrdering::Release);
         self.faulted.store(false, AtomicOrdering::Release);
         #[cfg(target_os = "windows")]
         unsafe {
@@ -693,6 +769,20 @@ impl RealtimeClient {
     pub fn set_sample_rate(&mut self, sample_rate: f64) {
         if sample_rate.is_finite() && sample_rate > 0.0 {
             self.sample_rate = sample_rate;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn record_deadline_miss(&self) {
+        self.deadline_misses.fetch_add(1, AtomicOrdering::Relaxed);
+        let consecutive = self
+            .consecutive_deadline_misses
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .saturating_add(1);
+        if deadline_miss_is_terminal(consecutive)
+            && !self.faulted.swap(true, AtomicOrdering::AcqRel)
+        {
+            self.signal_fault();
         }
     }
 
@@ -926,6 +1016,19 @@ fn run_server_loop(
                     );
                 }
                 plugin.process_bus_audio(buffers).map_err(|_| ())?;
+                let mut feedback_count = 0usize;
+                while feedback_count < MAX_REALTIME_PARAMETER_FEEDBACK {
+                    let Some((id, value)) = plugin.pop_realtime_parameter_change() else {
+                        break;
+                    };
+                    shared.parameter_feedback[feedback_count] = RealtimeParameterChange {
+                        id,
+                        sample_offset: 0,
+                        value_bits: value.to_bits(),
+                    };
+                    feedback_count += 1;
+                }
+                shared.parameter_feedback_count = feedback_count as u16;
                 Ok(())
             });
             if processed.is_ok() {
@@ -1138,5 +1241,29 @@ mod tests {
     fn shared_block_stays_within_the_intended_fixed_capacity() {
         assert!(std::mem::size_of::<RealtimeBlock>() < 3 * 1024 * 1024);
         assert_eq!(std::mem::align_of::<RealtimeBlock>(), 8);
+    }
+
+    #[test]
+    fn parameter_feedback_reader_drains_without_touching_the_plugin() {
+        let feedback = Arc::new(ArrayQueue::new(4));
+        feedback.push((17, 0.25)).unwrap();
+        feedback.push((42, 0.75)).unwrap();
+        let reader = RealtimeParameterReader {
+            feedback: Arc::clone(&feedback),
+        };
+
+        assert_eq!(reader.take(), vec![(17, 0.25), (42, 0.75)]);
+        assert!(reader.take().is_empty());
+    }
+
+    #[test]
+    fn a_single_deadline_miss_is_diagnostic_but_a_sustained_stall_is_terminal() {
+        assert!(!deadline_miss_is_terminal(1));
+        assert!(!deadline_miss_is_terminal(
+            MAX_CONSECUTIVE_DEADLINE_MISSES - 1
+        ));
+        assert!(deadline_miss_is_terminal(
+            MAX_CONSECUTIVE_DEADLINE_MISSES
+        ));
     }
 }

@@ -100,6 +100,8 @@ describe('multi-track selection and routing', () => {
 
   it('starts Colorizer in a deterministic manual C-major mask', () => {
     const defaults = effectDefaults('builtin:resonator')
+    expect(defaults.quality).toBe(1)
+    expect(defaults.transient).toBeCloseTo(.72)
     expect(defaults.midi).toBe(0)
     expect(defaults.scale).toBe(0)
     expect(Array.from({ length: 12 }, (_, pitch) => defaults[`pitch${pitch}`])).toEqual([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
